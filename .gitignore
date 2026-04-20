@@ -25,5 +25,5 @@ __pycache__/
 .idea/
 .vscode/
 
-# Local cargo config (use `.cargo/config.toml.example` as template)
+# Local cargo config
 .cargo/config.toml

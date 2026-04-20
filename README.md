@@ -100,4 +100,5 @@ at your option.
 ## Disclaimer
 
 This is **research code** accompanying an academic paper. It has not been
-audited for production use. See [SECURITY.md](SECURITY.md).
+audited for production use. See [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md)
+for the leakage analysis of the incremental-update protocol.
