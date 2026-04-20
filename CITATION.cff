@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+title: "Incremental-Keyword-PIR: Updatable keyword PIR via Segmented Cuckoo Filters"
+message: "If you use this software, please cite it using these metadata."
+authors:
+  - family-names: "<TODO-LAST>"
+    given-names: "<TODO-FIRST>"
+    email: "<TODO-EMAIL>"
+    affiliation: "<TODO-AFFILIATION>"
+    orcid: "https://orcid.org/<TODO-ORCID>"
+version: "0.1.0"
+date-released: "<TODO-YYYY-MM-DD>"
+license: "MIT OR Apache-2.0"
+repository-code: "https://github.com/<TODO-GITHUB-USER>/incremental-keyword-pir"
+keywords:
+  - "private information retrieval"
+  - "cuckoo filter"
+  - "probabilistic data structures"
+  - "LWE"
+  - "keyword PIR"
+preferred-citation:
+  type: conference-paper
+  title: "<TODO-PAPER-TITLE>"
+  authors:
+    - family-names: "<TODO-LAST>"
+      given-names: "<TODO-FIRST>"
+  collection-title: "<TODO-PROCEEDINGS>"
+  year: <TODO-YEAR>
+  doi: "<TODO-DOI>"

@@ -1,0 +1,46 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:      # manual trigger from the Actions tab
+  schedule:
+    - cron: "0 6 * * 1"   # 06:00 UTC every Monday
+
+jobs:
+  bench:
+    name: Portable benches
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bench-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install just
+        run: cargo install just --locked
+
+      - name: SCF benches (portable codegen)
+        run: just bench-scf-portable
+
+      - name: PIR benches (portable codegen)
+        run: just bench-pir-portable
+
+      - name: Upload bench CSVs
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.run_id }}
+          path: |
+            crates/**/results/**/*.csv
+            results/paper/**/*.csv
+          retention-days: 30

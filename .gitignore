@@ -1,0 +1,29 @@
+# Rust build artefacts
+/target
+/crates/*/target
+
+# Per-crate transient bench output (cargo bench CWD is the crate dir).
+# Paper-figure CSVs live in `results/paper/` and are tracked.
+/crates/*/results
+
+# Ignore everything in `results/` except the curated subtree that backs the paper.
+results/*
+!results/.gitkeep
+!results/README.md
+!results/SCHEMA.md
+!results/paper/
+!results/plots/
+
+# Python tooling for scripts/
+.venv/
+__pycache__/
+*.pyc
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local cargo config (use `.cargo/config.toml.example` as template)
+.cargo/config.toml

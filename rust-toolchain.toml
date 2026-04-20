@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned to 1.85.0 — the first stable that supports `edition2024`, which
+# several modern transitive deps (e.g. `getrandom ≥0.4`) now require.
+# Bump deliberately: paper numbers are measured on the pinned channel.
+channel    = "1.85.0"
+components = ["rustfmt", "clippy"]
+profile    = "minimal"

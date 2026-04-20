@@ -1,0 +1,12 @@
+# Normalise line endings on checkout; store LF in the repo.
+* text=auto eol=lf
+
+# CSV: use tabular diff so reviewers can spot column-level changes.
+*.csv diff=csv
+
+# Large binary assets — don't try to diff.
+*.pdf  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.svg  text

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / stable
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        # `rust-toolchain.toml` pins the channel — this action reads it.
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install just
+        run: |
+          if ! command -v just >/dev/null; then
+            cargo install just --locked
+          fi
+
+      - name: Format check
+        run: just fmt-check
+
+      - name: Clippy
+        run: just lint
+
+      - name: Test
+        run: just test
+
+      - name: Build (release)
+        run: just build-release
+
+      - name: Smoke repro
+        # Python venv for plot.py. We call plot.py only in repro-smoke.
+        run: |
+          python3 -m pip install --user -r scripts/requirements.txt
+          just repro-smoke

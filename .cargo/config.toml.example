@@ -1,0 +1,10 @@
+# Copy to `.cargo/config.toml` for LOCAL development only.
+#
+# WARNING: Do NOT commit a `.cargo/config.toml` with `target-cpu=native` — it silently
+# breaks reproducibility of paper numbers across machines with different µarchs.
+# For paper figures, always use `just bench-scf-portable` / `just bench-pir-portable`,
+# which set neutral RUSTFLAGS. Only use `just bench-scf-native` / `just bench-pir-native`
+# for local exploration.
+
+# [build]
+# rustflags = ["-C", "target-cpu=native"]
