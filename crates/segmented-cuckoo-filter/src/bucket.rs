@@ -32,7 +32,69 @@
 /// Bit-packed fingerprint storage for a cuckoo filter.
 ///
 /// All fingerprint widths from 1 to 32 bits are supported. Fingerprints are stored without
-/// byte alignment; the internal representation loads/stores u64 windows at the byte level.
+/// byte alignment; the internal representation loads/stores `u64` windows at the byte level.
+///
+/// # Layout
+///
+/// Fingerprints are packed contiguously, LSB-first both within and across bytes. There are
+/// no per-bucket headers, no inter-slot padding, and no byte alignment between fingerprints.
+/// Example with `fingerprint_bits = 12`, `fingerprints_per_bucket = 4`:
+///
+/// ```text
+/// byte:   |   0    |   1    |   2    |   3    |   4    | ...
+/// bits:   |76543210|76543210|76543210|76543210|76543210|
+/// fp #0:   <----- 12 ----->                              bits  0..11
+/// fp #1:                       <----- 12 ----->          bits 12..23
+/// fp #2:                                        <-- 12   bits 24..35 (crosses byte 3 → 4)
+/// ```
+///
+/// # Design rationale
+///
+/// - **Flat `Vec<u8>` over `Vec<u16>` / `Vec<u32>` / `bitvec`.** A `u16` slot array wastes
+///   33% on 12-bit fingerprints; a `u32` array, 167%. `bitvec` adds a dependency and a
+///   feature-gated layout that breaks stable (de)serialisation. The flat buffer gives
+///   minimum memory, a single allocation (a 2-bucket probe typically touches 1–2 cache
+///   lines), and a layout that *is* the on-disk wire format. The only cost is unaligned
+///   access, which is free on x86_64 and aarch64.
+///
+/// - **`u64` arithmetic despite the 32-bit width cap.** The mask is built as
+///   `(1u64 << fingerprint_bits) - 1`: at `fingerprint_bits == 32`, `1u32 << 32` is
+///   undefined behaviour in Rust (shift ≥ bit-width), whereas `1u64 << 32` is well-defined
+///   and yields the correct `0xFFFF_FFFF`. `u64` also matches the load/store window,
+///   sparing a truncation; the final cast back to `u32` is lossless because
+///   `mask ≤ 2³² − 1`.
+///
+/// - **Fixed 8-byte window, not the minimum 5.** A sub-byte-aligned 32-bit field fits in
+///   5 bytes, but 64-bit ISAs have no 5-byte load — it would be synthesised from a 4-byte
+///   plus a 1-byte load. An 8-byte unaligned load is a single `MOV` / `LDR`, and
+///   `u64::from_le_bytes` on a `[u8; 8]` produces branch-free code. The 8-byte tail
+///   padding allocated by [`new`](Self::new) keeps `data[byte_pos..byte_pos + 8]`
+///   in-bounds for every legal `(bucket, slot)`, so the `try_into` in
+///   [`read_fingerprint`](Self::read_fingerprint) / [`write_fingerprint`](Self::write_fingerprint)
+///   cannot fail — the `expect` documents this invariant, not an error path.
+///
+/// - **LSB-first / little-endian packing.** Higher byte indices map to higher bits of the
+///   loaded `u64`, so extraction is `(val >> bit_shift) & mask` and insertion is
+///   `val |= (fp & mask) << bit_shift` with `bit_shift = bit_pos % 8` in both directions.
+///   Byte-crossing fields need no special case; an MSB-first layout would require
+///   splitting them across two masks with inverted shifts. Every Rust tier-1 target is
+///   little-endian, so `from_le_bytes` / `to_le_bytes` compile to plain unaligned
+///   loads/stores, and the on-memory layout is host-independent and serialisation-stable.
+///
+/// # Invariants (caller-enforced)
+///
+/// These are not checked by `FingerprintTable` itself:
+///
+/// - `fingerprint_bits ∈ 1..=32` — enforced upstream in `validate_common_params`
+///   (in `filter.rs`); every public constructor path goes through it.
+/// - Fingerprint value `0` is reserved to mean "empty slot"; the hash layer must never
+///   produce `0` for a real key. [`insert_fingerprint_to_bucket`](Self::insert_fingerprint_to_bucket)
+///   and [`delete_fingerprint_from_bucket`](Self::delete_fingerprint_from_bucket) panic on
+///   a zero input, but [`read_fingerprint`](Self::read_fingerprint) and
+///   [`write_fingerprint`](Self::write_fingerprint) do not — callers must uphold the
+///   invariant there themselves.
+/// - `bucket < num_buckets` and `slot < fingerprints_per_bucket` — checked only by the
+///   assertions in the read/write primitives, which panic out of range.
 #[derive(Clone)]
 pub struct FingerprintTable {
     /// Raw fingerprint data: `⌈num_buckets · bucket_size · fingerprint_bits / 8⌉ + 8` bytes (8 bytes padding).
