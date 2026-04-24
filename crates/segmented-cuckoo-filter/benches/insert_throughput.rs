@@ -9,42 +9,42 @@
 //! only ~70% (sparse, cheap kicking), making the standard variant appear artificially slow.
 //! Measuring over the full fill trajectory puts all schemes under comparable conditions.
 //!
-//! **Parameters:** n ∈ {2^16, 2^18, 2^20}. b ∈ {1, 2, 3, 4}. fp_bits = 12.
+//! **Parameters:** num_buckets ∈ {2^16, 2^18, 2^20}. bucket_size ∈ {1, 2, 3, 4}. fingerprint_bits = 12.
 //! 3 warmup + 10 measured trials.
 //!
 //! **Output:** `results/insert_throughput.csv`
-//! Columns: scheme, arity, n, b, mean_inserted, mean_lf, mean_duration_ns, mean_mops, min_mops, max_mops, stddev_mops
+//! Columns: scheme, arity, num_buckets, bucket_size, mean_inserted, mean_lf, mean_duration_ns, mean_mops, min_mops, max_mops, stddev_mops
 
 mod helpers;
 
 use segmented_cuckoo_filter::{
-    CuckooError, Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, SegmentedCuckooFilter,
-    Standard3aryCuckooFilter, Standard4aryCuckooFilter, StandardCuckooFilter,
+    CuckooError, Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, Segmented2aryCuckooFilter,
+    Standard3aryCuckooFilter, Standard4aryCuckooFilter, Standard2aryCuckooFilter,
 };
 use std::io::Write;
 use std::time::Instant;
 
 const MAX_KICKS: u32 = 2500;
-const FP_BITS: u32 = 12;
+const FINGERPRINT_BITS: u32 = 12;
 const WARMUP_TRIALS: usize = 3;
 const MEASURE_TRIALS: usize = 10;
 
-const N_VALUES: &[u32] = &[1 << 16, 1 << 18, 1 << 20];
-const B_VALUES: &[u32] = &[1, 2, 3, 4];
+const NUM_BUCKETS_VALUES: &[u32] = &[1 << 16, 1 << 18, 1 << 20];
+const BUCKET_SIZE_VALUES: &[u32] = &[1, 2, 3, 4];
 
 macro_rules! bench_insert {
-    ($csv:expr, $label:expr, $filter_ty:ty, $scheme:expr, $arity:expr, $n:expr, $b:expr) => {{
-        let n: u32 = $n;
-        let b: u32 = $b;
+    ($csv:expr, $label:expr, $filter_ty:ty, $scheme:expr, $arity:expr, $num_buckets:expr, $bucket_size:expr) => {{
+        let num_buckets: u32 = $num_buckets;
+        let bucket_size: u32 = $bucket_size;
 
-        match <$filter_ty>::new(n, b, FP_BITS) {
+        match <$filter_ty>::new(num_buckets, bucket_size, FINGERPRINT_BITS) {
             Err(e) => {
-                eprintln!("  Skip {} n={} b={}: {}", $label, n, b, e);
+                eprintln!("  Skip {} num_buckets={} bucket_size={}: {}", $label, num_buckets, bucket_size, e);
             }
             Ok(_) => {
                 // Warmup
                 for _ in 0..WARMUP_TRIALS {
-                    let mut filter = <$filter_ty>::new(n, b, FP_BITS).unwrap();
+                    let mut filter = <$filter_ty>::new(num_buckets, bucket_size, FINGERPRINT_BITS).unwrap();
                     filter.set_max_kicks(MAX_KICKS);
                     let mut i = 0u64;
                     loop {
@@ -62,7 +62,7 @@ macro_rules! bench_insert {
                 let mut lf_vals = Vec::with_capacity(MEASURE_TRIALS);
                 let mut duration_vals = Vec::with_capacity(MEASURE_TRIALS);
                 for _trial in 0..MEASURE_TRIALS {
-                    let mut filter = <$filter_ty>::new(n, b, FP_BITS).unwrap();
+                    let mut filter = <$filter_ty>::new(num_buckets, bucket_size, FINGERPRINT_BITS).unwrap();
                     filter.set_max_kicks(MAX_KICKS);
                     let start = Instant::now();
                     let mut i = 0u64;
@@ -91,8 +91,8 @@ macro_rules! bench_insert {
                     "{},{},{},{},{:.0},{:.6},{:.0},{:.4},{:.4},{:.4},{:.4}",
                     $scheme,
                     $arity,
-                    n,
-                    b,
+                    num_buckets,
+                    bucket_size,
                     mean_inserted,
                     mean_lf,
                     mean_dur,
@@ -103,8 +103,8 @@ macro_rules! bench_insert {
                 )
                 .unwrap();
                 println!(
-                    "  {:<20} n={:<10} b={:<3} | mean={:<8.3} std={:<8.3} Mops",
-                    $label, n, b, mops_stats.mean, mops_stats.stddev
+                    "  {:<20} num_buckets={:<10} bucket_size={:<3} | mean={:<8.3} std={:<8.3} Mops",
+                    $label, num_buckets, bucket_size, mops_stats.mean, mops_stats.stddev
                 );
             }
         }
@@ -114,54 +114,47 @@ macro_rules! bench_insert {
 fn main() {
     let mut csv = helpers::csv_writer(
         "insert_throughput.csv",
-        "scheme,arity,n,b,mean_inserted,mean_lf,mean_duration_ns,mean_mops,min_mops,max_mops,stddev_mops",
+        "scheme,arity,num_buckets,bucket_size,mean_inserted,mean_lf,mean_duration_ns,mean_mops,min_mops,max_mops,stddev_mops",
     );
 
     println!("=== Insert Throughput (insert until full) ===");
     println!(
-        "Config: fp_bits={}, max_kicks={}, warmup={}, trials={}",
-        FP_BITS, MAX_KICKS, WARMUP_TRIALS, MEASURE_TRIALS
+        "Config: fingerprint_bits={}, max_kicks={}, warmup={}, trials={}",
+        FINGERPRINT_BITS, MAX_KICKS, WARMUP_TRIALS, MEASURE_TRIALS
     );
 
-    // pow3 n values comparable in size to N_VALUES
-    let pow3_values: &[u32] = &[3u32.pow(9), 3u32.pow(10), 3u32.pow(11)]; // ~19683, 59049, 177147
-                                                                          // pow4 n values comparable in size to N_VALUES
-    let pow4_values: &[u32] = &[4u32.pow(8), 4u32.pow(9), 4u32.pow(10)]; // 65536, 262144, 1048576
+    // Standard 3-ary num_buckets (power of 3) sized comparably to NUM_BUCKETS_VALUES.
+    let pow3_num_buckets: &[u32] = &[3u32.pow(9), 3u32.pow(10), 3u32.pow(11)]; // 19683, 59049, 177147
+    // Standard 4-ary num_buckets (power of 4) sized comparably to NUM_BUCKETS_VALUES.
+    let pow4_num_buckets: &[u32] = &[4u32.pow(8), 4u32.pow(9), 4u32.pow(10)]; // 65536, 262144, 1048576
 
-    for (idx, &n) in N_VALUES.iter().enumerate() {
-        for &b in B_VALUES {
-            let seg3_n = 3 * (1u32 << (n / 3).ilog2());
-            let std3_n = pow3_values[idx];
-            let std4_n = pow4_values[idx];
+    for (idx, &num_buckets) in NUM_BUCKETS_VALUES.iter().enumerate() {
+        for &bucket_size in BUCKET_SIZE_VALUES {
+            // Segmented 3-ary requires num_buckets = 3·2^t; pick the largest valid value
+            // that fits inside the 2^k window so the comparison stays at a similar size.
+            let seg3_num_buckets = 3 * (1u32 << (num_buckets / 3).ilog2());
+            let std3_num_buckets = pow3_num_buckets[idx];
+            let std4_num_buckets = pow4_num_buckets[idx];
 
-            println!("\n--- n={}, b={} ---", n, b);
+            println!("\n--- num_buckets={}, bucket_size={} ---", num_buckets, bucket_size);
 
-            bench_insert!(
-                csv,
-                "Standard 2-ary",
-                StandardCuckooFilter,
-                "standard",
-                2,
-                n,
-                b
-            );
             bench_insert!(
                 csv,
                 "Segmented 2-ary",
-                SegmentedCuckooFilter,
+                Segmented2aryCuckooFilter,
                 "segmented",
                 2,
-                n,
-                b
+                num_buckets,
+                bucket_size
             );
             bench_insert!(
                 csv,
-                "Standard 3-ary",
-                Standard3aryCuckooFilter,
+                "Standard 2-ary",
+                Standard2aryCuckooFilter,
                 "standard",
-                3,
-                std3_n,
-                b
+                2,
+                num_buckets,
+                bucket_size
             );
             bench_insert!(
                 csv,
@@ -169,17 +162,17 @@ fn main() {
                 Segmented3aryCuckooFilter,
                 "segmented",
                 3,
-                seg3_n,
-                b
+                seg3_num_buckets,
+                bucket_size
             );
             bench_insert!(
                 csv,
-                "Standard 4-ary",
-                Standard4aryCuckooFilter,
+                "Standard 3-ary",
+                Standard3aryCuckooFilter,
                 "standard",
-                4,
-                std4_n,
-                b
+                3,
+                std3_num_buckets,
+                bucket_size
             );
             bench_insert!(
                 csv,
@@ -187,8 +180,17 @@ fn main() {
                 Segmented4aryCuckooFilter,
                 "segmented",
                 4,
-                n,
-                b
+                num_buckets,
+                bucket_size
+            );
+            bench_insert!(
+                csv,
+                "Standard 4-ary",
+                Standard4aryCuckooFilter,
+                "standard",
+                4,
+                std4_num_buckets,
+                bucket_size
             );
         }
     }

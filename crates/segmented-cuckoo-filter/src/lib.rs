@@ -7,40 +7,41 @@
 //! fingerprints (short hashes) of inserted items and supports insert, lookup, and delete
 //! with a bounded false-positive rate. Unlike Bloom filters, deletes are exact.
 //!
-//! This crate explores two orthogonal axes of the design space:
+//! This crate explores the segmented variant of cuckoo filters, which partitions the
+//! table into equal segments and confines each candidate index to its own segment.
+//! This design can achieve higher load factors and support one-round keywork PIR.
 //!
-//! ## Indexing strategy
+//! # Notation
 //!
-//! | Strategy   | Candidate indices              | `n` constraint             |
-//! |------------|-------------------------------|----------------------------|
-//! | **Standard**   | All in `[0, n)`           | Power of 2                 |
-//! | **Segmented**  | `i_j ∈ [j·seg, (j+1)·seg)` | 2^m (or k·2^m for 3-ary)  |
+//! In this crate, "2-ary", "3-ary", and "4-ary" refer to the number of candidate buckets per item.
+//! "bucket_size" refers to the number of fingerprint slots per bucket, and "num_buckets" is the total number of buckets.
+//! We support 3 arities (2, 3, 4) and 4 bucket sizes (1, 2, 3, 4) for both standard and segmented
+//! indexing schemes. The letter `t` is used throughout these docs as the exponent variable when
+//! stating power constraints on `num_buckets` — e.g. `2^t`, `3^t`, or `3 · 2^t`.
 //!
-//! Standard (original) partial-key cuckoo hashing places all candidate buckets anywhere
-//! in the table. Segmented (bipartite) hashing confines each candidate to its own
-//! contiguous segment, eliminating cross-segment interference and improving locality.
+//! # Design note — rollback vs. victim cache
 //!
-//! ## Arity (candidate buckets per item)
+//! When a cuckoo insertion exhausts its kick budget, the original cuckoo filter of Fan et al. 2014
+//! ([efficient/cuckoofilter](https://github.com/efficient/cuckoofilter)) stores the last evicted
+//! fingerprint in a *victim cache* and only reports failure when that cache is already occupied;
+//! lookups must also probe the victim cache, so an item living there still counts as present.
 //!
-//! | Arity | Candidate buckets | Extra storage |
-//! |-------|-------------------|---------------|
-//! | 2     | 2                 | None          |
-//! | 3     | 3                 | None          |
-//! | 4     | 4                 | None          |
-//!
-//! Higher arity improves load factor at the cost of more candidate probes per lookup.
-//! Standard k > 2 schemes use xor3/xor4 cycling so `all_indices` reconstructs all candidates
-//! from any starting index — no per-slot position storage needed for any scheme.
-//!
-//! ## Module structure
+//! **This crate deliberately does not use a victim cache.** When the kick budget is exhausted we
+//! roll back every mutation made during the failing insert, leave the table in its pre-insert
+//! state, and return [`CuckooError::TableFull`]. The motivation is keyword PIR: the filter is
+//! materialised as a matrix and served obliviously, so a victim cache would have to be encoded as
+//! an extra row/column. That inflates both implementation complexity and the PIR database size
+//! for negligible gain at the load factors we target. See [`crate::filter`] for the mechanics.
+//! 
+//! # Module structure
 //!
 //! ```text
 //! lib.rs      — public API, type aliases
 //! filter.rs   — CuckooFilter<S> generic implementation
 //! scheme.rs   — IndexScheme trait + 6 scheme structs
-//! hash.rs     — tag hash functions, item hashing, index reconstruction
-//! bucket.rs   — TagTable: bit-packed fingerprint storage
-//! util.rs     — upper_power_of_2 helper
+//! hash.rs     — fingerprint hash functions, item hashing, index reconstruction
+//! bucket.rs   — FingerprintTable: bit-packed fingerprint storage
+//! util.rs     — helper compute next power of 2/3/4
 //! ```
 //!
 //! # Security considerations
@@ -50,20 +51,20 @@
 //!   An adversary who knows the hash function can craft inputs that all map to the same
 //!   buckets, causing artificially high false-positive rates or denial-of-service via
 //!   table-full conditions.
-//! - False positives are bounded by `d·b / 2^fp_bits` where `d` is the arity. With
-//!   `fp_bits = 12`, `b = 4`, `d = 2` the theoretical FPR is `≈ 0.2%`. This is a
+//! - False positives are bounded by `d·bucket_size / 2^fingerprint_bits` where `d` is the arity. With
+//!   `fingerprint_bits = 12`, `bucket_size = 4`, `d = 2` the theoretical FPR is `≈ 0.2%`. This is a
 //!   *probabilistic* guarantee, not a cryptographic one.
 //! - Deletion of an item never inserted may silently remove a fingerprint that belongs to
-//!   a different item sharing the same tag and candidate indices. Only delete items you
-//!   have explicitly inserted.
+//!   a different item sharing the same fingerprint and candidate indices. Only delete items
+//!   you have explicitly inserted.
 //!
 //! # Quick start
 //!
 //! ```rust
-//! use segmented_cuckoo_filter::SegmentedCuckooFilter;
+//! use segmented_cuckoo_filter::Segmented2aryCuckooFilter;
 //!
-//! // Create a filter: n=64 buckets, b=4 slots/bucket, 12-bit fingerprints.
-//! let mut filter = SegmentedCuckooFilter::new(64, 4, 12).unwrap();
+//! // Create a filter: num_buckets=64 buckets, bucket_size=4 slots/bucket, 12-bit fingerprints.
+//! let mut filter = Segmented2aryCuckooFilter::new(64, 4, 12).unwrap();
 //!
 //! filter.add("hello").unwrap();
 //! assert!(filter.contain("hello"));
@@ -76,9 +77,9 @@
 //! To auto-size based on expected item count:
 //!
 //! ```rust
-//! use segmented_cuckoo_filter::StandardCuckooFilter;
+//! use segmented_cuckoo_filter::Standard2aryCuckooFilter;
 //!
-//! let mut filter = StandardCuckooFilter::from_num_items(100_000, 4, 12).unwrap();
+//! let mut filter = Standard2aryCuckooFilter::from_num_items(100_000, 4, 12).unwrap();
 //! filter.add(b"item".as_ref()).unwrap();
 //! assert!(filter.contain(b"item".as_ref()));
 //! ```
@@ -89,59 +90,115 @@ pub mod hash;
 pub mod scheme;
 pub mod util;
 
-pub use filter::{CuckooError, CuckooFilter, InsertStats};
+pub use filter::{CuckooError, CuckooFilter, SUPPORTED_ARITIES, SUPPORTED_BUCKET_SIZES};
 pub use scheme::{
-    IndexScheme, Segmented3aryScheme, Segmented4aryScheme, SegmentedScheme, Standard3aryScheme,
-    Standard4aryScheme, StandardScheme,
+    IndexScheme, Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme, 
+    Standard2aryScheme, Standard3aryScheme, Standard4aryScheme,
 };
 
-/// Segmented (bipartite) 2-ary cuckoo filter.
+// ════════════════════════════════════════════════════════════════════════════
+// ░░ SEGMENTED SCHEMES ░░
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Segmented 2-ary cuckoo filter.
 ///
 /// Partitions the table into two equal halves. The primary index `i1` is always in the
-/// first half `[0, n/2)` and the alternate `i2` is always in the second half `[n/2, n)`.
+/// first half `[0, num_buckets/2)` and the alternate `i2` is always in the second half `[num_buckets/2, num_buckets)`.
 /// This eliminates cross-half interference and typically achieves higher load factors than
 /// the standard variant at the same parameters.
 ///
 /// # Constraints
 ///
-/// - `n` must be a power of 2 and ≥ 2.
-/// - `b` (tags per bucket) must be ≥ 1.
-/// - `fingerprint_bits` must satisfy `2^fp > 2b` (FPR < 1); minimum is `⌊log2(2b)⌋ + 1`.
+/// - `num_buckets` must be a power of 2 and ≥ 2.
+/// - `bucket_size` (fingerprints per bucket) must be in `1..=4`.
+/// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 32]`.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use segmented_cuckoo_filter::SegmentedCuckooFilter;
+/// use segmented_cuckoo_filter::Segmented2aryCuckooFilter;
 ///
-/// let mut f = SegmentedCuckooFilter::new(128, 4, 12).unwrap();
+/// let mut f = Segmented2aryCuckooFilter::new(128, 4, 12).unwrap();
 /// f.add("hello").unwrap();
 /// assert!(f.contain("hello"));
 /// ```
-pub type SegmentedCuckooFilter = CuckooFilter<SegmentedScheme>;
+pub type Segmented2aryCuckooFilter = CuckooFilter<Segmented2aryScheme>;
 
-/// Original (standard) 2-ary cuckoo filter.
+/// Segmented 3-ary cuckoo filter (three candidate buckets, one per segment).
 ///
-/// The classic partial-key cuckoo filter design. Both candidate indices live anywhere
-/// in `[0, n)`. Simple and cache-friendly for small tables.
+/// Divides the table into three equal segments. `i_j ∈ [j·(num_buckets/3), (j+1)·(num_buckets/3))` for
+/// j = 0, 1, 2. Chain position is derived from the segment number, so **no extra position
+/// storage is needed** — a key advantage over [`Standard3aryCuckooFilter`].
 ///
 /// # Constraints
 ///
-/// - `n` must be a power of 2 and ≥ 1.
-/// - `b` (tags per bucket) must be ≥ 1.
-/// - `fingerprint_bits` must satisfy `2^fp > 2b`.
+/// - `num_buckets` must equal `3 · 2^t` for some `t ≥ 0` (`num_buckets/3` must be a power of 2).
+/// - `bucket_size` must be in `1..=4`.
+/// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 32]`.
 ///
 /// # Examples
 ///
 /// ```rust
-/// use segmented_cuckoo_filter::StandardCuckooFilter;
+/// use segmented_cuckoo_filter::Segmented3aryCuckooFilter;
 ///
-/// let mut f = StandardCuckooFilter::from_num_items(50_000, 4, 12).unwrap();
+/// // num_buckets = 3 * 32 = 96
+/// let mut f = Segmented3aryCuckooFilter::new(96, 4, 12).unwrap();
+/// f.add("data").unwrap();
+/// assert!(f.contain("data"));
+/// ```
+pub type Segmented3aryCuckooFilter = CuckooFilter<Segmented3aryScheme>;
+
+/// Segmented 4-ary cuckoo filter (four candidate buckets, one per segment).
+///
+/// Divides the table into four equal segments. `i_j ∈ [j·(num_buckets/4), (j+1)·(num_buckets/4))` for
+/// j = 0..3. Like [`Segmented3aryCuckooFilter`], position is derived from the segment
+/// number, so **no extra position storage is needed**.
+///
+/// # Constraints
+///
+/// - `num_buckets` must be a power of 2 and ≥ 4 (ensures each segment is also a power of 2).
+/// - `bucket_size` must be in `1..=4`.
+/// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 32]`.
+///
+/// # Examples
+///
+/// ```rust
+/// use segmented_cuckoo_filter::Segmented4aryCuckooFilter;
+///
+/// // num_buckets = 64, so each of 4 segments has 16 buckets
+/// let mut f = Segmented4aryCuckooFilter::new(64, 4, 12).unwrap();
+/// f.add("data").unwrap();
+/// assert!(f.contain("data"));
+/// ```
+pub type Segmented4aryCuckooFilter = CuckooFilter<Segmented4aryScheme>;
+
+// ════════════════════════════════════════════════════════════════════════════
+// ░░ STANDARD SCHEMES ░░
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Standard (original) 2-ary cuckoo filter.
+///
+/// Use *partial-key cuckoo hashing* technique. Both candidate indices live anywhere
+/// in `[0, num_buckets)`. Simple and cache-friendly for small tables.
+///
+/// # Constraints
+///
+/// - `num_buckets` must be a power of 2 and ≥ 1.
+/// - `bucket_size` (fingerprints per bucket) must be in `1..=4`.
+/// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 32]`.
+///
+/// # Examples
+///
+/// ```rust
+/// use segmented_cuckoo_filter::Standard2aryCuckooFilter;
+///
+/// let mut f = Standard2aryCuckooFilter::from_num_items(50_000, 4, 12).unwrap();
 /// f.add(42u64.to_le_bytes()).unwrap();
 /// assert!(f.contain(42u64.to_le_bytes()));
 /// ```
-pub type StandardCuckooFilter = CuckooFilter<StandardScheme>;
+pub type Standard2aryCuckooFilter = CuckooFilter<Standard2aryScheme>;
 
-/// Standard 3-ary cuckoo filter (three candidate buckets, all in `[0, n)`).
+/// Standard 3-ary cuckoo filter (three candidate buckets, all in `[0, num_buckets)`).
 ///
 /// Each item has three candidate buckets linked by a xor3 chain: `i2 = xor3(i1, h)`,
 /// `i3 = xor3(i2, h)`. Higher arity typically increases achievable load factor.
@@ -149,9 +206,9 @@ pub type StandardCuckooFilter = CuckooFilter<StandardScheme>;
 ///
 /// # Constraints
 ///
-/// - `n` must be a power of 3 (3^k) and ≥ 1.
-/// - `b` must be ≥ 1.
-/// - `fingerprint_bits` must satisfy `2^fp > 3b`.
+/// - `num_buckets` must be a power of 3 (`3^t`) and ≥ 1.
+/// - `bucket_size` must be in `1..=4`.
+/// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 32]`.
 ///
 /// # Examples
 ///
@@ -164,31 +221,8 @@ pub type StandardCuckooFilter = CuckooFilter<StandardScheme>;
 /// ```
 pub type Standard3aryCuckooFilter = CuckooFilter<Standard3aryScheme>;
 
-/// Segmented 3-ary cuckoo filter (three candidate buckets, one per segment).
-///
-/// Divides the table into three equal segments. `i_j ∈ [j·(n/3), (j+1)·(n/3))` for
-/// j = 0, 1, 2. Chain position is derived from the segment number, so **no extra position
-/// storage is needed** — a key advantage over [`Standard3aryCuckooFilter`].
-///
-/// # Constraints
-///
-/// - `n` must equal `3 · 2^m` for some m ≥ 0 (`n/3` must be a power of 2).
-/// - `b` must be ≥ 1.
-/// - `fingerprint_bits` must satisfy `2^fp > 3b`.
-///
-/// # Examples
-///
-/// ```rust
-/// use segmented_cuckoo_filter::Segmented3aryCuckooFilter;
-///
-/// // n = 3 * 32 = 96
-/// let mut f = Segmented3aryCuckooFilter::new(96, 4, 12).unwrap();
-/// f.add("data").unwrap();
-/// assert!(f.contain("data"));
-/// ```
-pub type Segmented3aryCuckooFilter = CuckooFilter<Segmented3aryScheme>;
 
-/// Standard 4-ary cuckoo filter (four candidate buckets, all in `[0, n)`).
+/// Standard 4-ary cuckoo filter (four candidate buckets, all in `[0, num_buckets)`).
 ///
 /// Extends the xor4 chain to four indices: `i2 = xor4(i1, h)`, `i3 = xor4(i2, h)`,
 /// `i4 = xor4(i3, h)`. The widest standard variant; highest potential load factor.
@@ -196,9 +230,9 @@ pub type Segmented3aryCuckooFilter = CuckooFilter<Segmented3aryScheme>;
 ///
 /// # Constraints
 ///
-/// - `n` must be a power of 4 (4^k) and ≥ 1.
-/// - `b` must be ≥ 1.
-/// - `fingerprint_bits` must satisfy `2^fp > 4b`.
+/// - `num_buckets` must be a power of 4 (`4^t`) and ≥ 1.
+/// - `bucket_size` must be in `1..=4`.
+/// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 32]`.
 ///
 /// # Examples
 ///
@@ -211,26 +245,3 @@ pub type Segmented3aryCuckooFilter = CuckooFilter<Segmented3aryScheme>;
 /// ```
 pub type Standard4aryCuckooFilter = CuckooFilter<Standard4aryScheme>;
 
-/// Segmented 4-ary cuckoo filter (four candidate buckets, one per segment).
-///
-/// Divides the table into four equal segments. `i_j ∈ [j·(n/4), (j+1)·(n/4))` for
-/// j = 0..3. Like [`Segmented3aryCuckooFilter`], position is derived from the segment
-/// number, so **no extra position storage is needed**.
-///
-/// # Constraints
-///
-/// - `n` must be a power of 2 and ≥ 4 (ensures each segment is also a power of 2).
-/// - `b` must be ≥ 1.
-/// - `fingerprint_bits` must satisfy `2^fp > 4b`.
-///
-/// # Examples
-///
-/// ```rust
-/// use segmented_cuckoo_filter::Segmented4aryCuckooFilter;
-///
-/// // n = 64, so each of 4 segments has 16 buckets
-/// let mut f = Segmented4aryCuckooFilter::new(64, 4, 12).unwrap();
-/// f.add("data").unwrap();
-/// assert!(f.contain("data"));
-/// ```
-pub type Segmented4aryCuckooFilter = CuckooFilter<Segmented4aryScheme>;

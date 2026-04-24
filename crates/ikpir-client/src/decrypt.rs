@@ -8,7 +8,7 @@
 //!
 //! Rounding to multiples of `Δ` recovers `D_j[local_j, :]`, which encodes
 //! `b = slots_per_bucket` `(fingerprint, value)` slots. We scan each slot
-//! for a fingerprint matching `state.tag` and return the decoded value on
+//! for a fingerprint matching `state.fingerprint` and return the decoded value on
 //! a hit, or `Ok(None)` if no segment contains a matching slot.
 //!
 //! # Edge cases
@@ -89,7 +89,7 @@ pub fn decrypt(state: &QueryState, response_bytes: &[u8]) -> Result<Option<Vec<u
                 state.params.fingerprint_bits,
                 state.params.mat_elem_bit_len,
             );
-            if fp == state.tag {
+            if fp == state.fingerprint {
                 let val = decode_value(&slots[base + fp_elems..base + slot_elems], &state.params)
                     .ok_or(DecryptError::DecodeFailed)?;
                 return Ok(Some(val));

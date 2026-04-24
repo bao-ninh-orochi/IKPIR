@@ -97,13 +97,19 @@ _collect-pir-csvs:
 # Plotting
 # ---------------------------------------------------------------------------
 
-# Regenerate all figures in `results/plots/` from `results/paper/*.csv`.
+# plot.py lives inside the segmented-cuckoo-filter crate so the crate can
+# be published standalone; workspace `just plots` points it at the
+# workspace-level paper CSV tree instead of the crate's local `results/`.
+
+# Regenerate all figures in `results/plots/` from `results/paper/scf/*.csv`.
 plots:
-    python3 scripts/plot.py
+    SCF_RESULTS_DIR=results/paper/scf SCF_PLOTS_DIR=results/plots \
+        python3 crates/segmented-cuckoo-filter/scripts/plot.py
 
 # Install Python plotting dependencies into a local `.venv`.
 plots-setup:
     python3 -m venv .venv
+    .venv/bin/pip install -r crates/segmented-cuckoo-filter/scripts/requirements.txt
     .venv/bin/pip install -r scripts/requirements.txt
 
 # ---------------------------------------------------------------------------

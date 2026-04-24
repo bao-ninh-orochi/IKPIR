@@ -1,6 +1,6 @@
 [package]
 name        = "segmented-cuckoo-filter"
-description = "Cuckoo filter variants with k-ary partial-key hashing and segmented bucket layout"
+description = "Cuckoo filter variants: 2/3/4-ary partial-key hashing with standard and segmented bucket layout"
 keywords    = ["cuckoo", "filter", "probabilistic", "membership", "segmented"]
 categories  = ["data-structures", "algorithms"]
 readme      = "README.md"
@@ -42,10 +42,6 @@ harness = false
 
 [[bench]]
 name    = "fpr"
-harness = false
-
-[[bench]]
-name    = "eviction"
 harness = false
 
 [[bench]]

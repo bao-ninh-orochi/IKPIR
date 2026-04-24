@@ -19,7 +19,7 @@ use ikpir_common::cuckoo_store::{MapError, SegmentedCuckooMap, DEFAULT_MAX_KICKS
 use ikpir_common::hash::derive_segment_seeds;
 use ikpir_common::matrix::{Matrix, MatrixError};
 use ikpir_common::params::{Arity, FilterParams, ParamError, LWE_DIMENSION, SEED_LEN};
-use segmented_cuckoo_filter::{Segmented3aryScheme, Segmented4aryScheme, SegmentedScheme};
+use segmented_cuckoo_filter::{Segmented3aryScheme, Segmented4aryScheme, Segmented2aryScheme};
 
 /// Bundle of values produced at setup time.
 ///
@@ -87,7 +87,7 @@ fn build_map(params: &FilterParams, rng_seed: [u8; 32]) -> Result<crate::Segment
     let b = params.slots_per_bucket();
     match params.arity {
         Arity::Segmented2 => {
-            let scheme = SegmentedScheme { half: params.seg() };
+            let scheme = Segmented2aryScheme { half: params.seg() };
             let m =
                 SegmentedCuckooMap::new(scheme, params.clone(), b, DEFAULT_MAX_KICKS, rng_seed)?;
             Ok(crate::SegmentedMap::Seg2(m))

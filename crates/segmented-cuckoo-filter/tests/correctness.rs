@@ -8,11 +8,11 @@
 
 use proptest::prelude::*;
 use segmented_cuckoo_filter::{
-    CuckooError, Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, SegmentedCuckooFilter,
-    Standard3aryCuckooFilter, Standard4aryCuckooFilter, StandardCuckooFilter,
+    CuckooError, Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, Segmented2aryCuckooFilter,
+    Standard3aryCuckooFilter, Standard4aryCuckooFilter, Standard2aryCuckooFilter,
 };
 
-const FP_BITS: u32 = 12;
+const FINGERPRINT_BITS: u32 = 12;
 
 fn roundtrip<F>(mut new_filter: F, items: &[[u8; 8]])
 where
@@ -70,8 +70,8 @@ macro_rules! impl_roundtrip_filter {
     };
 }
 
-impl_roundtrip_filter!(StandardCuckooFilter);
-impl_roundtrip_filter!(SegmentedCuckooFilter);
+impl_roundtrip_filter!(Standard2aryCuckooFilter);
+impl_roundtrip_filter!(Segmented2aryCuckooFilter);
 impl_roundtrip_filter!(Standard3aryCuckooFilter);
 impl_roundtrip_filter!(Segmented3aryCuckooFilter);
 impl_roundtrip_filter!(Standard4aryCuckooFilter);
@@ -82,7 +82,7 @@ proptest! {
     fn standard_2ary_roundtrip(items in proptest::collection::vec(any::<u64>(), 1..500)) {
         let bytes: Vec<[u8; 8]> = items.iter().map(|x| x.to_le_bytes()).collect();
         roundtrip(
-            || Box::new(StandardCuckooFilter::new(1024, 4, FP_BITS).unwrap()),
+            || Box::new(Standard2aryCuckooFilter::new(1024, 4, FINGERPRINT_BITS).unwrap()),
             &bytes,
         );
     }
@@ -91,7 +91,7 @@ proptest! {
     fn segmented_2ary_roundtrip(items in proptest::collection::vec(any::<u64>(), 1..500)) {
         let bytes: Vec<[u8; 8]> = items.iter().map(|x| x.to_le_bytes()).collect();
         roundtrip(
-            || Box::new(SegmentedCuckooFilter::new(1024, 4, FP_BITS).unwrap()),
+            || Box::new(Segmented2aryCuckooFilter::new(1024, 4, FINGERPRINT_BITS).unwrap()),
             &bytes,
         );
     }
@@ -100,7 +100,7 @@ proptest! {
     fn standard_3ary_roundtrip(items in proptest::collection::vec(any::<u64>(), 1..500)) {
         let bytes: Vec<[u8; 8]> = items.iter().map(|x| x.to_le_bytes()).collect();
         roundtrip(
-            || Box::new(Standard3aryCuckooFilter::new(729, 4, FP_BITS).unwrap()),
+            || Box::new(Standard3aryCuckooFilter::new(729, 4, FINGERPRINT_BITS).unwrap()),
             &bytes,
         );
     }
@@ -109,7 +109,7 @@ proptest! {
     fn segmented_3ary_roundtrip(items in proptest::collection::vec(any::<u64>(), 1..500)) {
         let bytes: Vec<[u8; 8]> = items.iter().map(|x| x.to_le_bytes()).collect();
         roundtrip(
-            || Box::new(Segmented3aryCuckooFilter::new(3 * 256, 4, FP_BITS).unwrap()),
+            || Box::new(Segmented3aryCuckooFilter::new(3 * 256, 4, FINGERPRINT_BITS).unwrap()),
             &bytes,
         );
     }
@@ -118,7 +118,7 @@ proptest! {
     fn standard_4ary_roundtrip(items in proptest::collection::vec(any::<u64>(), 1..500)) {
         let bytes: Vec<[u8; 8]> = items.iter().map(|x| x.to_le_bytes()).collect();
         roundtrip(
-            || Box::new(Standard4aryCuckooFilter::new(1024, 4, FP_BITS).unwrap()),
+            || Box::new(Standard4aryCuckooFilter::new(1024, 4, FINGERPRINT_BITS).unwrap()),
             &bytes,
         );
     }
@@ -127,8 +127,32 @@ proptest! {
     fn segmented_4ary_roundtrip(items in proptest::collection::vec(any::<u64>(), 1..500)) {
         let bytes: Vec<[u8; 8]> = items.iter().map(|x| x.to_le_bytes()).collect();
         roundtrip(
-            || Box::new(Segmented4aryCuckooFilter::new(1024, 4, FP_BITS).unwrap()),
+            || Box::new(Segmented4aryCuckooFilter::new(1024, 4, FINGERPRINT_BITS).unwrap()),
             &bytes,
         );
+    }
+}
+
+#[test]
+fn rejects_bucket_size_above_supported_range() {
+    for bs in [0u32, 5, 8, 16] {
+        let err = Standard2aryCuckooFilter::new(1024, bs, FINGERPRINT_BITS)
+            .err()
+            .expect("expected InvalidParams for unsupported bucket_size");
+        match err {
+            CuckooError::InvalidParams(msg) => assert!(
+                msg.contains("bucket_size"),
+                "expected bucket_size error, got: {msg}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn accepts_all_supported_bucket_sizes() {
+    for bs in 1u32..=4 {
+        Standard2aryCuckooFilter::new(1024, bs, FINGERPRINT_BITS)
+            .unwrap_or_else(|e| panic!("bucket_size={bs} should be valid, got {e}"));
     }
 }

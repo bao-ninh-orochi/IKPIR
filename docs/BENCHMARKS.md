@@ -3,8 +3,8 @@
 All benchmarks are standalone binaries in `benches/`. Each writes CSV results to `results/`
 and an ASCII summary to stdout. Run with `cargo bench --bench <name>`.
 
-Common constants across all benchmarks: `MAX_KICKS = 500`, `FP_BITS = 12` (except `fpr`
-which sweeps fp_bits).
+Common constants across all benchmarks: `MAX_KICKS = 500`, `FINGERPRINT_BITS = 12` (except
+`fpr` which sweeps `fingerprint_bits`).
 
 ---
 
@@ -34,7 +34,7 @@ variance in the random eviction chain, giving min/mean/max rather than a single 
 requires n = 3·2^m), where n ∈ {3·2^12, 3·2^14, 3·2^16, 3·2^18}. b ∈ {1, 2, 3, 4}.
 
 **Output:** `results/load_factor.csv`
-Columns: `scheme, arity, n, b, fp_bits, trial, load_factor`
+Columns: `scheme, arity, n, b, fingerprint_bits, max_kicks, mean_lf, min_lf, max_lf, stddev_lf`
 
 **Plotted by:** `plot_load_factor_all`, `plot_load_factor_b234`
 
@@ -121,12 +121,13 @@ Columns: `scheme, arity, n, b, hit_rate_pct, trial, load_factor, num_queries, du
 ## fpr
 
 **Intent:** Measure the actual false positive rate (FPR) as fingerprint bit width varies, and
-compare it against the theoretical bound `2b / 2^fp_bits`.
+compare it against the theoretical bound `2b / 2^fingerprint_bits`.
 
-**Method:** For each (arity, n, b), sweep `fp_bits` from `min_fp_bits(b)` up to 32 (where
-`min_fp_bits(b) = floor(log2(2b)) + 1` is the minimum that makes FPR < 1). At each fp_bits:
-insert until full, then query `q = 10·n·b` items that were never inserted. Count how many
-return `true` (false positives). Also record the theoretical FPR `2b / 2^fp_bits`.
+**Method:** For each (arity, n, b), sweep `fingerprint_bits` from `min_fingerprint_bits(b)` up
+to 32 (where `min_fingerprint_bits(b) = floor(log2(2b)) + 1` is the minimum that makes FPR < 1).
+At each `fingerprint_bits`: insert until full, then query `q = 10·n·b` items that were never
+inserted. Count how many return `true` (false positives). Also record the theoretical FPR
+`2b / 2^fingerprint_bits`.
 
 Separate CSVs are created per (arity, n, b) because the arity changes both the filter type
 and (for segmented 3-ary) the n value.
@@ -138,44 +139,14 @@ segmentation affects index placement but not fingerprint collision probability. 
 enough for ~1000+ expected false positives even at low FPR, which keeps the measured rate
 statistically meaningful.
 
-**Parameters:** n = 2^18. b ∈ {1, 2, 3, 4}. fp_bits swept from min to 32. Single run per
-config (no trials — sweep runtime is already long).
+**Parameters:** n = 2^18. b ∈ {1, 2, 3, 4}. `fingerprint_bits` swept from min to 32. Single run
+per config (no trials — sweep runtime is already long).
 
 **Output:** `results/fpr/arity{a}_n{n}_b{b}.csv` (one file per arity per (n, b))
-Columns: `fp_bits, scheme, n, load_factor, num_inserted, num_queries, false_positives, fpr_pct, theoretical_pct`
+Columns: `fingerprint_bits, scheme, n, load_factor, num_inserted, num_queries, false_positives, fpr_pct, theoretical_pct`
 
-**Plotted by:** `plot_fpr_load_factor` (load factor vs fp_bits), `plot_fpr_comparison` (FPR
-vs fp_bits with theoretical line)
-
----
-
-## eviction
-
-**Intent:** Understand the eviction chain length distribution — how often an insert is a
-direct placement (0 kicks) vs. requiring many displacements.
-
-**Method:** Use `add_with_stats` instead of `add` to get per-insertion kick counts. For each
-(scheme, n, b), insert until full, accumulating kick counts into 5 histogram buckets: 0,
-1–10, 11–50, 51–100, 101–500. Also track total kicks, direct placements, and mean kicks per
-insertion.
-
-**Rationale:** `add_with_stats` is a separate code path (not delegating to `add`) that returns
-`InsertStats { kicks: u32 }`, intentionally keeping the hot `add` path free of stats overhead.
-The histogram buckets are chosen to reveal whether high-kick insertions are rare tail events or
-a significant fraction of all insertions. Eviction behavior is expected to worsen as the filter
-fills, so collecting stats over the full fill trajectory captures the entire distribution.
-
-b=1 is excluded because with only 1 slot per bucket, every collision immediately triggers
-kicking, making the histogram less informative — load factor with b=1 is also lower, so
-including it would add noise without insight.
-
-**Parameters:** n ∈ {2^14, 2^16, 2^18, 2^20}. b ∈ {2, 3, 4}. Single trial per config.
-
-**Output:** `results/eviction.csv`
-Columns: `scheme, arity, n, b, fp_bits, total_inserts, total_kicks, direct_placements, max_kicks, mean_kicks, hist_0, hist_1_10, hist_11_50, hist_51_100, hist_101_500`
-
-**Plotted by:** `plot_eviction` (stacked bar of normalised histogram per arity),
-`plot_eviction_mean_kicks` (mean kicks vs n per arity)
+**Plotted by:** `plot_fpr_load_factor` (load factor vs fingerprint_bits), `plot_fpr_comparison`
+(FPR vs fingerprint_bits with theoretical line)
 
 ---
 

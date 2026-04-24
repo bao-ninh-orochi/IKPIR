@@ -33,8 +33,8 @@ use crate::setup::ClientSetup;
 pub struct QueryState {
     /// The keyword this query was built for.
     pub key: Vec<u8>,
-    /// SCF fingerprint tag for the keyword (used for slot matching on decrypt).
-    pub tag: u32,
+    /// SCF fingerprint for the keyword (used for slot matching on decrypt).
+    pub fingerprint: u32,
     /// `c_j = sᵀ · H_j` for each segment, length `row_elems_bucket` each.
     pub c: Vec<Vec<u32>>,
     /// Echo of the active filter parameters.
@@ -118,7 +118,7 @@ pub fn query<R: RngCore + CryptoRng>(
     let bytes = batch_query_to_bytes(&b_segs);
     let state = QueryState {
         key: key.to_vec(),
-        tag: foot.tag,
+        fingerprint: foot.fingerprint,
         c: c_segs,
         params,
     };

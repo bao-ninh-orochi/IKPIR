@@ -47,7 +47,7 @@ use ikpir_common::serialization::{
     batch_hint_to_bytes, batch_query_from_bytes, batch_response_to_bytes, params_to_bytes,
     SerdeError,
 };
-use segmented_cuckoo_filter::{Segmented3aryScheme, Segmented4aryScheme, SegmentedScheme};
+use segmented_cuckoo_filter::{Segmented3aryScheme, Segmented4aryScheme, Segmented2aryScheme};
 
 /// LWE matrix triple for one segment.
 #[derive(Clone)]
@@ -66,7 +66,7 @@ pub(crate) struct PerSegmentState {
 #[derive(Clone)]
 pub(crate) enum SegmentedMap {
     /// Segmented-2ary map.
-    Seg2(SegmentedCuckooMap<SegmentedScheme>),
+    Seg2(SegmentedCuckooMap<Segmented2aryScheme>),
     /// Segmented-3ary map.
     Seg3(SegmentedCuckooMap<Segmented3aryScheme>),
     /// Segmented-4ary map.
