@@ -8,17 +8,17 @@
 //!
 //! # Standard vs. Segmented
 //!
-//! | Scheme family | Index range           | `n` constraint              | Position storage  |
+//! | Scheme family | Index range           | `num_buckets` constraint              | Position storage  |
 //! |---------------|-----------------------|-----------------------------|-------------------|
-//! | Standard 2-ary  | Both in `[0, n)`    | Power of 2                  | None              |
-//! | Segmented 2-ary | `i1 ∈ [0, n/2)`, `i2 ∈ [n/2, n)` | Power of 2 ≥ 2 | None |
-//! | Standard 3-ary  | All in `[0, n)`     | Power of 3 (3^k)            | None              |
-//! | Segmented 3-ary | `i_j ∈ [j·seg, (j+1)·seg)` | `n = 3·2^m`      | None              |
-//! | Standard 4-ary  | All in `[0, n)`     | Power of 4 (4^k)            | None              |
-//! | Segmented 4-ary | `i_j ∈ [j·seg, (j+1)·seg)` | Power of 2 ≥ 4   | None              |
+//! | Standard 2-ary  | Both in `[0, num_buckets)`    | Power of 2                  | None              |
+//! | Segmented 2-ary | `i1 ∈ [0, num_buckets/2)`, `i2 ∈ [num_buckets/2, num_buckets)` | Power of 2 ≥ 2 | None |
+//! | Standard 3-ary  | All in `[0, num_buckets)`     | Power of 3 (`3^t`)          | None              |
+//! | Segmented 3-ary | `i_j ∈ [j·segment_size, (j+1)·segment_size)` | `num_buckets = 3·2^t` | None        |
+//! | Standard 4-ary  | All in `[0, num_buckets)`     | Power of 4 (`4^t`)          | None              |
+//! | Segmented 4-ary | `i_j ∈ [j·segment_size, (j+1)·segment_size)` | Power of 2 ≥ 4   | None              |
 //!
-//! Standard k > 2 schemes use xor3/xor4 cycling so `all_indices` always starts from
-//! `cur_index`. No per-slot position storage is needed for any scheme.
+//! Standard 3-ary and 4-ary schemes use xor3/xor4 cycling so `all_indices` always starts
+//! from `cur_index`. No per-slot position storage is needed for any scheme.
 //!
 //! # Security
 //!
@@ -36,10 +36,11 @@ use crate::hash;
 /// # Implementing this trait
 ///
 /// All methods must be consistent with each other:
-/// - `hash_item` and `all_indices` must be inverse: for any `(tag, indices)` returned by
-///   `hash_item`, `all_indices(indices[p], tag, p)` must return the same set of indices.
-/// - `position_of` must agree with `all_indices`: the position returned for an index must
-///   be the one that `all_indices` expects to recover the full chain.
+/// - `hash_item` and `all_indices` must be inverse: for any `(fingerprint, indices)` returned
+///   by `hash_item`, `all_indices(indices[p], fingerprint)` must return the same set of
+///   indices (possibly in a different order for standard 2-ary).
+/// - `position_of` must agree with the scheme layout: the position returned for an index
+///   must correctly identify which candidate slot that index occupies.
 pub trait IndexScheme {
     /// Return the number of candidate bucket indices per item (2, 3, or 4).
     ///
@@ -50,52 +51,53 @@ pub trait IndexScheme {
     /// the remaining elements are `0` (padding).
     fn arity(&self) -> usize;
 
-    /// Hash an item to produce a fingerprint and k candidate bucket indices.
+    /// Hash an item to produce a fingerprint and candidate bucket indices.
     ///
     /// This is the primary entry point for the filter's insert, lookup, and delete paths.
-    /// The fingerprint `tag` is derived from the lower 32 bits of the xxh3 hash; the
-    /// indices are derived from the upper 32 bits plus XOR chaining with tag-hash offsets.
+    /// The fingerprint is derived from the lower 32 bits of the xxh3 hash; the indices are
+    /// derived from the upper 32 bits plus XOR chaining with fingerprint-hash offsets.
     ///
     /// # Arguments
     ///
     /// - `item` — arbitrary byte slice representing the item to hash.
-    /// - `bits_per_tag` — fingerprint bit width (1–32); must match the filter's `fp_bits`.
+    /// - `fingerprint_bits` — fingerprint bit width.
+    ///
+    /// # Constraints
+    ///
+    /// - `fingerprint_bits` must be in `1..=32` and must match the filter's `fingerprint_bits`.
     ///
     /// # Returns
     ///
-    /// `(tag, indices)` where:
-    /// - `tag` is a non-zero fingerprint in `[1, 2^bits_per_tag]`.
+    /// `(fingerprint, indices)` where:
+    /// - `fingerprint` is a non-zero value in `[1, 2^fingerprint_bits]`.
     /// - `indices[0..arity()]` are the valid candidate bucket indices.
     /// - `indices[arity()..]` are `0` (unused padding).
-    fn hash_item(&self, item: &[u8], bits_per_tag: u32) -> (u32, [u32; 4]);
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]);
 
-    /// Reconstruct all k candidate indices from one known index, its fingerprint, and its
-    /// chain position.
+    /// Reconstruct all candidate indices from one known index and its fingerprint.
     ///
-    /// Called during cuckoo kicking: after evicting a tag from a bucket, the filter needs
-    /// to know all other buckets where it could be placed. Given one bucket index and the
-    /// stored position, this function regenerates the full candidate set.
+    /// Called during cuckoo kicking: given a bucket index and the fingerprint stored there,
+    /// regenerates the full candidate set. Position is derived from the index for segmented
+    /// schemes, irrelevant for standard 2-ary (XOR symmetry), and implicit in the xor3/xor4
+    /// cycling for standard 3-ary/4-ary.
     ///
     /// # Arguments
     ///
-    /// - `cur_index` — the bucket index currently holding (or being evicted from) the tag.
-    /// - `tag` — the fingerprint stored at `cur_index`.
-    /// - `position` — the 0-indexed chain position of `cur_index`:
-    ///   `0` = primary index (`i1`), `1` = first alternate (`i2`), etc.
-    ///   For segmented schemes this argument is ignored (position is derived from the index).
+    /// - `cur_index` — the bucket index currently holding (or being evicted from) the fingerprint.
+    /// - `fingerprint` — the fingerprint stored at `cur_index`.
     ///
     /// # Returns
     ///
-    /// `[i1, i2, …, 0, 0]` — the full candidate array in canonical chain order.
-    /// `result[0..arity()]` are valid; remainder is `0`.
-    fn all_indices(&self, cur_index: u32, tag: u32, position: u8) -> [u32; 4];
+    /// The full candidate array; `result[0..arity()]` are valid; remainder is `0`.
+    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4];
 
     /// Derive the chain position from a bucket index without extra storage.
     ///
     /// For **segmented** schemes the segment number encodes the position:
     /// `position = index / segment_size`. For **standard 2-ary** the XOR symmetry means
-    /// position is irrelevant (returns `0`). For **standard k > 2** schemes using xor3/xor4
-    /// cycling, `all_indices` always starts from `cur_index` at position 0, so this returns 0.
+    /// position is irrelevant (returns `0`). For **standard 3-ary and 4-ary** schemes using
+    /// xor3/xor4 cycling, `all_indices` always starts from `cur_index` at position 0, so
+    /// this returns 0.
     ///
     /// # Arguments
     ///
@@ -112,8 +114,9 @@ pub trait IndexScheme {
 /// Original (standard) 2-ary cuckoo filter scheme.
 ///
 /// Both candidate indices live anywhere in `[0, num_buckets)`. The XOR relationship
-/// `i2 = i1 ^ h1(tag)` is self-inverse, so no per-slot position storage is needed: given
-/// `(index, tag)` the alternate is always `index ^ h1(tag)`.
+/// `i2 = i1 ^ fingerprint_hash1(fingerprint, num_buckets)` is self-inverse, so no per-slot position
+/// storage is needed: given `(index, fingerprint)` the alternate is always
+/// `index ^ fingerprint_hash1(fingerprint, num_buckets)`.
 ///
 /// # Field
 ///
@@ -122,28 +125,28 @@ pub trait IndexScheme {
 /// # Examples
 ///
 /// ```rust
-/// use segmented_cuckoo_filter::scheme::{StandardScheme, IndexScheme};
+/// use segmented_cuckoo_filter::scheme::{Standard2aryScheme, IndexScheme};
 ///
-/// let scheme = StandardScheme { num_buckets: 64 };
-/// let (tag, idx) = scheme.hash_item(b"hello", 12);
-/// assert_ne!(tag, 0);
+/// let scheme = Standard2aryScheme { num_buckets: 64 };
+/// let (fingerprint, idx) = scheme.hash_item(b"hello", 12);
+/// assert_ne!(fingerprint, 0);
 /// assert!(idx[0] < 64 && idx[1] < 64);
 /// ```
 #[derive(Clone, Copy, Debug)]
-pub struct StandardScheme {
+pub struct Standard2aryScheme {
     /// Total bucket count; must be a power of 2 and ≥ 1.
     pub num_buckets: u32,
 }
 
-impl IndexScheme for StandardScheme {
+impl IndexScheme for Standard2aryScheme {
     fn arity(&self) -> usize {
         2
     }
-    fn hash_item(&self, item: &[u8], bits_per_tag: u32) -> (u32, [u32; 4]) {
-        hash::hash_item_standard(item, self.num_buckets, bits_per_tag)
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+        hash::hash_item_standard_2ary(item, self.num_buckets, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, tag: u32, position: u8) -> [u32; 4] {
-        hash::all_indices_standard(cur_index, tag, position, self.num_buckets)
+    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+        hash::all_indices_standard_2ary(cur_index, fingerprint, self.num_buckets)
     }
     fn position_of(&self, _index: u32) -> u8 {
         0 // irrelevant for 2-ary XOR
@@ -159,33 +162,33 @@ impl IndexScheme for StandardScheme {
 ///
 /// # Field
 ///
-/// - `half` — segment size (`n / 2`); must be a power of 2 and ≥ 1 (so `n ≥ 2`).
+/// - `half` — segment size (`num_buckets / 2`); must be a power of 2 and ≥ 1 (so `num_buckets ≥ 2`).
 ///
 /// # Examples
 ///
 /// ```rust
-/// use segmented_cuckoo_filter::scheme::{SegmentedScheme, IndexScheme};
+/// use segmented_cuckoo_filter::scheme::{Segmented2aryScheme, IndexScheme};
 ///
-/// let scheme = SegmentedScheme { half: 32 };
-/// let (tag, idx) = scheme.hash_item(b"hello", 12);
+/// let scheme = Segmented2aryScheme { half: 32 };
+/// let (fingerprint, idx) = scheme.hash_item(b"hello", 12);
 /// assert!(idx[0] < 32);
 /// assert!(idx[1] >= 32 && idx[1] < 64);
 /// ```
 #[derive(Clone, Copy, Debug)]
-pub struct SegmentedScheme {
-    /// Segment size (`n / 2`); must be a power of 2 and ≥ 1 so `n ≥ 2`.
+pub struct Segmented2aryScheme {
+    /// Segment size (`num_buckets / 2`); must be a power of 2 and ≥ 1 so `num_buckets ≥ 2`.
     pub half: u32,
 }
 
-impl IndexScheme for SegmentedScheme {
+impl IndexScheme for Segmented2aryScheme {
     fn arity(&self) -> usize {
         2
     }
-    fn hash_item(&self, item: &[u8], bits_per_tag: u32) -> (u32, [u32; 4]) {
-        hash::hash_item_segmented(item, self.half, bits_per_tag)
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+        hash::hash_item_segmented_2ary(item, self.half, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, tag: u32, _position: u8) -> [u32; 4] {
-        hash::all_indices_segmented(cur_index, tag, self.half)
+    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+        hash::all_indices_segmented_2ary(cur_index, fingerprint, self.half)
     }
     fn position_of(&self, index: u32) -> u8 {
         if index < self.half {
@@ -200,13 +203,14 @@ impl IndexScheme for SegmentedScheme {
 
 /// Standard 3-ary scheme: all three candidate indices in `[0, num_buckets)`.
 ///
-/// xor3 chain: `i2 = xor3(i1, h)`, `i3 = xor3(i2, h)` where `h = tag_hash_mod(tag, n)`.
-/// All three indices share the same range. No per-slot position storage is needed because
-/// `all_indices` always cycles from `cur_index` using xor3.
+/// xor3 chain: `i2 = xor3(i1, h)`, `i3 = xor3(i2, h)` where
+/// `h = fingerprint_hash_mod(fingerprint, num_buckets)`. All three indices share the same range. No
+/// per-slot position storage is needed because `all_indices` always cycles from `cur_index`
+/// using xor3.
 ///
 /// # Field
 ///
-/// - `num_buckets` — total bucket count; must be a power of 3 (3^k) and ≥ 1.
+/// - `num_buckets` — total bucket count; must be a power of 3 (`3^t`) and ≥ 1.
 ///
 /// # Examples
 ///
@@ -214,12 +218,12 @@ impl IndexScheme for SegmentedScheme {
 /// use segmented_cuckoo_filter::scheme::{Standard3aryScheme, IndexScheme};
 ///
 /// let scheme = Standard3aryScheme { num_buckets: 243 };
-/// let (tag, idx) = scheme.hash_item(b"hello", 12);
+/// let (fingerprint, idx) = scheme.hash_item(b"hello", 12);
 /// assert!(idx[0] < 243 && idx[1] < 243 && idx[2] < 243);
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Standard3aryScheme {
-    /// Total bucket count; must be a power of 3 (3^k) and ≥ 1.
+    /// Total bucket count; must be a power of 3 (`3^t`) and ≥ 1.
     pub num_buckets: u32,
 }
 
@@ -227,11 +231,11 @@ impl IndexScheme for Standard3aryScheme {
     fn arity(&self) -> usize {
         3
     }
-    fn hash_item(&self, item: &[u8], bits_per_tag: u32) -> (u32, [u32; 4]) {
-        hash::hash_item_standard_3ary(item, self.num_buckets, bits_per_tag)
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+        hash::hash_item_standard_3ary(item, self.num_buckets, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, tag: u32, position: u8) -> [u32; 4] {
-        hash::all_indices_standard_3ary(cur_index, tag, position, self.num_buckets)
+    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+        hash::all_indices_standard_3ary(cur_index, fingerprint, self.num_buckets)
     }
     /// With xor3 cycling, `all_indices` always starts from `cur_index` at position 0.
     fn position_of(&self, _index: u32) -> u8 {
@@ -239,22 +243,22 @@ impl IndexScheme for Standard3aryScheme {
     }
 }
 
-/// Segmented 3-ary scheme: `i_j ∈ [j·seg, (j+1)·seg)` for j = 0, 1, 2.
+/// Segmented 3-ary scheme: `i_j ∈ [j·segment_size, (j+1)·segment_size)` for j = 0, 1, 2.
 ///
-/// The table is divided into three equal segments. `n = 3 · seg` where `seg` must be a
-/// power of 2. Chain position is derived from `index / seg` — no per-slot storage needed.
+/// The table is divided into three equal segments. `num_buckets = 3 · segment_size` where `segment_size` must be a
+/// power of 2. Chain position is derived from `index / segment_size` — no per-slot storage needed.
 /// This is a key advantage over [`Standard3aryScheme`] at identical load capacity.
 ///
 /// # Field
 ///
-/// - `segment_size` — size of each segment (`n / 3`); must be a power of 2.
+/// - `segment_size` — size of each segment (`num_buckets / 3`); must be a power of 2.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use segmented_cuckoo_filter::scheme::{Segmented3aryScheme, IndexScheme};
 ///
-/// let scheme = Segmented3aryScheme { segment_size: 32 }; // n = 96
+/// let scheme = Segmented3aryScheme { segment_size: 32 }; // num_buckets = 96
 /// let (_, idx) = scheme.hash_item(b"hello", 12);
 /// assert!(idx[0] < 32);
 /// assert!(idx[1] >= 32 && idx[1] < 64);
@@ -262,7 +266,7 @@ impl IndexScheme for Standard3aryScheme {
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Segmented3aryScheme {
-    /// Size of each segment (`n / 3`); must be a power of 2.
+    /// Size of each segment (`num_buckets / 3`); must be a power of 2.
     pub segment_size: u32,
 }
 
@@ -270,11 +274,11 @@ impl IndexScheme for Segmented3aryScheme {
     fn arity(&self) -> usize {
         3
     }
-    fn hash_item(&self, item: &[u8], bits_per_tag: u32) -> (u32, [u32; 4]) {
-        hash::hash_item_segmented_3ary(item, self.segment_size, bits_per_tag)
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+        hash::hash_item_segmented_3ary(item, self.segment_size, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, tag: u32, _position: u8) -> [u32; 4] {
-        hash::all_indices_segmented_3ary(cur_index, tag, self.segment_size)
+    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+        hash::all_indices_segmented_3ary(cur_index, fingerprint, self.segment_size)
     }
     fn position_of(&self, index: u32) -> u8 {
         (index / self.segment_size) as u8
@@ -286,12 +290,12 @@ impl IndexScheme for Segmented3aryScheme {
 /// Standard 4-ary scheme: all four candidate indices in `[0, num_buckets)`.
 ///
 /// xor4 chain: `i2 = xor4(i1, h)`, `i3 = xor4(i2, h)`, `i4 = xor4(i3, h)` where
-/// `h = tag_hash1(tag, n)`. The widest standard variant. No per-slot storage is needed
-/// because `all_indices` always cycles from `cur_index` using xor4.
+/// `h = fingerprint_hash1(fingerprint, num_buckets)`. The widest standard variant. No per-slot storage
+/// is needed because `all_indices` always cycles from `cur_index` using xor4.
 ///
 /// # Field
 ///
-/// - `num_buckets` — total bucket count; must be a power of 4 (4^k) and ≥ 1.
+/// - `num_buckets` — total bucket count; must be a power of 4 (`4^t`) and ≥ 1.
 ///
 /// # Examples
 ///
@@ -304,7 +308,7 @@ impl IndexScheme for Segmented3aryScheme {
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Standard4aryScheme {
-    /// Total bucket count; must be a power of 4 (4^k) and ≥ 1.
+    /// Total bucket count; must be a power of 4 (`4^t`) and ≥ 1.
     pub num_buckets: u32,
 }
 
@@ -312,11 +316,11 @@ impl IndexScheme for Standard4aryScheme {
     fn arity(&self) -> usize {
         4
     }
-    fn hash_item(&self, item: &[u8], bits_per_tag: u32) -> (u32, [u32; 4]) {
-        hash::hash_item_standard_4ary(item, self.num_buckets, bits_per_tag)
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+        hash::hash_item_standard_4ary(item, self.num_buckets, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, tag: u32, position: u8) -> [u32; 4] {
-        hash::all_indices_standard_4ary(cur_index, tag, position, self.num_buckets)
+    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+        hash::all_indices_standard_4ary(cur_index, fingerprint, self.num_buckets)
     }
     /// With xor4 cycling, `all_indices` always starts from `cur_index` at position 0.
     fn position_of(&self, _index: u32) -> u8 {
@@ -324,22 +328,22 @@ impl IndexScheme for Standard4aryScheme {
     }
 }
 
-/// Segmented 4-ary scheme: `i_j ∈ [j·seg, (j+1)·seg)` for j = 0, 1, 2, 3.
+/// Segmented 4-ary scheme: `i_j ∈ [j·segment_size, (j+1)·segment_size)` for j = 0, 1, 2, 3.
 ///
-/// The table is divided into four equal segments. `n = 4 · seg` where `seg` must be a
-/// power of 2 (equivalently, `n` is a power of 2 and ≥ 4). Position is derived from
-/// `index / seg`, so **no per-slot position storage is needed**.
+/// The table is divided into four equal segments. `num_buckets = 4 · segment_size` where `segment_size` must be a
+/// power of 2 (equivalently, `num_buckets` is a power of 2 and ≥ 4). Position is derived from
+/// `index / segment_size`, so **no per-slot position storage is needed**.
 ///
 /// # Field
 ///
-/// - `segment_size` — size of each segment (`n / 4`); must be a power of 2.
+/// - `segment_size` — size of each segment (`num_buckets / 4`); must be a power of 2.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use segmented_cuckoo_filter::scheme::{Segmented4aryScheme, IndexScheme};
 ///
-/// let scheme = Segmented4aryScheme { segment_size: 16 }; // n = 64
+/// let scheme = Segmented4aryScheme { segment_size: 16 }; // num_buckets = 64
 /// let (_, idx) = scheme.hash_item(b"hello", 12);
 /// assert!(idx[0] < 16);
 /// assert!(idx[1] >= 16 && idx[1] < 32);
@@ -348,7 +352,7 @@ impl IndexScheme for Standard4aryScheme {
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Segmented4aryScheme {
-    /// Size of each segment (`n / 4`); must be a power of 2.
+    /// Size of each segment (`num_buckets / 4`); must be a power of 2.
     pub segment_size: u32,
 }
 
@@ -356,11 +360,11 @@ impl IndexScheme for Segmented4aryScheme {
     fn arity(&self) -> usize {
         4
     }
-    fn hash_item(&self, item: &[u8], bits_per_tag: u32) -> (u32, [u32; 4]) {
-        hash::hash_item_segmented_4ary(item, self.segment_size, bits_per_tag)
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+        hash::hash_item_segmented_4ary(item, self.segment_size, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, tag: u32, _position: u8) -> [u32; 4] {
-        hash::all_indices_segmented_4ary(cur_index, tag, self.segment_size)
+    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+        hash::all_indices_segmented_4ary(cur_index, fingerprint, self.segment_size)
     }
     fn position_of(&self, index: u32) -> u8 {
         (index / self.segment_size) as u8
@@ -375,17 +379,17 @@ mod tests {
 
     #[test]
     fn segmented_fingerprint_non_zero() {
-        let scheme = SegmentedScheme { half: 64 };
+        let scheme = Segmented2aryScheme { half: 64 };
         for i in 0u32..1000 {
-            let (tag, _) = scheme.hash_item(&i.to_le_bytes(), 12);
-            assert_ne!(tag, 0);
+            let (fingerprint, _) = scheme.hash_item(&i.to_le_bytes(), 12);
+            assert_ne!(fingerprint, 0);
         }
     }
 
     #[test]
     fn segmented_index_ranges() {
         let half = 128u32;
-        let scheme = SegmentedScheme { half };
+        let scheme = Segmented2aryScheme { half };
         for i in 0u32..1000 {
             let (_, idx) = scheme.hash_item(&i.to_le_bytes(), 12);
             assert!(idx[0] < half);
@@ -396,11 +400,11 @@ mod tests {
     #[test]
     fn segmented_all_indices_round_trip() {
         let half = 256u32;
-        let scheme = SegmentedScheme { half };
+        let scheme = Segmented2aryScheme { half };
         for i in 0u32..1000 {
-            let (tag, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
-            for p in 0..2u8 {
-                let a = scheme.all_indices(idx[p as usize], tag, p);
+            let (fingerprint, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
+            for p in 0..2 {
+                let a = scheme.all_indices(idx[p], fingerprint);
                 assert_eq!(a[0], idx[0]);
                 assert_eq!(a[1], idx[1]);
             }
@@ -409,23 +413,28 @@ mod tests {
 
     #[test]
     fn standard_fingerprint_non_zero() {
-        let scheme = StandardScheme { num_buckets: 128 };
+        let scheme = Standard2aryScheme { num_buckets: 128 };
         for i in 0u32..1000 {
-            let (tag, _) = scheme.hash_item(&i.to_le_bytes(), 12);
-            assert_ne!(tag, 0);
+            let (fingerprint, _) = scheme.hash_item(&i.to_le_bytes(), 12);
+            assert_ne!(fingerprint, 0);
         }
     }
 
     #[test]
     fn standard_all_indices_round_trip() {
-        let n = 256u32;
-        let scheme = StandardScheme { num_buckets: n };
+        let num_buckets = 256u32;
+        let scheme = Standard2aryScheme { num_buckets: num_buckets };
         for i in 0u32..1000 {
-            let (tag, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
-            for p in 0..2u8 {
-                let a = scheme.all_indices(idx[p as usize], tag, p);
-                assert_eq!(a[0], idx[0]);
-                assert_eq!(a[1], idx[1]);
+            let (fingerprint, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
+            // TEST-CHANGE: position param removed from all_indices; calling with idx[1]
+            // now returns [idx[1], idx[0]] instead of [idx[0], idx[1]], so sort-and-compare.
+            for &start in &[idx[0], idx[1]] {
+                let a = scheme.all_indices(start, fingerprint);
+                let mut got = [a[0], a[1]];
+                got.sort();
+                let mut exp = [idx[0], idx[1]];
+                exp.sort();
+                assert_eq!(got, exp, "i={}", i);
             }
         }
     }
@@ -434,12 +443,12 @@ mod tests {
 
     #[test]
     fn standard_3ary_round_trip() {
-        let n = 243u32;
-        let scheme = Standard3aryScheme { num_buckets: n };
+        let num_buckets = 243u32;
+        let scheme = Standard3aryScheme { num_buckets: num_buckets };
         for i in 0u32..1000 {
-            let (tag, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
-            for p in 0..3u8 {
-                let a = scheme.all_indices(idx[p as usize], tag, p);
+            let (fingerprint, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
+            for p in 0..3 {
+                let a = scheme.all_indices(idx[p], fingerprint);
                 let mut expected = [idx[0], idx[1], idx[2]];
                 expected.sort();
                 let mut got = [a[0], a[1], a[2]];
@@ -459,15 +468,15 @@ mod tests {
 
     #[test]
     fn segmented_3ary_round_trip() {
-        let seg = 128u32;
-        let scheme = Segmented3aryScheme { segment_size: seg };
+        let segment_size = 128u32;
+        let scheme = Segmented3aryScheme { segment_size: segment_size };
         for i in 0u32..1000 {
-            let (tag, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
-            assert!(idx[0] < seg);
-            assert!(idx[1] >= seg && idx[1] < 2 * seg);
-            assert!(idx[2] >= 2 * seg && idx[2] < 3 * seg);
+            let (fingerprint, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
+            assert!(idx[0] < segment_size);
+            assert!(idx[1] >= segment_size && idx[1] < 2 * segment_size);
+            assert!(idx[2] >= 2 * segment_size && idx[2] < 3 * segment_size);
             for p in 0..3 {
-                let a = scheme.all_indices(idx[p], tag, p as u8);
+                let a = scheme.all_indices(idx[p], fingerprint);
                 assert_eq!(
                     [a[0], a[1], a[2]],
                     [idx[0], idx[1], idx[2]],
@@ -483,12 +492,12 @@ mod tests {
 
     #[test]
     fn standard_4ary_round_trip() {
-        let n = 256u32;
-        let scheme = Standard4aryScheme { num_buckets: n };
+        let num_buckets = 256u32;
+        let scheme = Standard4aryScheme { num_buckets: num_buckets };
         for i in 0u32..1000 {
-            let (tag, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
-            for p in 0..4u8 {
-                let a = scheme.all_indices(idx[p as usize], tag, p);
+            let (fingerprint, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
+            for p in 0..4 {
+                let a = scheme.all_indices(idx[p], fingerprint);
                 let mut expected = [idx[0], idx[1], idx[2], idx[3]];
                 expected.sort();
                 let mut got = [a[0], a[1], a[2], a[3]];
@@ -508,16 +517,16 @@ mod tests {
 
     #[test]
     fn segmented_4ary_round_trip() {
-        let seg = 64u32;
-        let scheme = Segmented4aryScheme { segment_size: seg };
+        let segment_size = 64u32;
+        let scheme = Segmented4aryScheme { segment_size: segment_size };
         for i in 0u32..1000 {
-            let (tag, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
-            assert!(idx[0] < seg);
-            assert!(idx[1] >= seg && idx[1] < 2 * seg);
-            assert!(idx[2] >= 2 * seg && idx[2] < 3 * seg);
-            assert!(idx[3] >= 3 * seg && idx[3] < 4 * seg);
-            for p in 0..4u8 {
-                let a = scheme.all_indices(idx[p as usize], tag, p);
+            let (fingerprint, idx) = scheme.hash_item(&i.to_le_bytes(), 16);
+            assert!(idx[0] < segment_size);
+            assert!(idx[1] >= segment_size && idx[1] < 2 * segment_size);
+            assert!(idx[2] >= 2 * segment_size && idx[2] < 3 * segment_size);
+            assert!(idx[3] >= 3 * segment_size && idx[3] < 4 * segment_size);
+            for p in 0..4 {
+                let a = scheme.all_indices(idx[p], fingerprint);
                 assert_eq!(a, idx, "i={} p={}", i, p);
             }
         }
@@ -527,7 +536,7 @@ mod tests {
 
     #[test]
     fn segmented_position_of() {
-        let scheme = SegmentedScheme { half: 64 };
+        let scheme = Segmented2aryScheme { half: 64 };
         assert_eq!(scheme.position_of(0), 0);
         assert_eq!(scheme.position_of(63), 0);
         assert_eq!(scheme.position_of(64), 1);
@@ -558,7 +567,7 @@ mod tests {
     #[test]
     fn standard_2ary_position_of_always_zero() {
         // For 2-ary standard, position_of is defined but effectively unused (XOR symmetry).
-        let scheme = StandardScheme { num_buckets: 64 };
+        let scheme = Standard2aryScheme { num_buckets: 64 };
         assert_eq!(scheme.position_of(0), 0);
         assert_eq!(scheme.position_of(63), 0);
     }

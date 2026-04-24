@@ -24,8 +24,8 @@ sharing identical insert/lookup/delete logic and differing only in index computa
 - **k-ary partial-key cuckoo hashing.** We extend the XOR-based partial-key scheme of
   Fan et al. (2014) from 2 candidate buckets to 3 and 4, using the xor3 and xor4 operations
   from Liu et al. (2017). The xord *cycling property* (applying xord d times returns to the
-  start) enables reconstruction of all k candidate indices from any one index and the tag,
-  without per-slot position storage, for all arities.
+  start) enables reconstruction of all k candidate indices from any one index and the
+  fingerprint, without per-slot position storage, for all arities.
 
 - **Segmented (k-partite) cuckoo filter construction.** We propose a variant that confines
   each of the k candidate indices to a dedicated segment of the table. The chain position is
@@ -33,7 +33,7 @@ sharing identical insert/lookup/delete logic and differing only in index computa
   arity.
 
 - **Comprehensive empirical comparison.** We benchmark all 6 variants on load factor,
-  insert/lookup/delete throughput, false-positive rate, and eviction chain statistics,
+  insert/lookup/delete throughput, false-positive rate, and degree distribution,
   and compare against theoretical thresholds from k-ary cuckoo hashing theory.
 
 ## Key Findings
@@ -42,7 +42,7 @@ sharing identical insert/lookup/delete logic and differing only in index computa
 |---|---|
 | **k-ary works as expected** | 3-ary and 4-ary standard filters (xor3/xor4 construction) achieve load factors 0.15--2.10% below theoretical thresholds, consistent with the partial-key penalty |
 | **Segmented matches or beats standard** | For b >= 2, segmented achieves +0.04% to +0.23% higher load factor than standard at the same arity |
-| **3-ary standard throughput limited by modulo** | Standard 3-ary (n = 3^k) uses modulo-based `tag_hash_mod` which is slower than the bitmask operations available when n is a power of 2 |
+| **3-ary standard throughput limited by modulo** | Standard 3-ary (n = 3^k) uses modulo-based `fingerprint_hash_mod` which is slower than the bitmask operations available when n is a power of 2 |
 | **Load factor decreases with table size** | For fixed `max_kicks = 500`, larger tables achieve lower load factor (the kick budget becomes proportionally smaller) |
 
 ---
@@ -69,9 +69,9 @@ src/
   lib.rs             -- public API, type aliases for all 6 filter types
   filter.rs          -- CuckooFilter<S>: generic insert/lookup/delete with cuckoo kicking
   scheme.rs          -- IndexScheme trait + 6 concrete scheme structs
-  hash.rs            -- xxHash3 item hashing, tag-hash functions, index reconstruction
-  bucket.rs          -- TagTable: bit-packed fingerprint storage (arbitrary bit widths)
-  util.rs            -- upper_power_of_2, power-of-3 and power-of-4 helpers
+  hash.rs            -- xxHash3 item hashing, fingerprint-hash functions, index reconstruction
+  bucket.rs          -- FingerprintTable: bit-packed fingerprint storage (arbitrary bit widths)
+  util.rs            -- next_power_of_2, power-of-3 and power-of-4 helpers
 
 examples/
   basic_usage.rs     -- demo of both 2-ary filter types
@@ -159,9 +159,6 @@ you can recover the other index: `i_other = index XOR h(fingerprint)`. This is c
 *partial-key cuckoo hashing* and is what makes cuckoo filters practical -- eviction only
 needs the stored fingerprint, not the original item.
 
-> **Terminology.** From here on we use **tag** to refer to the fingerprint, following the
-> implementation's naming convention.
-
 ---
 
 ## Extension 1: k-ary Partial-Key Cuckoo Hashing
@@ -200,25 +197,25 @@ xor4(xor4(xor4(xor4(a, b), b), b), b) = a  (4 applications return to start)
 ### Index chain construction
 
 The candidate indices for a k-ary filter are a chained application of xord with a
-tag-derived offset. The offset uses `tag_hash` masked to `[0, n)`:
+fingerprint-derived offset. The offset uses `fingerprint_hash` masked to `[0, n)`:
 
 **Standard 3-ary** (`n` must be a power of 3, `3^k`):
 ```
-tag_hash(tag) = (tag * 0x5bd1e995) % n      (modulo, because n is not a power of 2)
+fingerprint_hash(fp) = (fp * 0x5bd1e995) % n      (modulo, because n is not a power of 2)
 
-i1 = H(x) % n                  (primary index)
-i2 = xor3(i1, tag_hash(tag))   (first alternate)
-i3 = xor3(i2, tag_hash(tag))   (second alternate)
+i1 = H(x) % n                          (primary index)
+i2 = xor3(i1, fingerprint_hash(fp))    (first alternate)
+i3 = xor3(i2, fingerprint_hash(fp))    (second alternate)
 ```
 
 **Standard 4-ary** (`n` must be a power of 4, `4^k`):
 ```
-tag_hash(tag) = (tag * 0x5bd1e995) & (n-1)  (bitmask, because n is a power of 2)
+fingerprint_hash(fp) = (fp * 0x5bd1e995) & (n-1)  (bitmask, because n is a power of 2)
 
-i1 = (H(x) >> 32) & (n-1)      (primary index)
-i2 = xor4(i1, tag_hash(tag))   (first alternate)
-i3 = xor4(i2, tag_hash(tag))   (second alternate)
-i4 = xor4(i3, tag_hash(tag))   (third alternate)
+i1 = (H(x) >> 32) & (n-1)              (primary index)
+i2 = xor4(i1, fingerprint_hash(fp))    (first alternate)
+i3 = xor4(i2, fingerprint_hash(fp))    (second alternate)
+i4 = xor4(i3, fingerprint_hash(fp))    (third alternate)
 ```
 
 ### Cycling property: no position storage needed
@@ -228,31 +225,31 @@ every step, and the cycling property means all k candidates can be reconstructed
 one of them by cycling forward:
 
 ```
-Given cur_index and tag, all k candidates are:
+Given cur_index and fingerprint (fp), all k candidates are:
     indices[0] = cur_index
-    indices[1] = xord(cur_index, tag_hash(tag))
-    indices[2] = xord(indices[1], tag_hash(tag))
+    indices[1] = xord(cur_index, fingerprint_hash(fp))
+    indices[2] = xord(indices[1], fingerprint_hash(fp))
     ...
-    indices[k-1] = xord(indices[k-2], tag_hash(tag))
+    indices[k-1] = xord(indices[k-2], fingerprint_hash(fp))
 ```
 
 Because the cycling property guarantees the full set is always produced (just starting from
 a different point in the cycle), **no per-slot chain position storage is needed for any
 scheme** -- not even for standard k > 2 filters.
 
-### Tag-hash functions
+### Fingerprint-hash functions
 
 | Function | Definition | Usage |
 |---|---|---|
-| `tag_hash1(tag)` | `(tag * 0x5bd1e995) & (range-1)` | 2-ary and 4-ary (range = n or seg) |
-| `tag_hash2(tag)` | `(tag * 0xcc9e2d51) & (range-1)` | Segmented 3/4-ary (within-segment offset) |
-| `tag_hash3(tag)` | `(tag * 0x1b873593) & (range-1)` | Segmented 4-ary (within-segment offset) |
-| `tag_hash_mod(tag)` | `(tag * 0x5bd1e995) % range` | Standard 3-ary (range = n = 3^k, not power of 2) |
+| `fingerprint_hash1(fp)` | `(fp * 0x5bd1e995) & (range-1)` | 2-ary and 4-ary (range = n or segment_size) |
+| `fingerprint_hash2(fp)` | `(fp * 0xcc9e2d51) & (range-1)` | Segmented 3/4-ary (within-segment offset) |
+| `fingerprint_hash3(fp)` | `(fp * 0x1b873593) & (range-1)` | Segmented 4-ary (within-segment offset) |
+| `fingerprint_hash_mod(fp)` | `(fp * 0x5bd1e995) % range` | Standard 3-ary (range = n = 3^k, not power of 2) |
 
-The item hash function is xxHash3 (64-bit, non-cryptographic). The tag is extracted from
-the lower 32 bits; the primary index `i1` from the upper 32 bits (bitmask) or using modulo
-for 3-ary. A tag of 0 is forbidden (it marks an empty slot); if the hash yields 0, it is
-replaced with 1.
+The item hash function is xxHash3 (64-bit, non-cryptographic). The fingerprint is extracted
+from the lower 32 bits; the primary index `i1` from the upper 32 bits (bitmask) or using
+modulo for 3-ary. A fingerprint of 0 is forbidden (it marks an empty slot); if the hash
+yields 0, it is replaced with 1.
 
 ---
 
@@ -281,55 +278,55 @@ A segmented cuckoo filter divides the `n` buckets into `k` equal **segments** an
 each candidate index to its own segment:
 
 ```
-k = 2:  seg = n/2,   i1 in [0, seg),     i2 in [seg, 2*seg)
-k = 3:  seg = n/3,   i1 in [0, seg),     i2 in [seg, 2*seg),     i3 in [2*seg, 3*seg)
-k = 4:  seg = n/4,   i1 in [0, seg),     i2 in [seg, 2*seg),     i3 in [2*seg, 3*seg),  i4 in [3*seg, 4*seg)
+k = 2:  segment_size = n/2,   i1 in [0, segment_size),     i2 in [segment_size, 2*segment_size)
+k = 3:  segment_size = n/3,   i1 in [0, segment_size),     i2 in [segment_size, 2*segment_size),     i3 in [2*segment_size, 3*segment_size)
+k = 4:  segment_size = n/4,   i1 in [0, segment_size),     i2 in [segment_size, 2*segment_size),     i3 in [2*segment_size, 3*segment_size),  i4 in [3*segment_size, 4*segment_size)
 ```
 
 The partial-key XOR formulas work *within* each segment. Writing `i_j_local` for the offset
-within segment j (i.e., `i_j = j * seg + i_j_local`):
+within segment j (i.e., `i_j = j * segment_size + i_j_local`):
 
 **Segmented 2-ary:**
 ```
-i1_local = (H(x) >> 32) & (seg - 1)
-i2_local = i1_local XOR h1(tag)            -- h1 output masked to [0, seg)
+i1_local = (H(x) >> 32) & (segment_size - 1)
+i2_local = i1_local XOR h1(fp)             -- h1 output masked to [0, segment_size)
 
 i1 = i1_local                               -- segment 0
-i2 = seg + i2_local                         -- segment 1
+i2 = segment_size + i2_local                         -- segment 1
 ```
 
 **Segmented 3-ary:**
 ```
-i1_local = (H(x) >> 32) & (seg - 1)
-i2_local = i1_local XOR h1(tag)            -- h1 masked to [0, seg)
-i3_local = i2_local XOR h2(tag)            -- h2 masked to [0, seg)
+i1_local = (H(x) >> 32) & (segment_size - 1)
+i2_local = i1_local XOR h1(fp)             -- h1 masked to [0, segment_size)
+i3_local = i2_local XOR h2(fp)             -- h2 masked to [0, segment_size)
 
-i1 = 0 * seg + i1_local                    -- segment 0
-i2 = 1 * seg + i2_local                    -- segment 1
-i3 = 2 * seg + i3_local                    -- segment 2
+i1 = 0 * segment_size + i1_local                    -- segment 0
+i2 = 1 * segment_size + i2_local                    -- segment 1
+i3 = 2 * segment_size + i3_local                    -- segment 2
 ```
 
 **Segmented 4-ary:**
 ```
-i1_local = (H(x) >> 32) & (seg - 1)
-i2_local = i1_local XOR h1(tag)
-i3_local = i2_local XOR h2(tag)
-i4_local = i3_local XOR h3(tag)
+i1_local = (H(x) >> 32) & (segment_size - 1)
+i2_local = i1_local XOR h1(fp)
+i3_local = i2_local XOR h2(fp)
+i4_local = i3_local XOR h3(fp)
 
-i1 = 0 * seg + i1_local                    -- segment 0
-i2 = 1 * seg + i2_local                    -- segment 1
-i3 = 2 * seg + i3_local                    -- segment 2
-i4 = 3 * seg + i4_local                    -- segment 3
+i1 = 0 * segment_size + i1_local                    -- segment 0
+i2 = 1 * segment_size + i2_local                    -- segment 1
+i3 = 2 * segment_size + i3_local                    -- segment 2
+i4 = 3 * segment_size + i4_local                    -- segment 3
 ```
 
-> **Note:** The segment size `seg` **must** be a power of two so that the `& (seg - 1)` mask
+> **Note:** The segment size `segment_size` **must** be a power of two so that the `& (segment_size - 1)` mask
 > replaces a modulo operation. This means n must be `k * 2^m` for some m >= 0.
 
 ### Why no position storage is needed
 
 In a segmented filter, the chain position of any index is determined by which segment it
-falls in: `position = index / seg`. During eviction, the filter reads the bucket index,
-divides by `seg`, and immediately knows the chain position -- no per-slot storage required.
+falls in: `position = index / segment_size`. During cuckoo kicking, the filter reads the bucket index,
+divides by `segment_size`, and immediately knows the chain position -- no per-slot storage required.
 
 Standard k > 2 filters achieve the same result via the xord cycling property (Liu et al.
 2017): since applying xord d times returns to the starting index, all k candidates can be
@@ -353,7 +350,7 @@ Both constructions therefore need zero per-slot position storage for any arity.
 
 ### Parameters
 
-All experiments use `fp_bits = 12` (unless sweeping fp_bits), `max_kicks = 500`, and the
+All experiments use `fingerprint_bits = 12` (unless sweeping `fingerprint_bits`), `max_kicks = 500`, and the
 xxHash3 item hash. The table sizes tested are:
 
 - **Standard 2-ary:** n in {2^14, 2^16, 2^18, 2^20}
@@ -372,8 +369,7 @@ xxHash3 item hash. The table sizes tested are:
 | `insert_throughput` | MOps/s while filling to capacity | 10 per config |
 | `lookup_throughput` | MOps/s at 5 hit rates (0%, 25%, 50%, 75%, 100%) after filling | 10 per config |
 | `delete_throughput` | MOps/s deleting all items after filling | 10 per config |
-| `fpr` | False-positive rate, sweeping fp_bits from minimum to 32 | 1 per fp_bits |
-| `eviction` | Kick-chain statistics (mean kicks, histogram) | 1 per config |
+| `fpr` | False-positive rate, sweeping `fingerprint_bits` from minimum to 32 | 1 per value |
 | `degree_distribution` | Per-bucket occupancy (degree) at saturation | 1 per config |
 
 ### Running benchmarks
@@ -385,7 +381,6 @@ cargo bench --bench insert_throughput
 cargo bench --bench lookup_throughput
 cargo bench --bench delete_throughput
 cargo bench --bench fpr
-cargo bench --bench eviction
 cargo bench --bench degree_distribution
 
 # All in sequence
@@ -394,7 +389,6 @@ cargo bench --bench insert_throughput && \
 cargo bench --bench lookup_throughput && \
 cargo bench --bench delete_throughput && \
 cargo bench --bench fpr && \
-cargo bench --bench eviction && \
 cargo bench --bench degree_distribution
 
 # Generate plots from CSV results
@@ -410,10 +404,8 @@ python scripts/plot.py load_factor_by_kicks 2 4   # MAX_KICKS sweep, arity=2 b=4
 python scripts/plot.py insert_throughput          # insert throughput bars per arity
 python scripts/plot.py delete_throughput          # delete throughput bars per arity
 python scripts/plot.py lookup_throughput          # lookup at 5 hit rates (0/25/50/75/100%)
-python scripts/plot.py fpr_load_factor            # load factor vs fp_bits
-python scripts/plot.py fpr_comparison             # FPR vs fp_bits with d·b/2^f bound
-python scripts/plot.py eviction                   # eviction distribution stacked bars
-python scripts/plot.py eviction_mean_kicks        # mean evictions per insert vs n
+python scripts/plot.py fpr_load_factor            # load factor vs fingerprint_bits
+python scripts/plot.py fpr_comparison             # FPR vs fingerprint_bits with d·b/2^f bound
 python scripts/plot.py degree_index               # bucket degree vs index scatter
 python scripts/plot.py degree_histogram           # degree histogram per (arity, b)
 ```

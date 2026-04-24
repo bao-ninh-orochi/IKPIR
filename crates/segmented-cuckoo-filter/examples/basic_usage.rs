@@ -1,6 +1,6 @@
 use segmented_cuckoo_filter::{
-    Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, SegmentedCuckooFilter,
-    Standard3aryCuckooFilter, Standard4aryCuckooFilter, StandardCuckooFilter,
+    Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, Segmented2aryCuckooFilter,
+    Standard3aryCuckooFilter, Standard4aryCuckooFilter, Standard2aryCuckooFilter,
 };
 
 macro_rules! demo {
@@ -29,37 +29,75 @@ macro_rules! demo {
 }
 
 fn main() {
+
+    // ==== USING `new` CONSTRUCTOR =====================================================
+
     // ── 2-ary ─────────────────────────────────────────────────────────────────
+    // Segmented 2-ary: num_buckets must be a power of 2 and ≥ 2.
     demo!(
         "Segmented 2-ary Cuckoo Filter",
-        SegmentedCuckooFilter::from_num_items(100_000, 4, 12).unwrap()
+        Segmented2aryCuckooFilter::new(128, 4, 12).unwrap()
     );
+    // Standard 2-ary: num_buckets must be a power of 2 and ≥ 2.
     demo!(
         "Standard 2-ary Cuckoo Filter",
-        StandardCuckooFilter::from_num_items(100_000, 4, 12).unwrap()
+        Standard2aryCuckooFilter::new(128, 4, 12).unwrap()
     );
 
     // ── 3-ary ─────────────────────────────────────────────────────────────────
-    // Standard 3-ary: n must be power of 2; from_num_items auto-sizes.
-    demo!(
-        "Standard 3-ary Cuckoo Filter",
-        Standard3aryCuckooFilter::from_num_items(100_000, 4, 12).unwrap()
-    );
-    // Segmented 3-ary: n must be 3·2^m; from_num_items auto-sizes.
+    // Segmented 3-ary: num_buckets must be 3·2^m (num_buckets/3 is a power of 2).
     demo!(
         "Segmented 3-ary Cuckoo Filter",
-        Segmented3aryCuckooFilter::from_num_items(100_000, 4, 12).unwrap()
+        Segmented3aryCuckooFilter::from_num_items(96, 4, 12).unwrap()   // 3 * 2^5 = 96 buckets
+    );
+    // Standard 3-ary: num_buckets must be a power of 3 and ≥ 1.
+    demo!(
+        "Standard 3-ary Cuckoo Filter",
+        Standard3aryCuckooFilter::from_num_items(81, 4, 12).unwrap()  // 3^4 = 81 buckets
     );
 
     // ── 4-ary ─────────────────────────────────────────────────────────────────
-    // Standard 4-ary: n must be power of 2; from_num_items auto-sizes.
-    demo!(
-        "Standard 4-ary Cuckoo Filter",
-        Standard4aryCuckooFilter::from_num_items(100_000, 4, 12).unwrap()
-    );
-    // Segmented 4-ary: n must be power of 2 and ≥ 4; from_num_items auto-sizes.
+    // Segmented 4-ary: num_buckets must be a power of 2 and ≥ 4 (ensures each segment is also a power of 2).
     demo!(
         "Segmented 4-ary Cuckoo Filter",
-        Segmented4aryCuckooFilter::from_num_items(100_000, 4, 12).unwrap()
+        Segmented4aryCuckooFilter::from_num_items(128, 4, 12).unwrap()
+    );
+    // Standard 4-ary: num_buckets must be a power of 4 and ≥ 1.
+    demo!(
+        "Standard 4-ary Cuckoo Filter",
+        Standard4aryCuckooFilter::from_num_items(64, 4, 12).unwrap()  // 4^3 = 64 buckets
+    );
+    
+
+    // ==== USING `from_num_items` CONSTRUCTOR =====================================================
+
+    // ── 2-ary ─────────────────────────────────────────────────────────────────
+    demo!(
+        "Segmented 2-ary Cuckoo Filter",
+        Segmented2aryCuckooFilter::from_num_items(100, 4, 12).unwrap()
+    );
+    demo!(
+        "Standard 2-ary Cuckoo Filter",
+        Standard2aryCuckooFilter::from_num_items(100, 4, 12).unwrap()
+    );
+
+    // ── 3-ary ─────────────────────────────────────────────────────────────────
+    demo!(
+        "Standard 3-ary Cuckoo Filter",
+        Standard3aryCuckooFilter::from_num_items(100, 4, 12).unwrap()
+    );
+    demo!(
+        "Segmented 3-ary Cuckoo Filter",
+        Segmented3aryCuckooFilter::from_num_items(100, 4, 12).unwrap()
+    );
+
+    // ── 4-ary ─────────────────────────────────────────────────────────────────
+    demo!(
+        "Standard 4-ary Cuckoo Filter",
+        Standard4aryCuckooFilter::from_num_items(100, 4, 12).unwrap()
+    );
+    demo!(
+        "Segmented 4-ary Cuckoo Filter",
+        Segmented4aryCuckooFilter::from_num_items(100, 4, 12).unwrap()
     );
 }

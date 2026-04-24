@@ -23,7 +23,7 @@
 //!
 //! # Invariants
 //!
-//! - `tables[j].read_tag(local, slot) == 0` ⇔ `values[j][local][slot] == None`.
+//! - `tables[j].read_fingerprint(local, slot) == 0` ⇔ `values[j][local][slot] == None`.
 //! - A successful `insert` leaves exactly one `(segment, local, slot)` holding
 //!   the new `(tag, value)`; `delete` clears both halves atomically.
 //! - `encode_bucket(j, local)` is pure: it reflects the current
@@ -56,7 +56,7 @@ use core::fmt;
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use segmented_cuckoo_filter::bucket::TagTable;
+use segmented_cuckoo_filter::bucket::FingerprintTable;
 use segmented_cuckoo_filter::IndexScheme;
 
 use crate::lwe::encode_value;
@@ -140,7 +140,7 @@ impl std::error::Error for MapError {}
 /// Per-segment cuckoo map with companion value storage.
 ///
 /// Owns:
-///   - k independent [`TagTable`]s (one per segment) of shape `seg × b`,
+///   - k independent [`FingerprintTable`]s (one per segment) of shape `seg × b`,
 ///   - k independent value mirrors of the same shape,
 ///   - a seeded ChaCha20 RNG driving deterministic kick-slot selection.
 ///
@@ -153,15 +153,15 @@ pub struct SegmentedCuckooMap<S: IndexScheme + Clone> {
     b: u32,
     k: u32,
     seg: u32,
-    tables: Vec<TagTable>,
+    tables: Vec<FingerprintTable>,
     /// `values[j][local_idx][slot] = Some(value) | None` in lock-step with
-    /// `tables[j].read_tag(local_idx, slot) != 0`.
+    /// `tables[j].read_fingerprint(local_idx, slot) != 0`.
     values: Vec<Vec<Vec<Option<Vec<u8>>>>>,
     max_kicks: u32,
     rng: ChaCha20Rng,
 }
 
-// `TagTable` does not derive `Debug`; we expose only the structural fields.
+// `FingerprintTable` does not derive `Debug`; we expose only the structural fields.
 impl<S: IndexScheme + Clone> fmt::Debug for SegmentedCuckooMap<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SegmentedCuckooMap")
@@ -194,8 +194,8 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
         }
         let k = params.degree();
         let seg = params.seg();
-        let tables: Vec<TagTable> = (0..k)
-            .map(|_| TagTable::new(seg, b, params.fingerprint_bits))
+        let tables: Vec<FingerprintTable> = (0..k)
+            .map(|_| FingerprintTable::new(seg, b, params.fingerprint_bits))
             .collect();
         let values: Vec<Vec<Vec<Option<Vec<u8>>>>> = (0..k as usize)
             .map(|_| {
@@ -284,7 +284,7 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
         for j in 0..self.k as usize {
             let local = (indices[j] - (j as u32) * self.seg) as usize;
             for s in 0..self.b as usize {
-                if self.tables[j].read_tag(local as u32, s as u32) == tag {
+                if self.tables[j].read_fingerprint(local as u32, s as u32) == tag {
                     if let Some(stored) = &self.values[j][local][s] {
                         if stored.as_slice() == value {
                             return Err(MapError::Duplicate);
@@ -300,8 +300,8 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
         // ── 2. Fast path: direct insertion into any of the k candidate buckets.
         for j in 0..self.k as usize {
             let local = indices[j] - (j as u32) * self.seg;
-            if let Some(slot) = self.tables[j].insert_tag_to_bucket(local, tag) {
-                // `insert_tag_to_bucket` found a slot with previous tag==0 (empty).
+            if let Some(slot) = self.tables[j].insert_fingerprint_to_bucket(local, tag) {
+                // `insert_fingerprint_to_bucket` found a slot with previous tag==0 (empty).
                 // Mirror: values[j][local][slot] should be None.
                 debug_assert!(self.values[j][local as usize][slot as usize].is_none());
                 let old_val = self.values[j][local as usize][slot as usize].take();
@@ -321,7 +321,7 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
         for _ in 0..self.max_kicks {
             // Evict a random slot in the current bucket.
             let slot = self.rng.next_u32() % self.b;
-            let evicted_fp = self.tables[cur_seg as usize].read_tag(cur_local, slot);
+            let evicted_fp = self.tables[cur_seg as usize].read_fingerprint(cur_local, slot);
             let evicted_val = self.values[cur_seg as usize][cur_local as usize][slot as usize]
                 .take()
                 .unwrap_or_else(|| vec![0u8; self.params.value_len as usize]);
@@ -336,12 +336,12 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
             ));
 
             // Overwrite with (cur_fp, cur_val).
-            self.tables[cur_seg as usize].write_tag(cur_local, slot, cur_fp);
+            self.tables[cur_seg as usize].write_fingerprint(cur_local, slot, cur_fp);
             self.values[cur_seg as usize][cur_local as usize][slot as usize] = Some(cur_val);
 
             // Evictee's alternate candidates (global indices).
             let evicted_global = (cur_seg as u32) * self.seg + cur_local;
-            let all = self.scheme.all_indices(evicted_global, evicted_fp, cur_seg);
+            let all = self.scheme.all_indices(evicted_global, evicted_fp);
 
             // Try to place the evictee in each alternate segment.
             let mut placed_via_direct = false;
@@ -355,7 +355,7 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
                     "alternate {p} index {} not in its segment",
                     all[p]
                 );
-                if let Some(slot_p) = self.tables[p].insert_tag_to_bucket(local_p, evicted_fp) {
+                if let Some(slot_p) = self.tables[p].insert_fingerprint_to_bucket(local_p, evicted_fp) {
                     debug_assert!(self.values[p][local_p as usize][slot_p as usize].is_none());
                     let old_val = self.values[p][local_p as usize][slot_p as usize].take();
                     self.values[p][local_p as usize][slot_p as usize] = Some(evicted_val.clone());
@@ -384,7 +384,7 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
 
         // ── 4. Kicks exhausted. Rollback.
         for (seg_idx, local, slot, old_fp, old_val) in trace.iter().rev() {
-            self.tables[*seg_idx as usize].write_tag(*local, *slot, *old_fp);
+            self.tables[*seg_idx as usize].write_fingerprint(*local, *slot, *old_fp);
             self.values[*seg_idx as usize][*local as usize][*slot as usize] = old_val.clone();
         }
         Err(MapError::TableFull)
@@ -419,7 +419,7 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
         let (tag, indices) = self.lookup_candidates(key);
         for j in 0..self.k as usize {
             let local = indices[j] - (j as u32) * self.seg;
-            if let Some(slot) = self.tables[j].find_tag_in_bucket_slot(local, tag) {
+            if let Some(slot) = self.tables[j].find_fingerprint_in_bucket_slot(local, tag) {
                 self.values[j][local as usize][slot as usize] = Some(new_value.to_vec());
                 let new_payload = self.encode_bucket(j as u8, local)?;
                 return Ok(UpdateBatch {
@@ -447,8 +447,8 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
         let (tag, indices) = self.lookup_candidates(key);
         for j in 0..self.k as usize {
             let local = indices[j] - (j as u32) * self.seg;
-            if let Some(slot) = self.tables[j].find_tag_in_bucket_slot(local, tag) {
-                self.tables[j].write_tag(local, slot, 0);
+            if let Some(slot) = self.tables[j].find_fingerprint_in_bucket_slot(local, tag) {
+                self.tables[j].write_fingerprint(local, slot, 0);
                 self.values[j][local as usize][slot as usize] = None;
                 let new_payload = self.encode_bucket(j as u8, local)?;
                 return Ok(UpdateBatch {
@@ -476,7 +476,7 @@ impl<S: IndexScheme + Clone> SegmentedCuckooMap<S> {
 
         for s in 0..self.b as usize {
             let base = s * slot_elems;
-            let stored_fp = self.tables[segment_idx as usize].read_tag(row_local_idx, s as u32);
+            let stored_fp = self.tables[segment_idx as usize].read_fingerprint(row_local_idx, s as u32);
             // Fingerprint chunks, LSB-first.
             encode_fp_into(
                 stored_fp,
@@ -594,11 +594,11 @@ pub fn decode_fp(chunks: &[u32], fp_bits: u32, bit_len: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::params::{Arity, DEFAULT_SLOTS_PER_BUCKET};
-    use segmented_cuckoo_filter::{Segmented3aryScheme, Segmented4aryScheme, SegmentedScheme};
+    use segmented_cuckoo_filter::{Segmented3aryScheme, Segmented4aryScheme, Segmented2aryScheme};
 
-    fn seg2_map(num_items: u32, value_len: u32) -> SegmentedCuckooMap<SegmentedScheme> {
+    fn seg2_map(num_items: u32, value_len: u32) -> SegmentedCuckooMap<Segmented2aryScheme> {
         let params = FilterParams::recommended(Arity::Segmented2, num_items, value_len).unwrap();
-        let scheme = SegmentedScheme { half: params.seg() };
+        let scheme = Segmented2aryScheme { half: params.seg() };
         SegmentedCuckooMap::new(
             scheme,
             params,
@@ -691,7 +691,7 @@ mod tests {
             mat_elem_bit_len: 8,
             value_len: 32,
         };
-        let scheme = SegmentedScheme { half: params.seg() };
+        let scheme = Segmented2aryScheme { half: params.seg() };
         let err = SegmentedCuckooMap::new(
             scheme,
             params,
@@ -720,7 +720,7 @@ mod tests {
             for j in 0..map.k() as usize {
                 let local = indices[j] - (j as u32) * map.seg();
                 for s in 0..map.slots_per_bucket() {
-                    if map.tables[j].read_tag(local, s) == tag {
+                    if map.tables[j].read_fingerprint(local, s) == tag {
                         let val = map.values[j][local as usize][s as usize].as_ref().unwrap();
                         if val.as_slice() == mk_value(i, value_len).as_slice() {
                             found = true;
@@ -792,7 +792,7 @@ mod tests {
                 // Place a distinct non-zero tag directly via the low-level TagTable API.
                 let fake_tag = 1 + (j as u32) * 10 + s;
                 assert!(map.tables[j]
-                    .insert_tag_to_bucket(local, fake_tag)
+                    .insert_fingerprint_to_bucket(local, fake_tag)
                     .is_some());
                 map.values[j][local as usize][s as usize] = Some(vec![0xAAu8; 4]);
             }
@@ -804,7 +804,7 @@ mod tests {
                 (0..map.seg() * map.slots_per_bucket())
                     .map(|idx| {
                         map.tables[j]
-                            .read_tag(idx / map.slots_per_bucket(), idx % map.slots_per_bucket())
+                            .read_fingerprint(idx / map.slots_per_bucket(), idx % map.slots_per_bucket())
                     })
                     .collect()
             })
@@ -821,7 +821,7 @@ mod tests {
                 for s in 0..map.slots_per_bucket() {
                     let idx = (local * map.slots_per_bucket() + s) as usize;
                     assert_eq!(
-                        map.tables[j].read_tag(local, s),
+                        map.tables[j].read_fingerprint(local, s),
                         tables_before[j][idx],
                         "table[{j}][{local}][{s}] not restored"
                     );
@@ -849,7 +849,7 @@ mod tests {
         for j in 0..map.k() as usize {
             let local = indices[j] - (j as u32) * map.seg();
             for s in 0..map.slots_per_bucket() {
-                if map.tables[j].read_tag(local, s) == tag {
+                if map.tables[j].read_fingerprint(local, s) == tag {
                     panic!("fingerprint still present after delete");
                 }
                 if map.values[j][local as usize][s as usize].is_some() {
@@ -879,7 +879,7 @@ mod tests {
             .find_map(|j| {
                 let local = indices[j] - (j as u32) * map.seg();
                 (0..map.slots_per_bucket())
-                    .find(|s| map.tables[j].read_tag(local, *s) == tag)
+                    .find(|s| map.tables[j].read_fingerprint(local, *s) == tag)
                     .map(|s| (j as u8, local, s))
             })
             .expect("slot located after insert");
@@ -891,7 +891,7 @@ mod tests {
 
         // Same slot, same tag; value is replaced.
         assert_eq!(
-            map.tables[seg_before as usize].read_tag(local_before, slot_before),
+            map.tables[seg_before as usize].read_fingerprint(local_before, slot_before),
             tag,
         );
         assert_eq!(
@@ -941,7 +941,7 @@ mod tests {
             .find_map(|j| {
                 let local = indices[j] - (j as u32) * map.seg();
                 (0..map.slots_per_bucket())
-                    .find(|s| map.tables[j].read_tag(local, *s) == tag)
+                    .find(|s| map.tables[j].read_fingerprint(local, *s) == tag)
                     .map(|s| (j as u8, local, s))
             })
             .expect("stored slot not located");

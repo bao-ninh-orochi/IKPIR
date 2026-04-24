@@ -4,15 +4,15 @@
 //! — they check structural properties (load factor, FPR bounds) rather than
 //! exact per-item outcomes.
 
-use segmented_cuckoo_filter::{CuckooError, SegmentedCuckooFilter, StandardCuckooFilter};
+use segmented_cuckoo_filter::{CuckooError, Segmented2aryCuckooFilter, Standard2aryCuckooFilter};
 
-const FP_BITS: u32 = 12;
+const FINGERPRINT_BITS: u32 = 12;
 const N: u32 = 1 << 14;
 const B: u32 = 4;
 
 #[test]
 fn load_factor_never_exceeds_one() {
-    let mut f = StandardCuckooFilter::new(N, B, FP_BITS).unwrap();
+    let mut f = Standard2aryCuckooFilter::new(N, B, FINGERPRINT_BITS).unwrap();
     let mut i: u64 = 0;
     loop {
         match f.add(i.to_le_bytes()) {
@@ -27,7 +27,7 @@ fn load_factor_never_exceeds_one() {
 
 #[test]
 fn segmented_load_factor_at_least_half() {
-    let mut f = SegmentedCuckooFilter::new(N, B, FP_BITS).unwrap();
+    let mut f = Segmented2aryCuckooFilter::new(N, B, FINGERPRINT_BITS).unwrap();
     let mut i: u64 = 0;
     loop {
         match f.add(i.to_le_bytes()) {
@@ -45,7 +45,7 @@ fn segmented_load_factor_at_least_half() {
 
 #[test]
 fn empty_filter_contains_nothing() {
-    let f = StandardCuckooFilter::new(N, B, FP_BITS).unwrap();
+    let f = Standard2aryCuckooFilter::new(N, B, FINGERPRINT_BITS).unwrap();
     for i in 0u64..1000 {
         assert!(
             !f.contain(i.to_le_bytes()),
@@ -56,10 +56,10 @@ fn empty_filter_contains_nothing() {
 
 #[test]
 fn false_positive_rate_within_bound() {
-    // Theoretical bound for standard 2-ary: d*b / 2^fp_bits.
-    // With d=2, b=4, fp_bits=12 → 8/4096 ≈ 0.2%.
+    // Theoretical bound for standard 2-ary: d*bucket_size / 2^fingerprint_bits.
+    // With d=2, bucket_size=4, fingerprint_bits=12 → 8/4096 ≈ 0.2%.
     // We tolerate 3× the bound to account for finite-sample variance.
-    let mut f = StandardCuckooFilter::new(N, B, FP_BITS).unwrap();
+    let mut f = Standard2aryCuckooFilter::new(N, B, FINGERPRINT_BITS).unwrap();
     let mut inserted = 0u64;
     for i in 0u64..(N as u64 * B as u64 / 2) {
         if f.add(i.to_le_bytes()).is_ok() {
@@ -76,7 +76,7 @@ fn false_positive_rate_within_bound() {
         }
     }
     let observed = fps as f64 / trials as f64;
-    let bound = 2.0 * B as f64 / (1u64 << FP_BITS) as f64;
+    let bound = 2.0 * B as f64 / (1u64 << FINGERPRINT_BITS) as f64;
     assert!(
         observed < 3.0 * bound,
         "observed FPR {observed:.5} exceeds 3× theoretical bound {bound:.5} (inserted {inserted})"

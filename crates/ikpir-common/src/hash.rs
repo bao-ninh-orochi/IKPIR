@@ -16,8 +16,8 @@
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use segmented_cuckoo_filter::{
-    IndexScheme, Segmented3aryScheme, Segmented4aryScheme, SegmentedScheme, Standard3aryScheme,
-    Standard4aryScheme, StandardScheme,
+    IndexScheme, Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
+    Standard2aryScheme, Standard3aryScheme, Standard4aryScheme,
 };
 
 use crate::params::{Arity, FilterParams, SEED_LEN};
@@ -29,8 +29,8 @@ use crate::params::{Arity, FilterParams, SEED_LEN};
 /// the SCF's own return shape so the two APIs compose cleanly.
 #[derive(Debug, Clone, Copy)]
 pub struct KeywordFootprint {
-    /// SCF fingerprint tag (non-zero for any valid keyword).
-    pub tag: u32,
+    /// SCF fingerprint (non-zero for any valid keyword).
+    pub fingerprint: u32,
     /// Candidate bucket indices — valid entries at `[0, degree)`.
     pub indices: [u32; 4],
     /// Arity degree (`2`, `3`, or `4`); `indices[degree..]` are padding zeros.
@@ -51,14 +51,14 @@ impl KeywordFootprint {
 /// appropriate); construction-time sizing lives in
 /// [`crate::params::FilterParams::recommended`].
 pub fn candidates(key: &[u8], params: &FilterParams) -> KeywordFootprint {
-    let (tag, indices) = match params.arity {
-        Arity::Standard2 => StandardScheme {
+    let (fingerprint, indices) = match params.arity {
+        Arity::Standard2 => Standard2aryScheme {
             num_buckets: params.num_buckets,
         }
         .hash_item(key, params.fingerprint_bits),
         Arity::Segmented2 => {
             let half = params.num_buckets / 2;
-            SegmentedScheme { half }.hash_item(key, params.fingerprint_bits)
+            Segmented2aryScheme { half }.hash_item(key, params.fingerprint_bits)
         }
         Arity::Standard3 => Standard3aryScheme {
             num_buckets: params.num_buckets,
@@ -78,7 +78,7 @@ pub fn candidates(key: &[u8], params: &FilterParams) -> KeywordFootprint {
         }
     };
     KeywordFootprint {
-        tag,
+        fingerprint,
         indices,
         degree: params.degree(),
     }
@@ -165,7 +165,7 @@ mod tests {
             for i in 0u32..100 {
                 let foot = candidates(&i.to_le_bytes(), &p);
                 assert_eq!(foot.degree, arity.degree(), "arity={:?}", arity);
-                assert_ne!(foot.tag, 0);
+                assert_ne!(foot.fingerprint, 0);
                 for &idx in foot.slots() {
                     assert!(idx < p.num_buckets, "arity={:?} idx={}", arity, idx);
                 }
@@ -178,7 +178,7 @@ mod tests {
         let p = FilterParams::recommended(Arity::Segmented4, 256, 32).unwrap();
         let a = candidates(b"hello", &p);
         let b = candidates(b"hello", &p);
-        assert_eq!(a.tag, b.tag);
+        assert_eq!(a.fingerprint, b.fingerprint);
         assert_eq!(a.indices, b.indices);
     }
 

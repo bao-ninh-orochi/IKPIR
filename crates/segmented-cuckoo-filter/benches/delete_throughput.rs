@@ -10,28 +10,28 @@
 //! fraction of deletes may return `NotFound` due to fingerprint collisions — this is expected
 //! and does not invalidate the measurement; the full delete code path is still exercised.
 //!
-//! **Parameters:** n ∈ {2^16, 2^18, 2^20}. b ∈ {1, 2, 3, 4}. fp_bits = 12.
+//! **Parameters:** num_buckets ∈ {2^16, 2^18, 2^20}. bucket_size ∈ {1, 2, 3, 4}. fingerprint_bits = 12.
 //! 3 warmup + 10 measured trials.
 //!
 //! **Output:** `results/delete_throughput.csv`
-//! Columns: scheme, arity, n, b, deleted, mean_lf, mean_duration_ns, mean_mops, min_mops, max_mops, stddev_mops
+//! Columns: scheme, arity, num_buckets, bucket_size, deleted, mean_lf, mean_duration_ns, mean_mops, min_mops, max_mops, stddev_mops
 
 mod helpers;
 
 use segmented_cuckoo_filter::{
-    CuckooError, Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, SegmentedCuckooFilter,
-    Standard3aryCuckooFilter, Standard4aryCuckooFilter, StandardCuckooFilter,
+    CuckooError, Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, Segmented2aryCuckooFilter,
+    Standard3aryCuckooFilter, Standard4aryCuckooFilter, Standard2aryCuckooFilter,
 };
 use std::io::Write;
 use std::time::Instant;
 
 const MAX_KICKS: u32 = 500;
-const FP_BITS: u32 = 12;
+const FINGERPRINT_BITS: u32 = 12;
 const WARMUP_TRIALS: usize = 3;
 const MEASURE_TRIALS: usize = 10;
 
-const N_VALUES: &[u32] = &[1 << 16, 1 << 18, 1 << 20];
-const B_VALUES: &[u32] = &[1, 2, 3, 4];
+const NUM_BUCKETS_VALUES: &[u32] = &[1 << 16, 1 << 18, 1 << 20];
+const BUCKET_SIZE_VALUES: &[u32] = &[1, 2, 3, 4];
 
 /// Fill a filter of type `$filter_ty` with sequential u64 keys until `TableFull`,
 /// then measure how fast we can delete all inserted items in bulk.
@@ -39,15 +39,15 @@ const B_VALUES: &[u32] = &[1, 2, 3, 4];
 /// The deletion loop timing deliberately excludes the fill phase so that the CSV
 /// captures pure delete throughput, not insert + delete throughput.
 ///
-/// CSV columns: scheme, arity, n, b, deleted, mean_lf, mean_duration_ns, mean_mops, min_mops, max_mops, stddev_mops
+/// CSV columns: scheme, arity, num_buckets, bucket_size, deleted, mean_lf, mean_duration_ns, mean_mops, min_mops, max_mops, stddev_mops
 macro_rules! bench_delete {
-    ($csv:expr, $label:expr, $filter_ty:ty, $scheme:expr, $arity:expr, $n:expr, $b:expr) => {{
-        let n: u32 = $n;
-        let b: u32 = $b;
+    ($csv:expr, $label:expr, $filter_ty:ty, $scheme:expr, $arity:expr, $num_buckets:expr, $bucket_size:expr) => {{
+        let num_buckets: u32 = $num_buckets;
+        let bucket_size: u32 = $bucket_size;
 
-        match <$filter_ty>::new(n, b, FP_BITS) {
+        match <$filter_ty>::new(num_buckets, bucket_size, FINGERPRINT_BITS) {
             Err(e) => {
-                eprintln!("  Skip {} n={} b={}: {}", $label, n, b, e);
+                eprintln!("  Skip {} num_buckets={} bucket_size={}: {}", $label, num_buckets, bucket_size, e);
             }
             Ok(_) => {
                 // ── Determine how many items fit ───────────────────────────
@@ -55,7 +55,7 @@ macro_rules! bench_delete {
                 // with the same number of deletions, making throughput numbers
                 // comparable across trials.
                 let count: u64 = {
-                    let mut probe = <$filter_ty>::new(n, b, FP_BITS).unwrap();
+                    let mut probe = <$filter_ty>::new(num_buckets, bucket_size, FINGERPRINT_BITS).unwrap();
                     probe.set_max_kicks(MAX_KICKS);
                     let mut c = 0u64;
                     loop {
@@ -69,11 +69,11 @@ macro_rules! bench_delete {
                 };
 
                 if count == 0 {
-                    eprintln!("  Skip {} n={} b={}: filter holds 0 items", $label, n, b);
+                    eprintln!("  Skip {} num_buckets={} bucket_size={}: filter holds 0 items", $label, num_buckets, bucket_size);
                 } else {
                     // ── Warmup ─────────────────────────────────────────────
                     for _ in 0..WARMUP_TRIALS {
-                        let mut filter = <$filter_ty>::new(n, b, FP_BITS).unwrap();
+                        let mut filter = <$filter_ty>::new(num_buckets, bucket_size, FINGERPRINT_BITS).unwrap();
                         filter.set_max_kicks(MAX_KICKS);
                         for i in 0u64..count {
                             let _ = filter.add(i.to_le_bytes());
@@ -90,7 +90,7 @@ macro_rules! bench_delete {
 
                     for _trial in 0..MEASURE_TRIALS {
                         // Fill the filter — not timed.
-                        let mut filter = <$filter_ty>::new(n, b, FP_BITS).unwrap();
+                        let mut filter = <$filter_ty>::new(num_buckets, bucket_size, FINGERPRINT_BITS).unwrap();
                         filter.set_max_kicks(MAX_KICKS);
                         for i in 0u64..count {
                             let _ = filter.add(i.to_le_bytes());
@@ -119,13 +119,13 @@ macro_rules! bench_delete {
                     writeln!(
                         $csv,
                         "{},{},{},{},{},{:.6},{:.0},{:.4},{:.4},{:.4},{:.4}",
-                        $scheme, $arity, n, b, count, mean_lf, mean_dur,
+                        $scheme, $arity, num_buckets, bucket_size, count, mean_lf, mean_dur,
                         mops_stats.mean, mops_stats.min, mops_stats.max, mops_stats.stddev
                     )
                     .unwrap();
                     println!(
-                        "  {:<20} n={:<10} b={:<3} | mean={:<8.3} std={:<8.3} Mops",
-                        $label, n, b, mops_stats.mean, mops_stats.stddev
+                        "  {:<20} num_buckets={:<10} bucket_size={:<3} | mean={:<8.3} std={:<8.3} Mops",
+                        $label, num_buckets, bucket_size, mops_stats.mean, mops_stats.stddev
                     );
                 }
             }
@@ -136,54 +136,47 @@ macro_rules! bench_delete {
 fn main() {
     let mut csv = helpers::csv_writer(
         "delete_throughput.csv",
-        "scheme,arity,n,b,deleted,mean_lf,mean_duration_ns,mean_mops,min_mops,max_mops,stddev_mops",
+        "scheme,arity,num_buckets,bucket_size,deleted,mean_lf,mean_duration_ns,mean_mops,min_mops,max_mops,stddev_mops",
     );
 
     println!("=== Delete Throughput (delete all items from a full filter) ===");
     println!(
-        "Config: fp_bits={}, max_kicks={}, warmup={}, trials={}",
-        FP_BITS, MAX_KICKS, WARMUP_TRIALS, MEASURE_TRIALS
+        "Config: fingerprint_bits={}, max_kicks={}, warmup={}, trials={}",
+        FINGERPRINT_BITS, MAX_KICKS, WARMUP_TRIALS, MEASURE_TRIALS
     );
 
-    let pow3_values: &[u32] = &[3u32.pow(9), 3u32.pow(10), 3u32.pow(11)];
-    let pow4_values: &[u32] = &[4u32.pow(8), 4u32.pow(9), 4u32.pow(10)];
+    // Standard 3-ary num_buckets (power of 3) sized comparably to NUM_BUCKETS_VALUES.
+    let pow3_num_buckets: &[u32] = &[3u32.pow(9), 3u32.pow(10), 3u32.pow(11)];
+    // Standard 4-ary num_buckets (power of 4) sized comparably to NUM_BUCKETS_VALUES.
+    let pow4_num_buckets: &[u32] = &[4u32.pow(8), 4u32.pow(9), 4u32.pow(10)];
 
-    for (idx, &n) in N_VALUES.iter().enumerate() {
-        for &b in B_VALUES {
-            // Segmented 3-ary requires n = 3 * 2^m; compute the largest valid n ≤ the
-            // requested n so comparisons with other schemes at the same n are approximate.
-            let seg3_n = 3 * (1u32 << (n / 3).ilog2());
-            let std3_n = pow3_values[idx];
-            let std4_n = pow4_values[idx];
+    for (idx, &num_buckets) in NUM_BUCKETS_VALUES.iter().enumerate() {
+        for &bucket_size in BUCKET_SIZE_VALUES {
+            // Segmented 3-ary requires num_buckets = 3·2^t; pick the largest valid value
+            // that fits inside the 2^k window so the comparison stays at a similar size.
+            let seg3_num_buckets = 3 * (1u32 << (num_buckets / 3).ilog2());
+            let std3_num_buckets = pow3_num_buckets[idx];
+            let std4_num_buckets = pow4_num_buckets[idx];
 
-            println!("\n--- n={}, b={} ---", n, b);
+            println!("\n--- num_buckets={}, bucket_size={} ---", num_buckets, bucket_size);
 
-            bench_delete!(
-                csv,
-                "Standard 2-ary",
-                StandardCuckooFilter,
-                "standard",
-                2,
-                n,
-                b
-            );
             bench_delete!(
                 csv,
                 "Segmented 2-ary",
-                SegmentedCuckooFilter,
+                Segmented2aryCuckooFilter,
                 "segmented",
                 2,
-                n,
-                b
+                num_buckets,
+                bucket_size
             );
             bench_delete!(
                 csv,
-                "Standard 3-ary",
-                Standard3aryCuckooFilter,
+                "Standard 2-ary",
+                Standard2aryCuckooFilter,
                 "standard",
-                3,
-                std3_n,
-                b
+                2,
+                num_buckets,
+                bucket_size
             );
             bench_delete!(
                 csv,
@@ -191,17 +184,17 @@ fn main() {
                 Segmented3aryCuckooFilter,
                 "segmented",
                 3,
-                seg3_n,
-                b
+                seg3_num_buckets,
+                bucket_size
             );
             bench_delete!(
                 csv,
-                "Standard 4-ary",
-                Standard4aryCuckooFilter,
+                "Standard 3-ary",
+                Standard3aryCuckooFilter,
                 "standard",
-                4,
-                std4_n,
-                b
+                3,
+                std3_num_buckets,
+                bucket_size
             );
             bench_delete!(
                 csv,
@@ -209,8 +202,17 @@ fn main() {
                 Segmented4aryCuckooFilter,
                 "segmented",
                 4,
-                n,
-                b
+                num_buckets,
+                bucket_size
+            );
+            bench_delete!(
+                csv,
+                "Standard 4-ary",
+                Standard4aryCuckooFilter,
+                "standard",
+                4,
+                std4_num_buckets,
+                bucket_size
             );
         }
     }
