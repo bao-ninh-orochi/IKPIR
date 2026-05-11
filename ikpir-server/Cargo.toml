@@ -1,0 +1,16 @@
+[package]
+name        = "ikpir-server"
+description = "Server-side IKPIR protocol: database management, PIR preprocessing, query handling"
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+segmented-cuckoo = { workspace = true }

@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/segmented-cuckoo-filter",
-    "crates/ikpir-common",
-    "crates/ikpir-client",
-    "crates/ikpir-server",
+    "segmented-cuckoo",
+    "ikpir-server",
+    "ikpir-client",
 ]
 
 [workspace.package]
@@ -16,9 +15,9 @@ repository   = "https://github.com/<TODO-GITHUB-USER>/incremental-keyword-pir"
 license      = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-segmented-cuckoo-filter = { path = "crates/segmented-cuckoo-filter", version = "0.1" }
-ikpir-common            = { path = "crates/ikpir-common",            version = "0.1" }
-ikpir-client            = { path = "crates/ikpir-client",            version = "0.1" }
+segmented-cuckoo = { path = "segmented-cuckoo", version = "0.1" }
+ikpir-server     = { path = "ikpir-server",     version = "0.1" }
+ikpir-client     = { path = "ikpir-client",     version = "0.1" }
 rand         = "0.9"
 rand_chacha  = "0.9"
 xxhash-rust  = { version = "0.8", features = ["xxh3"] }

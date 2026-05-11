@@ -1,104 +1,67 @@
-# Incremental-Keyword-PIR
+# Incremental Keyword PIR
 
-**IKPIR** is an updatable keyword-PIR scheme that swaps the binary fuse filter
-of [ChalametPIR] for a **Segmented Cuckoo Filter (SCF)**. The substitution gives
-two wins:
+A research prototype of **Incremental Keyword PIR** — a single-server keyword-PIR
+construction that supports efficient **insert / update / delete** on the server's
+database, while preserving the one-round structure of state-of-the-art schemes.
 
-1. **Better space efficiency.** SCF reaches load factors above 0.94 at arity 4,
-   so the server's hint matrix is smaller per stored item.
-2. **Native updateability.** Cuckoo filters support `insert`, `delete`, and
-   `update` in place — something binary fuse filters cannot offer without a
-   full rebuild. We extend this to the *preprocessing matrix* with an
-   incremental update algorithm whose cost is logarithmic in the DB size.
+> **Status.** Research prototype. Interfaces, parameters, and internals are
+> subject to change.
 
-The artefact is two contributions in one workspace:
+## Background
 
-| Crate | Role |
-|---|---|
-| [`segmented-cuckoo-filter`](crates/segmented-cuckoo-filter/) | Stand-alone SCF library (publishable to crates.io) |
-| [`ikpir-common`](crates/ikpir-common/) | Shared PIR primitives (LWE, matrix, keyword encoding) |
-| [`ikpir-client`](crates/ikpir-client/) | Client: setup, query, decrypt |
-| [`ikpir-server`](crates/ikpir-server/) | Server: setup, respond, **insert/delete/update** |
+Following the framework popularised by *ChalametPIR*, a keyword-PIR scheme can
+be built from any **fingerprint-based filter** in two stages:
 
-[ChalametPIR]: https://eprint.iacr.org/2024/092
+1. **Fingerprint filter → key-value store.**
+   A fingerprint-based filter (e.g. Binary Fuse Filter, Cuckoo Filter) stores,
+   for each inserted key `k`, a short fingerprint `fp(k)` placed at filter
+   positions determined by a public, key-derived rule. The filter is upgraded
+   into a key-value store by replacing each stored fingerprint with the pair
+   `fp(k) ‖ v`. On lookup, the client reconstructs `fp(k) ‖ v` from the
+   filter slots dictated by the public rule, checks the fingerprint, and — on
+   match — accepts `v` as the value.
 
-## 60-second smoke test
+2. **Key-value store → keyword PIR.**
+   The server publishes the key-value store as an array; the client knows,
+   from the public rule, exactly which array indices it must read to recover
+   `fp(k) ‖ v`. Reading those indices privately is the job of a standard
+   **single-server Index-based PIR**. Because the rule selects a small,
+   fixed-size set of indices, a single Index-PIR query suffices.
 
-```bash
-git clone https://github.com/<TODO-GITHUB-USER>/incremental-keyword-pir
-cd incremental-keyword-pir
-just repro-smoke          # build + test + tiny bench + regenerate plots
-```
+Under this framework, the choice of fingerprint-based filter determines the
+*functionality* of the resulting keyword PIR.
 
-`just repro-smoke` is the entry point CI uses; if it passes on your box, the
-full reproduction pipeline (`just repro-all`) will too.
+## Why incremental?
 
-## Repo map
+ChalametPIR instantiates the framework with a **Binary Fuse Filter (BFF)**,
+which is *static*: the entire filter must be rebuilt to insert, update, or
+delete a key. For real-world databases — which evolve continuously — this
+makes the static instantiation impractical.
 
-```
-incremental-keyword-pir/
-├── crates/
-│   ├── segmented-cuckoo-filter/   # Phase A — SCF library
-│   ├── ikpir-common/              # Phase B — shared PIR types
-│   ├── ikpir-client/              # Phase B — client
-│   └── ikpir-server/              # Phase B + C — server (+incremental update)
-├── docs/
-│   ├── ARCHITECTURE.md            # system diagram, module map
-│   ├── SCF-DESIGN.md              # SCF technical deep-dive
-│   ├── PIR-INTEGRATION.md         # how SCF replaces BFF
-│   ├── INCREMENTAL-UPDATE.md      # the update protocol (novel)
-│   ├── THREAT-MODEL.md            # PIR security + updateability leakage
-│   ├── BENCHMARKS.md              # methodology
-│   └── PLOTS.md                   # figure-by-figure guide
-├── scripts/                       # plot.py, verify_results.py, reproduce.sh
-├── papers/                        # our paper + cited references
-├── results/
-│   ├── paper/                     # committed CSVs backing every figure
-│   └── plots/                     # committed PNG/SVG figures
-└── Justfile                       # one-command build / bench / plot / repro
-```
+A natural alternative is the standard **Cuckoo Filter**, which is dynamic.
+However, Cuckoo Filter lookups read a *variable* number of buckets (usually
+two, but the client cannot tell in advance which one holds the key). Plugged
+into the framework above, this forces the client to issue **multiple
+Index-PIR queries**, eroding the round and bandwidth profile that makes the
+ChalametPIR-style construction attractive in the first place.
 
-## Paper
+## This repository
 
-> *(Title TBD.)* <TODO-AUTHOR>. <TODO-VENUE>, <TODO-YEAR>. `<TODO-DOI-OR-ARXIV>`.
+This repository introduces the **Segmented Cuckoo Filter (SCF)** — a Cuckoo
+Filter variant designed specifically for use as the fingerprint-based filter
+inside the keyword-PIR framework. SCF is engineered so that:
 
-See [`papers/ours/paper.pdf`](papers/ours/) (published with the repo) and
-[`CITATION.cff`](CITATION.cff) for BibTeX.
+- it supports **incremental** `insert`, `update`, and `delete`, like a
+  standard Cuckoo Filter, and
+- a key lookup reads a **deterministic, fixed set of slots**, so the resulting
+  keyword PIR retains the **single Index-PIR query** profile of the static
+  BFF-based construction.
 
-```bibtex
-@inproceedings{ikpir<TODO-YEAR>,
-  title     = {<TODO-TITLE>},
-  author    = {<TODO-AUTHOR>},
-  booktitle = {<TODO-VENUE>},
-  year      = {<TODO-YEAR>},
-}
-```
+Combined with an efficient preprocessing-update technique, SCF yields an
+**Incremental Keyword PIR** scheme suitable for evolving databases.
 
-## Reproducing
+## Compatibility
 
-See [REPRODUCING.md](REPRODUCING.md) for hardware, wall-clock expectations per
-bench, and the exact command that regenerates each paper figure.
-
-## License
-
-Dual-licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
-
-## Related work
-
-- ChalametPIR: single-round keyword PIR using binary fuse filters.
-  <https://eprint.iacr.org/2024/092>. Our hint-matrix construction follows
-  their design; we replace the filter and add incremental updates.
-- Reference implementation: <https://github.com/itzmeanjan/ChalametPIR>. We do
-  not fork; all code in this repo is written clean-room.
-
-## Disclaimer
-
-This is **research code** accompanying an academic paper. It has not been
-audited for production use. See [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md)
-for the leakage analysis of the incremental-update protocol.
+The construction is compatible with **any single-server Index-based PIR**.
+This repository targets in particular **FrodoPIR** and **SimplePIR**, two
+LWE-based Index-PIR schemes that offer high server throughput and well-studied post-quantum security.

@@ -1,0 +1,16 @@
+[package]
+name        = "ikpir-client"
+description = "Client-side IKPIR protocol: index extraction, PIR query construction, response decoding"
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+[lints]
+workspace = true
+
+[dependencies]
+segmented-cuckoo = { workspace = true }
