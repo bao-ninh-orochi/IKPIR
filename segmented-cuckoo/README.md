@@ -79,11 +79,17 @@ examples/
   kv_store_basic_usage.rs -- demo of Segmented2aryCuckooKVStore insert/get/delete/update
   load_factor.rs          -- fill filters to capacity and print max load factor
 
-benches/             -- standalone benchmark binaries (write CSV to results/)
-  kv_store_insert_throughput.rs -- KV store insert throughput
-  kv_store_lookup_throughput.rs -- KV store lookup throughput
-  kv_store_delete_throughput.rs -- KV store delete throughput
-scripts/plot.py      -- matplotlib charts from CSV results
+benches/             -- standalone benchmark binaries (no clap; write CSV to results/)
+  load_factor.rs                -- max load factor (sweeps max_kicks ∈ {500..5000})
+  insert_throughput.rs          -- insert MOps/s while filling to capacity
+  lookup_throughput.rs          -- lookup MOps/s at 5 hit rates (0/25/50/75/100%)
+  delete_throughput.rs          -- delete MOps/s on a full filter
+  fpr.rs                        -- false-positive rate vs fingerprint_bits
+  degree_distribution.rs        -- per-bucket degree at saturation + histogram
+  kv_store_insert_throughput.rs -- KV-store insert MOps/s
+  kv_store_lookup_throughput.rs -- KV-store lookup MOps/s (50/50 hit/miss)
+  kv_store_delete_throughput.rs -- KV-store delete MOps/s
+scripts/plot.py      -- matplotlib charts from CSV results (10 plot functions)
 results/             -- generated CSV data and plots (gitignored)
 ```
 
@@ -387,49 +393,61 @@ xxHash3 item hash. The table sizes tested are:
 
 | Benchmark | What it measures | Trials |
 |---|---|---|
-| `load_factor` | Fill filter to capacity, record maximum load factor | 20 per config |
+| `load_factor` | Fill filter to capacity, record max load factor; sweeps `max_kicks` ∈ {500, 1000, …, 5000} | 20 per config |
 | `insert_throughput` | MOps/s while filling to capacity | 10 per config |
-| `lookup_throughput` | MOps/s at 5 hit rates (0%, 25%, 50%, 75%, 100%) after filling | 10 per config |
-| `delete_throughput` | MOps/s deleting all items after filling | 10 per config |
+| `lookup_throughput` | MOps/s at 5 hit rates (0%, 25%, 50%, 75%, 100%) on a full filter | 10 per config |
+| `delete_throughput` | MOps/s deleting all items from a full filter | 10 per config |
 | `fpr` | False-positive rate, sweeping `fingerprint_bits` from minimum to 32 | 1 per value |
-| `degree_distribution` | Per-bucket occupancy (degree) at saturation | 1 per config |
+| `degree_distribution` | Per-bucket occupancy (degree) at saturation, plus degree histogram | 1 per config |
+| `kv_store_insert_throughput` | KV-store insert MOps/s — segmented schemes only, `value_bits` ∈ {8, 64, 256, 1024} | 10 per config |
+| `kv_store_lookup_throughput` | KV-store lookup MOps/s (50/50 hit/miss) via zero-allocation `get_into` | 10 per config |
+| `kv_store_delete_throughput` | KV-store delete MOps/s on a full store | 10 per config |
+
+The first six are the comparison study reported in [Results](#results).
+The three `kv_store_*` benches measure the IKPIR primitive layer
+(segmented schemes only, `(fingerprint, value)` slots) — they feed
+`ikpir-server` performance.
 
 ### Running benchmarks
 
+Benches are not clap-parsed: `cargo bench --bench <name>` runs the
+hardcoded matrix and writes CSV under `results/`. Each filter bench
+(where applicable) has matching plot function(s) in `scripts/plot.py`;
+the `kv_store_*` benches do not yet ship a plotter.
+
+| Bench | CSV output (under `results/`) | Matching plot functions |
+|---|---|---|
+| `load_factor` | `load_factor.csv` | `load_factor_all`, `load_factor_b234`, `load_factor_by_kicks [arity] [bucket_size]` |
+| `insert_throughput` | `insert_throughput.csv` | `insert_throughput` |
+| `lookup_throughput` | `lookup_throughput.csv` | `lookup_throughput` |
+| `delete_throughput` | `delete_throughput.csv` | `delete_throughput` |
+| `fpr` | `fpr/arity{a}_num_buckets{n}_bucket_size{b}.csv` (12 files) | `fpr_load_factor`, `fpr_comparison` |
+| `degree_distribution` | `degree_per_bucket.csv`, `degree_distribution.csv` | `degree_index`, `degree_histogram` |
+| `kv_store_insert_throughput` | `kv_store_insert_throughput.csv` | _no packaged plot_ |
+| `kv_store_lookup_throughput` | `kv_store_lookup_throughput.csv` | _no packaged plot_ |
+| `kv_store_delete_throughput` | `kv_store_delete_throughput.csv` | _no packaged plot_ |
+
 ```bash
-# Individual
+# Run one bench, then render its plots:
 cargo bench --bench load_factor
-cargo bench --bench insert_throughput
-cargo bench --bench lookup_throughput
-cargo bench --bench delete_throughput
-cargo bench --bench fpr
-cargo bench --bench degree_distribution
+python scripts/plot.py load_factor_all
+python scripts/plot.py load_factor_by_kicks 2 4   # optional args: arity=2, bucket_size=4
 
-# All in sequence
-cargo bench --bench load_factor && \
-cargo bench --bench insert_throughput && \
-cargo bench --bench lookup_throughput && \
-cargo bench --bench delete_throughput && \
-cargo bench --bench fpr && \
-cargo bench --bench degree_distribution
+# Run every bench in sequence:
+for b in load_factor insert_throughput lookup_throughput delete_throughput \
+         fpr degree_distribution \
+         kv_store_insert_throughput kv_store_lookup_throughput kv_store_delete_throughput; do
+    cargo bench --bench "$b"
+done
 
-# Generate plots from CSV results
+# Render every plot at once (one-time pip setup):
 source .venv/bin/activate
-python scripts/plot.py                            # all plots → results/plots/
-python scripts/plot.py --list                     # show all available plot functions
+pip install -r scripts/requirements.txt
+python scripts/plot.py                            # all available plots → results/plots/
+python scripts/plot.py --list                     # list plot functions
 
-# Individual plots
-python scripts/plot.py load_factor_all            # load factor — all b values (3 subplots per arity)
-python scripts/plot.py load_factor_b234           # load factor — selective b for clarity
-python scripts/plot.py load_factor_by_kicks       # MAX_KICKS sweep, all (arity, b)
-python scripts/plot.py load_factor_by_kicks 2 4   # MAX_KICKS sweep, arity=2 b=4 only
-python scripts/plot.py insert_throughput          # insert throughput bars per arity
-python scripts/plot.py delete_throughput          # delete throughput bars per arity
-python scripts/plot.py lookup_throughput          # lookup at 5 hit rates (0/25/50/75/100%)
-python scripts/plot.py fpr_load_factor            # load factor vs fingerprint_bits
-python scripts/plot.py fpr_comparison             # FPR vs fingerprint_bits with d·b/2^f bound
-python scripts/plot.py degree_index               # bucket degree vs index scatter
-python scripts/plot.py degree_histogram           # degree histogram per (arity, b)
+# Override the read/write directories:
+SCF_RESULTS_DIR=/tmp/results SCF_PLOTS_DIR=/tmp/plots python scripts/plot.py
 ```
 
 ---

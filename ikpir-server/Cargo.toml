@@ -26,13 +26,14 @@ rand_chacha      = { workspace = true }
 proptest     = { workspace = true }
 ikpir-client = { workspace = true }
 clap         = { workspace = true }
+criterion    = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [[bench]]
-name    = "setup_throughput"
+name    = "setup_latency"
 harness = false
 
 [[bench]]

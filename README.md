@@ -89,19 +89,19 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 ## Benches and visualization
 
 Each crate ships `clap`-parsed benches that emit CSV under `results/`,
-mirroring `segmented-cuckoo`'s style. Default invocation runs a single
-sensible config; `--sweep` runs the full hardcoded parameter matrix;
-specific flags (`--num-buckets`, `--bucket-size`, `--value-bits`,
-`--lwe-dim`, ...) pick an exact configuration.
+mirroring `segmented-cuckoo`'s style. Each invocation runs a single config
+and appends one row to its CSV (`csv_writer` is append-aware); sweeping
+across configs is the orchestrator's job — a shell or Python wrapper that
+`rm`s the CSV first, then loops over configs.
 
 ```bash
-# Server: setup, answer, and the headline incremental-vs-rebuild crossover
-cargo bench -p ikpir-server --bench setup_throughput
-cargo bench -p ikpir-server --bench answer_throughput       -- --sweep
-cargo bench -p ikpir-server --bench incremental_vs_rebuild  -- --n-mutations 64
+# Server: setup latency, answer rate, and the headline incremental crossover
+cargo bench -p ikpir-server --bench setup_latency
+cargo bench -p ikpir-server --bench answer_throughput
+cargo bench -p ikpir-server --bench incremental_vs_rebuild  -- --n-mutations 1024
 
 # Client: query construction, decode, and apply_delta
-cargo bench -p ikpir-client --bench query_throughput        -- --sweep
+cargo bench -p ikpir-client --bench query_throughput
 cargo bench -p ikpir-client --bench decode_throughput
 cargo bench -p ikpir-client --bench apply_delta_throughput
 

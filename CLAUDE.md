@@ -52,19 +52,30 @@ state machine, failure-mode table, and entry-point map.
 
 Each crate ships `clap`-parsed benches that emit CSV under `results/`,
 plus a `scripts/plot.py` (matplotlib + pandas) that turns those CSVs into
-PNG charts under `results/plots/`. Default invocation runs a single
-sensible config; `--sweep` runs the full hardcoded matrix; specific
-flags (`--num-buckets`, `--bucket-size`, `--value-bits`, ...) pick an
-exact config.
+PNG charts under `results/plots/`. Each invocation = one config = one CSV
+row (the writer is append-aware); sweeping across configs is the
+orchestrator's job — `rm` the CSV first, then loop. Specific flags
+(`--num-buckets`, `--bucket-size`, `--value-bits`, ...) pin a configuration.
+
+The canonical sweep is `scripts/run_all.sh`, which iterates every bench
+over a paper-derived config matrix (see `scripts/configs.sh` — anchors
+ChalametPIR Tables 1/2 and Hao-2025 Table 1/Figure 10) and then renders
+all plots. Per-crate orchestrators (`<crate>/scripts/run_benches.sh`) run
+just that crate.
 
 ```bash
-cargo bench -p ikpir-server --bench answer_throughput
-cargo bench -p ikpir-server --bench answer_throughput -- --sweep
-cargo bench -p ikpir-server --bench answer_throughput -- \
-    --num-buckets 1024 --bucket-size 4 --value-bits 64
+# Full sweep + plots (server then client).
+./scripts/run_all.sh
+IKPIR_BENCH_PROFILE=quick ./scripts/run_all.sh   # smaller matrix, ~minutes
+IKPIR_BENCH_PROFILE=full  ./scripts/run_all.sh   # adds m=2^22 (very slow)
 
-cd ikpir-server && pip install -r scripts/requirements.txt && \
-    python scripts/plot.py
+# One bench at one config (manual).
+cargo bench -p ikpir-server --bench answer_throughput -- \
+    --num-buckets 16384 --bucket-size 4 --value-bits 256
+
+# Plots only (CSVs already populated).
+cd ikpir-server && python scripts/plot.py
+cd ikpir-client && python scripts/plot.py
 ```
 
 ## Design principles

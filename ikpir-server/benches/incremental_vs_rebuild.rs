@@ -1,57 +1,45 @@
-//! **Intent:** Compare the wall-clock and *wire* cost of `N` incremental
-//! hint patches against a single `full_rebuild` for the same total
-//! mutation footprint, split by mutation kind (`insert` / `update` /
-//! `delete`).
+//! **Intent:** Compare the wall-clock and wire cost of `N` incremental hint
+//! patches against a single `full_rebuild` for the same total mutation
+//! footprint, split by mutation kind (insert / update / delete).
 //!
-//! This is the headline benefit of the incremental scheme: a
-//! `full_rebuild` pays an `O(arity × n_rows × lwe_dim × row_width)`
-//! matvec regardless of how few cells changed; the per-mutation patch is
-//! `O(touched_cells × lwe_dim)`. There is some break-even point `N*` past
-//! which incremental becomes strictly more expensive than rebuilding
-//! once.
+//! **Method:** Populate once to `--load-factor` (default 0.80), snapshot the
+//! cell array, then for each (mutation_kind, path) clone via `from_cells`.
+//! This avoids re-populating for each path.
 //!
-//! Each mutation kind has a different per-call cost profile:
-//!   - `insert` may trigger a cuckoo kick chain that touches up to
-//!     `max_kicks` slots; the worst-case delta footprint is the largest
-//!     of the three.
-//!   - `update` always touches exactly one slot's value cells.
-//!   - `delete` always zeroes exactly one slot (fingerprint + value).
-//!
-//! **Method:** For each `(arity, num_buckets, n_mutations)` and each
-//! `mutation_kind ∈ {insert, update, delete}`, time:
-//!   - **incremental path**: build a populated server, run `N` mutations
-//!     via `server.{insert,update,delete}`, summing the
-//!     [`HintDeltaBundle::wire_byte_size`] of each returned delta.
-//!   - **rebuild path**: build a fresh store, run the same `N` mutations
-//!     directly on the store (no hint patches), wrap in `IkpirServer`, and
-//!     time one `full_rebuild` call. Sum `BackendWireSize::hint_byte_size`
-//!     across the rebuilt hints.
-//!
-//! **Invocation:** `cargo bench --bench incremental_vs_rebuild` runs at
-//! one `(arity, num_buckets, n_mutations)` point for all three mutation
-//! kinds. Pass `--sweep` for the full curve. Use `--arity <N>` to pick 2,
-//! 3, or 4; with `--sweep` and no explicit `--arity`, all three arities
-//! are swept.
+//! Insert path may fail at high load; tracks `n_attempted` and `n_succeeded`.
+//! At `--load-factor full`, insert row is emitted with `n_succeeded=0`,
+//! `incremental_ms=NaN`, `ratio_inc_over_rebuild=NaN`.
 //!
 //! **Output:** `results/ikpir_server_incremental_vs_rebuild.csv`
-//! Columns: `mutation_kind, arity, num_buckets, bucket_size, value_bits,
-//! n_mutations, incremental_ms, rebuild_ms, ratio_inc_over_rebuild,
-//! delta_bytes_total, rebuild_hint_bytes, delta_to_hint_ratio`
+//! Columns: mutation_kind, arity, num_buckets, bucket_size, value_bits,
+//! n_mutations, n_attempted, n_succeeded, incremental_ms, incremental_per_op_ms,
+//! rebuild_ms, ratio_inc_over_rebuild, delta_bytes_total, rebuild_hint_bytes,
+//! delta_to_hint_ratio
 
 mod helpers;
 
-use helpers::MakeStore;
+use helpers::CloneStore;
 use ikpir_server::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer,
 };
 use segmented_cuckoo::{
-    CuckooError, CuckooKVStore,
+    CuckooParams,
     Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
 };
 use std::io::Write;
 use std::time::Instant;
 
-const MAX_KICKS: u32 = 2_500;
+const HEADER: &str = "mutation_kind,arity,num_buckets,bucket_size,value_bits,\
+    n_mutations,n_attempted,n_succeeded,incremental_ms,incremental_per_op_ms,\
+    rebuild_ms,ratio_inc_over_rebuild,delta_bytes_total,rebuild_hint_bytes,delta_to_hint_ratio";
+
+#[derive(Clone, Debug)]
+enum LoadFactor { Value(f64), Full }
+
+fn parse_lf(s: &str) -> Result<LoadFactor, String> {
+    if s == "full" { return Ok(LoadFactor::Full); }
+    s.parse::<f64>().map(LoadFactor::Value).map_err(|e| e.to_string())
+}
 
 #[derive(Clone, Copy, Debug)]
 enum MutationKind { Insert, Update, Delete }
@@ -59,258 +47,226 @@ impl MutationKind {
     fn as_csv(self) -> &'static str {
         match self { Self::Insert => "insert", Self::Update => "update", Self::Delete => "delete" }
     }
-    fn all() -> &'static [Self] {
-        &[Self::Insert, Self::Update, Self::Delete]
-    }
+    fn all() -> &'static [Self] { &[Self::Insert, Self::Update, Self::Delete] }
 }
 
 #[derive(clap::Parser)]
 #[command(about = "Compare incremental hint patching vs full rebuild for N mutations.")]
 struct Cli {
-    /// Run the full hardcoded curve
-    /// (num_buckets per arity × n_mutations ∈ {1,4,16,64,256,1024}).
-    #[arg(long)]
-    sweep: bool,
-
-    /// Cuckoo arity (2, 3, or 4). With --sweep and no --arity, sweep all three.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4))]
-    arity: Option<u32>,
-
-    #[arg(long, default_value_t = 256)]  num_buckets: u32,
-    #[arg(long, default_value_t = 4)]    bucket_size: u32,
-    #[arg(long, default_value_t = 64)]   value_bits: u32,
-    #[arg(long, default_value_t = 12)]   fingerprint_bits: u32,
-    #[arg(long, default_value_t = 8)]    plaintext_bits: u32,
-    #[arg(long, default_value_t = 1774)] lwe_dim: u32,
-    #[arg(long, default_value_t = 64)]   n_mutations: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
+    arity: u32,
+    #[arg(long, default_value_t = 16_384)] num_buckets: u32,
+    #[arg(long, default_value_t = 4)]      bucket_size: u32,
+    #[arg(long, default_value_t = 256)]    value_bits: u32,
+    #[arg(long, default_value_t = 32)]     fingerprint_bits: u32,
+    #[arg(long, default_value_t = 8)]      plaintext_bits: u32,
+    #[arg(long, default_value_t = 1774)]   lwe_dim: u32,
+    #[arg(long, default_value_t = 1024)]   n_mutations: u32,
+    /// Load factor before mutations. Float in (0,1) or "full" to populate
+    /// to TableFull (insert mutations will always fail at full).
+    #[arg(long, value_parser = parse_lf, default_value = "0.80")]
+    load_factor: LoadFactor,
 }
 
-/// Build a seeded store at ~50% load with deterministic `(key, value)`
-/// pairs for keys `0..n_seed`. Returns `None` if the store geometry is
-/// invalid or seeding hits `TableFull` (the latter is unusual at 50% load
-/// but possible for tiny tables).
-fn build_seeded_store<S>(cli: &Cli, num_buckets: u32, n_seed: u32) -> Option<CuckooKVStore<S>>
-where S: MakeStore {
-    let mut store = S::make_store(
-        num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
-    ).ok()?;
-    store.set_max_kicks(MAX_KICKS);
-    let vsize = (cli.value_bits as usize).div_ceil(8);
-    let mut value = vec![0u8; vsize];
-    for k in 0u32..n_seed {
-        fill_value(&mut value, k, 17);
-        match store.insert(k.to_le_bytes(), &value) {
-            Ok(())                       => {}
-            Err(CuckooError::TableFull)  => return None,
-            Err(e)                       => panic!("seed: {e:?}"),
-        }
-    }
-    Some(store)
-}
-
-/// Deterministic value filler; `salt` lets two different mutation kinds
-/// generate distinct payloads for the same key (e.g., seed vs update).
 fn fill_value(value: &mut [u8], key: u32, salt: u32) {
     for (i, b) in value.iter_mut().enumerate() {
         *b = (key.wrapping_mul(salt).wrapping_add(i as u32) & 0xFF) as u8;
     }
 }
 
-#[derive(Clone, Copy)]
-struct PerKindResult {
+struct KindResult {
+    n_attempted:        u32,
+    n_succeeded:        u32,
     incremental_ms:     f64,
     rebuild_ms:         f64,
     delta_bytes_total:  usize,
     rebuild_hint_bytes: usize,
 }
 
-/// Run the incremental + rebuild paths for a single mutation kind.
-fn run_kind<S>(
-    cli: &Cli,
-    num_buckets: u32,
-    n_seed: u32,
-    n_mut: u32,
-    kind: MutationKind,
-) -> Result<PerKindResult, IkpirError>
-where S: MakeStore {
+fn run_kind<S: CloneStore>(
+    cli:        &Cli,
+    cells:      &[u32],
+    params:     CuckooParams,
+    n_seed:     u64,
+    n_mut:      u32,
+    kind:       MutationKind,
+) -> KindResult {
     let vsize = (cli.value_bits as usize).div_ceil(8);
+    let mut value = vec![0u8; vsize];
 
-    // ── Incremental path ─────────────────────────────────────────────────
-    let store = build_seeded_store::<S>(cli, num_buckets, n_seed).ok_or(IkpirError::TableFull)?;
+    // ── Incremental path ───────────────────────────────────────────────────
+    let store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
     let mut server: IkpirServer<S, FrodoPirBackend> =
         IkpirServer::new(store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
 
     let mut delta_bytes_total = 0usize;
-    let mut value = vec![0u8; vsize];
+    let mut n_succeeded = 0u32;
+    let n_attempted = n_mut;
     let inc_start = Instant::now();
     for i in 0..n_mut {
-        let bundle = match kind {
+        let res = match kind {
             MutationKind::Insert => {
-                let k = n_seed + i;
+                let k = n_seed as u32 + i;
                 fill_value(&mut value, k, 31);
-                server.insert(&k.to_le_bytes(), &value)?
+                server.insert(&k.to_le_bytes(), &value)
             }
             MutationKind::Update => {
-                let k = (n_seed - 1) - i;
-                fill_value(&mut value, k, 47); // different salt from seed
-                server.update(&k.to_le_bytes(), &value)?
+                let k = (n_seed as u32 - 1) - (i % n_seed as u32);
+                fill_value(&mut value, k, 47);
+                server.update(&k.to_le_bytes(), &value)
             }
             MutationKind::Delete => {
-                let k = (n_seed - 1) - i;
-                server.delete(&k.to_le_bytes())?
+                let k = (n_seed as u32 - 1) - (i % n_seed as u32);
+                server.delete(&k.to_le_bytes())
             }
         };
-        delta_bytes_total += bundle.wire_byte_size();
-    }
-    let incremental_ms = inc_start.elapsed().as_secs_f64() * 1e3;
-
-    // ── Rebuild path ─────────────────────────────────────────────────────
-    // Recreate the store, apply the same mutations directly (no hint
-    // patches), wrap in a fresh server, then time one full_rebuild call.
-    let mut store = build_seeded_store::<S>(cli, num_buckets, n_seed).ok_or(IkpirError::TableFull)?;
-    for i in 0..n_mut {
-        match kind {
-            MutationKind::Insert => {
-                let k = n_seed + i;
-                fill_value(&mut value, k, 31);
-                if store.insert(k.to_le_bytes(), &value).is_err() { break; }
+        match res {
+            Ok(bundle) => {
+                delta_bytes_total += bundle.wire_byte_size();
+                n_succeeded += 1;
             }
-            MutationKind::Update => {
-                let k = (n_seed - 1) - i;
-                fill_value(&mut value, k, 47);
-                if store.update(k.to_le_bytes(), &value).is_err() { break; }
-            }
-            MutationKind::Delete => {
-                let k = (n_seed - 1) - i;
-                if store.delete(k.to_le_bytes()).is_err() { break; }
-            }
+            Err(IkpirError::TableFull) => { /* count as attempted, not succeeded */ }
+            Err(e) => panic!("incremental path: {e:?}"),
         }
     }
+    // Total elapsed across all mutation attempts. Per-op latency is recovered
+    // by dividing by `n_succeeded` for the insert kind (the failure path is
+    // cheap and rolls back), or by `n_mut` for update/delete (always succeed).
+    let incremental_ms = if n_succeeded > 0 {
+        inc_start.elapsed().as_secs_f64() * 1e3
+    } else {
+        f64::NAN
+    };
+
+    // ── Rebuild path ───────────────────────────────────────────────────────
+    let store2 = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
     let mut server2: IkpirServer<S, FrodoPirBackend> =
-        IkpirServer::new(store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
+        IkpirServer::new(store2, FrodoConfig::with_lwe_dim(cli.lwe_dim));
+    for i in 0..n_mut {
+        let _ = match kind {
+            MutationKind::Insert => {
+                let k = n_seed as u32 + i;
+                fill_value(&mut value, k, 31);
+                server2.insert(&k.to_le_bytes(), &value).ok()
+            }
+            MutationKind::Update => {
+                let k = (n_seed as u32 - 1) - (i % n_seed as u32);
+                fill_value(&mut value, k, 47);
+                server2.update(&k.to_le_bytes(), &value).ok()
+            }
+            MutationKind::Delete => {
+                let k = (n_seed as u32 - 1) - (i % n_seed as u32);
+                server2.delete(&k.to_le_bytes()).ok()
+            }
+        };
+    }
     let reb_start = Instant::now();
     let rebuild_bundle = server2.full_rebuild();
     let rebuild_ms = reb_start.elapsed().as_secs_f64() * 1e3;
     let rebuild_hint_bytes: usize = rebuild_bundle.hints.iter()
         .map(FrodoPirBackend::hint_byte_size).sum();
 
-    Ok(PerKindResult { incremental_ms, rebuild_ms, delta_bytes_total, rebuild_hint_bytes })
+    KindResult { n_attempted, n_succeeded, incremental_ms, rebuild_ms,
+                 delta_bytes_total, rebuild_hint_bytes }
 }
 
-fn run_one<S>(
+fn run_one<S: CloneStore>(
     csv: &mut std::io::BufWriter<std::fs::File>,
     cli: &Cli,
     arity: u32,
     num_buckets: u32,
-    n_mut:       u32,
-)
-where S: MakeStore {
-    let cap    = num_buckets * cli.bucket_size;
-    let n_seed = cap / 2;
-    // Insert path needs headroom for n_seed + n_mut. Update/delete need
-    // n_mut ≤ n_seed (so the keys exist). Use the same conservative bound
-    // as the original bench for the insert headroom; update/delete are
-    // trivially satisfied because n_mut ≤ n_seed = cap/2.
-    if n_seed + n_mut > (cap as f64 * 0.85) as u32 {
-        eprintln!("  Skip arity={arity} num_buckets={num_buckets} N={n_mut}: insufficient headroom");
-        return;
-    }
-    if n_mut > n_seed {
-        eprintln!("  Skip arity={arity} num_buckets={num_buckets} N={n_mut}: n_mut > n_seed");
+) {
+    use clap::parser::ValueSource;
+    let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
+
+    // Populate once and snapshot.
+    let (seed_store, n_seed) = match &cli.load_factor {
+        LoadFactor::Full => helpers::populate_until_full::<S>(
+            num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
+        ),
+        LoadFactor::Value(lf) => helpers::populate_to_load::<S>(
+            *lf, num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
+        ),
+    };
+    let cells  = seed_store.snapshot_cells();
+    let params = seed_store.params();
+
+    let cps = params.cells_per_slot();
+    let store_state = helpers::StoreState {
+        capacity:      (num_buckets as u64) * (cli.bucket_size as u64),
+        populated:     n_seed,
+        load_pct:      100.0 * n_seed as f64 / (num_buckets as f64 * cli.bucket_size as f64),
+        cells_per_slot: cps,
+        row_width:     cli.bucket_size * cps,
+        segment_rows:  params.segment_size(),
+    };
+    let lf_str = match &cli.load_factor {
+        LoadFactor::Full => "full".to_string(),
+        LoadFactor::Value(v) => format!("{v:.2}"),
+    };
+    let geom = helpers::Geometry {
+        hint_per_seg_bytes: 0, setup_bundle_bytes: 0,
+        query_bytes: 0, response_bytes: 0, hint_delta_typical_bytes: None,
+    };
+    let knobs = [
+        helpers::Knob { name: "arity",        value: arity.to_string(),           is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "num_buckets",   value: num_buckets.to_string(),     is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",   value: cli.bucket_size.to_string(), is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",    value: cli.value_bits.to_string(),  is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "n_mutations",   value: cli.n_mutations.to_string(), is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "load_factor",   value: lf_str,                      is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
+    ];
+    helpers::print_preamble("incremental_vs_rebuild", &knobs, &store_state, &geom);
+
+    // Ensure n_seed is sufficient for update/delete targets.
+    if n_seed < cli.n_mutations as u64 {
+        eprintln!("  Skip: n_seed={n_seed} < n_mutations={}", cli.n_mutations);
         return;
     }
 
     for &kind in MutationKind::all() {
-        let r = match run_kind::<S>(cli, num_buckets, n_seed, n_mut, kind) {
-            Ok(r)  => r,
-            Err(e) => {
-                eprintln!("  Skip kind={} arity={arity} num_buckets={num_buckets} N={n_mut}: {e:?}",
-                          kind.as_csv());
-                continue;
-            }
-        };
-        let ratio_time = r.incremental_ms / r.rebuild_ms;
-        let ratio_bytes = if r.rebuild_hint_bytes == 0 {
-            f64::NAN
-        } else {
+        let r = run_kind::<S>(cli, &cells, params, n_seed, cli.n_mutations, kind);
+        let ratio_time = if r.rebuild_ms > 0.0 { r.incremental_ms / r.rebuild_ms } else { f64::NAN };
+        let inc_per_op = if r.n_succeeded > 0 {
+            r.incremental_ms / r.n_succeeded as f64
+        } else { f64::NAN };
+        let ratio_bytes = if r.rebuild_hint_bytes > 0 {
             r.delta_bytes_total as f64 / r.rebuild_hint_bytes as f64
-        };
+        } else { f64::NAN };
         writeln!(
             csv,
-            "{},{arity},{num_buckets},{},{},{n_mut},{:.3},{:.3},{:.4},{},{},{:.6}",
-            kind.as_csv(),
-            cli.bucket_size, cli.value_bits,
-            r.incremental_ms, r.rebuild_ms, ratio_time,
+            "{},{arity},{num_buckets},{},{},{},{},{},{:.3},{:.6},{:.3},{:.4},{},{},{:.6}",
+            kind.as_csv(), cli.bucket_size, cli.value_bits, cli.n_mutations,
+            r.n_attempted, r.n_succeeded,
+            r.incremental_ms, inc_per_op, r.rebuild_ms, ratio_time,
             r.delta_bytes_total, r.rebuild_hint_bytes, ratio_bytes,
-        )
-        .unwrap();
+        ).unwrap();
         println!(
-            "  kind={:<6} arity={arity} num_buckets={num_buckets:<5} N={n_mut:<5} | \
-             inc={:>8.3} ms  rebuild={:>8.3} ms  ratio={:.3}  delta={:>9} B  hint={:>10} B  ratio_b={:.4}",
-            kind.as_csv(),
-            r.incremental_ms, r.rebuild_ms, ratio_time,
-            r.delta_bytes_total, r.rebuild_hint_bytes, ratio_bytes,
+            "  kind={:<6} arity={arity} num_buckets={num_buckets:<6} N={} | \
+             inc={:.3}ms ({:.4}ms/op)  rebuild={:.3}ms  ratio={:.3}  succ={}/{}  delta={}B  hint={}B",
+            kind.as_csv(), cli.n_mutations,
+            r.incremental_ms, inc_per_op, r.rebuild_ms, ratio_time,
+            r.n_succeeded, r.n_attempted,
+            r.delta_bytes_total, r.rebuild_hint_bytes,
         );
     }
 }
 
-fn dispatch(
-    csv: &mut std::io::BufWriter<std::fs::File>,
-    cli: &Cli,
-    arity: u32,
-    num_buckets: u32,
-    n_mut: u32,
-) {
-    match arity {
-        2 => run_one::<Segmented2aryScheme>(csv, cli, 2, num_buckets, n_mut),
-        3 => run_one::<Segmented3aryScheme>(csv, cli, 3, num_buckets, n_mut),
-        4 => run_one::<Segmented4aryScheme>(csv, cli, 4, num_buckets, n_mut),
-        _ => unreachable!("clap value_parser bounds arity to 2..=4"),
-    }
-}
-
-fn sweep_buckets(arity: u32) -> &'static [u32] {
-    match arity {
-        2 | 4 => &[256, 1024],
-        3     => &[384, 1536],
-        _     => unreachable!(),
-    }
-}
-
-fn resolve_num_buckets(cli: &Cli, arity: u32) -> u32 {
-    if cli.num_buckets == 256 && arity == 3 { 384 } else { cli.num_buckets }
-}
-
 fn main() {
-    let cli: Cli = helpers::parse_cli();
-    let mut csv = helpers::csv_writer(
-        "ikpir_server_incremental_vs_rebuild.csv",
-        "mutation_kind,arity,num_buckets,bucket_size,value_bits,n_mutations,incremental_ms,rebuild_ms,ratio_inc_over_rebuild,delta_bytes_total,rebuild_hint_bytes,delta_to_hint_ratio",
-    );
-
-    println!("=== ikpir-server: incremental hint patch vs full_rebuild (FrodoPirBackend) ===");
-    println!(
-        "Config: fingerprint_bits={}, plaintext_bits={}, value_bits={}, bucket_size={}, lwe_dim={}",
-        cli.fingerprint_bits, cli.plaintext_bits, cli.value_bits, cli.bucket_size, cli.lwe_dim,
-    );
-
-    let arities: Vec<u32> = match (cli.sweep, cli.arity) {
-        (true,  None)    => vec![2, 3, 4],
-        (true,  Some(a)) => vec![a],
-        (false, opt)     => vec![opt.unwrap_or(2)],
+    let (cli, matches) = helpers::parse_cli_with_matches::<Cli>();
+    let num_buckets = if matches.value_source("num_buckets") == Some(clap::parser::ValueSource::CommandLine) {
+        cli.num_buckets
+    } else {
+        helpers::default_num_buckets_for_arity(cli.arity)
     };
 
-    for &arity in &arities {
-        if cli.sweep {
-            for &nb in sweep_buckets(arity) {
-                for &n in &[1u32, 4, 16, 64, 256, 1024] {
-                    dispatch(&mut csv, &cli, arity, nb, n);
-                }
-            }
-        } else {
-            let nb = resolve_num_buckets(&cli, arity);
-            dispatch(&mut csv, &cli, arity, nb, cli.n_mutations);
-        }
+    let mut csv = helpers::csv_writer("ikpir_server_incremental_vs_rebuild.csv", HEADER);
+
+    match cli.arity {
+        2 => run_one::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
+        3 => run_one::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
+        4 => run_one::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
+        _ => unreachable!("clap value_parser bounds arity to 2..=4"),
     }
     println!("\nResults written to results/ikpir_server_incremental_vs_rebuild.csv");
 }

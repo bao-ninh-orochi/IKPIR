@@ -22,25 +22,23 @@
 //!   - `row_width` = bucket_size × cells_per_slot
 //!   - `cells_per_slot` = (fingerprint_bits + value_bits).div_ceil(plaintext_bits)
 //!
-//! **Invocation:** `cargo bench --bench client_memory_footprint` runs a
-//! single default config. Pass `--sweep` to iterate the full matrix
-//! (including all three modes — see sweep semantics below).
-//!
-//! **Sweep semantics:** `--sweep` (or `--sweep --mode cold`) iterates all
-//! three modes; `--sweep --mode warm-b` / `--sweep --mode warm-bc` pins to
-//! a single mode while sweeping configs.
-//!
 //! **Output:** `results/ikpir_client_memory_footprint.csv`
 //! Columns: mode, arity, num_buckets, bucket_size, value_bits, lwe_dim,
 //! batch, stack_bytes, heap_bytes, total_bytes
 
 mod helpers;
 
-use ikpir_client::{FrodoPirBackend, IkpirClient};
+use helpers::MakeStore;
+use ikpir_client::{FrodoConfig, FrodoPirBackend, IkpirClient};
+use ikpir_server::{BackendWireSize, IkpirServer};
+use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
 use std::io::Write;
 use std::mem;
 
 type Client = IkpirClient<FrodoPirBackend>;
+
+const HEADER: &str = "mode,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+    batch,stack_bytes,heap_bytes,total_bytes";
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum Mode { Cold, WarmB, WarmBc }
@@ -53,45 +51,29 @@ impl Mode {
 #[derive(Clone, clap::Parser)]
 #[command(about = "Closed-form heap accounting for IkpirClient<FrodoPirBackend>.")]
 struct Cli {
-    /// Run the full hardcoded matrix.
-    #[arg(long)]
-    sweep: bool,
-
-    /// Cuckoo arity (2, 3, or 4). With --sweep and no --arity, sweep all three.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4))]
-    arity: Option<u32>,
-
-    /// Preprocessing mode: cold (default), warm-b, or warm-bc.
-    #[arg(long, value_enum, default_value_t = Mode::Cold)]
-    mode: Mode,
-
-    #[arg(long, default_value_t = 256)]  num_buckets: u32,
-    #[arg(long, default_value_t = 4)]    bucket_size: u32,
-    #[arg(long, default_value_t = 64)]   value_bits: u32,
-    #[arg(long, default_value_t = 12)]   fingerprint_bits: u32,
-    #[arg(long, default_value_t = 8)]    plaintext_bits: u32,
-    #[arg(long, default_value_t = 1774)] lwe_dim: u32,
-    #[arg(long, default_value_t = 64)]   batch: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
+    arity: u32,
+    #[arg(long, value_enum, default_value_t = Mode::Cold)] mode: Mode,
+    #[arg(long, default_value_t = 16_384)] num_buckets: u32,
+    #[arg(long, default_value_t = 4)]      bucket_size: u32,
+    #[arg(long, default_value_t = 256)]    value_bits: u32,
+    #[arg(long, default_value_t = 32)]     fingerprint_bits: u32,
+    #[arg(long, default_value_t = 8)]      plaintext_bits: u32,
+    #[arg(long, default_value_t = 1774)]   lwe_dim: u32,
+    #[arg(long, default_value_t = 64)]     batch: u32,
 }
 
-fn footprint(
-    cli:         &Cli,
-    arity:       u32,
-    num_buckets: u32,
-    bucket_size: u32,
-    value_bits:  u32,
-    mode:        Mode,
-) -> (usize, usize) {
+fn footprint(cli: &Cli, arity: u32, num_buckets: u32) -> (usize, usize) {
     let n_rows         = (num_buckets / arity) as usize;
-    let cells_per_slot = (cli.fingerprint_bits + value_bits).div_ceil(cli.plaintext_bits) as usize;
-    let row_width      = bucket_size as usize * cells_per_slot;
+    let cells_per_slot = (cli.fingerprint_bits + cli.value_bits).div_ceil(cli.plaintext_bits) as usize;
+    let row_width      = cli.bucket_size as usize * cells_per_slot;
     let lwe_dim        = cli.lwe_dim as usize;
 
     let per_seg_baseline   = 2 * (n_rows * lwe_dim * 4) + (lwe_dim * row_width * 4);
     let per_slot_cold      = (lwe_dim + n_rows) * 4;
     let per_slot_warm_c    = (lwe_dim + n_rows + row_width) * 4;
-    let prepared_count     = match mode { Mode::Cold => 0, Mode::WarmB | Mode::WarmBc => cli.batch as usize };
-    let per_seg_prepared   = match mode {
+    let prepared_count     = match cli.mode { Mode::Cold => 0, Mode::WarmB | Mode::WarmBc => cli.batch as usize };
+    let per_seg_prepared   = match cli.mode {
         Mode::Cold | Mode::WarmB => prepared_count * per_slot_cold,
         Mode::WarmBc             => prepared_count * per_slot_warm_c,
     };
@@ -100,83 +82,85 @@ fn footprint(
     (stack_bytes, heap_bytes)
 }
 
-fn run_one(
+fn run_one<S: MakeStore>(
     csv: &mut std::io::BufWriter<std::fs::File>,
     cli: &Cli,
     arity: u32,
     num_buckets: u32,
-    bucket_size: u32,
-    value_bits:  u32,
 ) {
-    let (stack_bytes, heap_bytes) = footprint(cli, arity, num_buckets, bucket_size, value_bits, cli.mode);
+    use clap::parser::ValueSource;
+    let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
+
+    // Build an empty server purely to extract Geometry for the preamble.
+    // No populate, no timing — closed-form accounting follows.
+    let store = S::make_store(
+        num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
+    ).expect("make_store");
+    let server: IkpirServer<S, FrodoPirBackend> =
+        IkpirServer::new(store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
+    let bundle = server.setup();
+    let params_store = server.params();
+    let cps = params_store.cells_per_slot();
+    let store_state = helpers::StoreState {
+        capacity:       (num_buckets as u64) * (cli.bucket_size as u64),
+        populated:      0,
+        load_pct:       0.0,
+        cells_per_slot: cps,
+        row_width:      cli.bucket_size * cps,
+        segment_rows:   params_store.segment_size(),
+    };
+    let mut probe_client = Client::from_setup(bundle.clone());
+    let q0 = probe_client.build_query(&0u32.to_le_bytes());
+    let geom = helpers::Geometry {
+        hint_per_seg_bytes:       FrodoPirBackend::hint_byte_size(&bundle.hints[0]),
+        setup_bundle_bytes:       bundle.wire_byte_size(),
+        query_bytes:              q0.wire_byte_size(),
+        response_bytes:           server.answer(&q0).expect("answer ok").wire_byte_size(),
+        hint_delta_typical_bytes: None,
+    };
+    let mode_str = cli.mode.as_csv();
+    let knobs = [
+        helpers::Knob { name: "arity",            value: arity.to_string(),               is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "mode",             value: mode_str.to_string(),            is_default: matches.value_source("mode") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "num_buckets",       value: num_buckets.to_string(),         is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",       value: cli.bucket_size.to_string(),     is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "fingerprint_bits",  value: cli.fingerprint_bits.to_string(), is_default: matches.value_source("fingerprint_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",        value: cli.value_bits.to_string(),      is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "plaintext_bits",    value: cli.plaintext_bits.to_string(),  is_default: matches.value_source("plaintext_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",           value: cli.lwe_dim.to_string(),         is_default: matches.value_source("lwe_dim") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "batch",             value: cli.batch.to_string(),           is_default: matches.value_source("batch") != Some(ValueSource::CommandLine) },
+    ];
+    helpers::print_preamble("client_memory_footprint", &knobs, &store_state, &geom);
+
+    let (stack_bytes, heap_bytes) = footprint(cli, arity, num_buckets);
     let total_bytes = stack_bytes + heap_bytes;
-    let mode_label  = cli.mode.as_csv();
     writeln!(
         csv,
-        "{mode_label},{arity},{num_buckets},{bucket_size},{value_bits},{},{},{stack_bytes},{heap_bytes},{total_bytes}",
-        cli.lwe_dim, cli.batch,
-    )
-    .unwrap();
+        "{mode_str},{arity},{num_buckets},{},{},{},{},{stack_bytes},{heap_bytes},{total_bytes}",
+        cli.bucket_size, cli.value_bits, cli.lwe_dim, cli.batch,
+    ).unwrap();
     println!(
-        "  mode={mode_label:<7} arity={arity} num_buckets={num_buckets:<5} bs={bucket_size} vb={value_bits:<4} | \
-         stack={stack_bytes}B heap={heap_bytes}B total={total_bytes}B"
+        "  mode={mode_str:<7} arity={arity} nb={num_buckets:<6} bs={} vb={:<4} | \
+         stack={stack_bytes}B heap={heap_bytes}B total={total_bytes}B",
+        cli.bucket_size, cli.value_bits,
     );
-}
-
-fn sweep_buckets(arity: u32) -> &'static [u32] {
-    match arity {
-        2 | 4 => &[64, 256, 1024],
-        3     => &[96, 384, 1536],
-        _     => unreachable!(),
-    }
-}
-
-fn resolve_num_buckets(cli: &Cli, arity: u32) -> u32 {
-    if cli.num_buckets == 256 && arity == 3 { 384 } else { cli.num_buckets }
 }
 
 fn main() {
-    let cli: Cli = helpers::parse_cli();
-    let mut csv = helpers::csv_writer(
-        "ikpir_client_memory_footprint.csv",
-        "mode,arity,num_buckets,bucket_size,value_bits,lwe_dim,batch,stack_bytes,heap_bytes,total_bytes",
-    );
-
-    println!("=== ikpir-client memory footprint (FrodoPirBackend, closed-form) ===");
-    println!(
-        "Config: mode={}, fingerprint_bits={}, plaintext_bits={}, lwe_dim={}, batch={}",
-        cli.mode.as_csv(), cli.fingerprint_bits, cli.plaintext_bits, cli.lwe_dim, cli.batch,
-    );
-
-    let arities: Vec<u32> = match (cli.sweep, cli.arity) {
-        (true,  None)    => vec![2, 3, 4],
-        (true,  Some(a)) => vec![a],
-        (false, opt)     => vec![opt.unwrap_or(2)],
+    let (cli, matches) = helpers::parse_cli_with_matches::<Cli>();
+    let num_buckets = if matches.value_source("num_buckets") == Some(clap::parser::ValueSource::CommandLine) {
+        cli.num_buckets
+    } else {
+        helpers::default_num_buckets_for_arity(cli.arity)
     };
 
-    let modes: Vec<Mode> = match (cli.sweep, cli.mode) {
-        (true,  Mode::Cold)   => vec![Mode::Cold, Mode::WarmB, Mode::WarmBc],
-        (true,  Mode::WarmB)  => vec![Mode::WarmB],
-        (true,  Mode::WarmBc) => vec![Mode::WarmBc],
-        (false, m)            => vec![m],
-    };
+    let mut csv = helpers::csv_writer("ikpir_client_memory_footprint.csv", HEADER);
 
-    for &mode in &modes {
-        let cli_local = Cli { mode, ..cli.clone() };
-        for &arity in &arities {
-            if cli_local.sweep {
-                for &nb in sweep_buckets(arity) {
-                    for &bs in &[2u32, 4] {
-                        for &vb in &[8u32, 64, 256] {
-                            run_one(&mut csv, &cli_local, arity, nb, bs, vb);
-                        }
-                    }
-                }
-            } else {
-                let nb = resolve_num_buckets(&cli_local, arity);
-                run_one(&mut csv, &cli_local, arity, nb, cli_local.bucket_size, cli_local.value_bits);
-            }
-        }
+    match cli.arity {
+        2 => run_one::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
+        3 => run_one::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
+        4 => run_one::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
+        _ => unreachable!("clap value_parser bounds arity to 2..=4"),
     }
     println!("\nResults written to results/ikpir_client_memory_footprint.csv");
 }

@@ -1,64 +1,46 @@
 //! **Intent:** Measure client-side `decode` throughput on the FrodoPIR
 //! backend, in three preprocessing modes:
 //!
-//! - **`cold`** — no preprocessing; each `decode` recomputes `c = sᵀ·H`
-//!   on the fly. Cost ∝ `arity × lwe_dim × row_width`.
-//! - **`warm-b`** — `precompute_queries(batch)` only; queries take the
-//!   cheap path but decode still computes `c` inline (the design intent
-//!   for dynamic-database benchmarks where Phase C is invalidated by every
-//!   mutation).
-//! - **`warm-bc`** — both `precompute_queries(batch)` and
-//!   `precompute_decodes()`; decode collapses to one vector subtract +
+//! - **`cold`** — decode recomputes `c = sᵀ·H` on the fly.
+//! - **`warm-b`** — Phase B only; queries cheap, decode still on-the-fly.
+//! - **`warm-bc`** — Phase B + Phase C; decode is one vector subtract +
 //!   rounding plus the slot scan.
 //!
-//! **Method:** Build a server-client pair, run the configured
-//! preprocessing, pre-build a batch of `(query, response)` pairs
-//! (excluding query construction and `server.answer` from the timing),
-//! then time `batch` `decode` calls.
+//! **Method:** Populate to `TableFull`, build the server. Each criterion
+//! iter: setup (untimed) calls `build_query` + `server.answer` to produce a
+//! matching `(key, response)` pair for the *same* client that will decode;
+//! the routine times only `client.decode(key, response)`. The criterion
+//! HTML/JSON report lands in `target/criterion/decode_throughput/`.
 //!
-//! **Invocation:** `cargo bench --bench decode_throughput` runs a single
-//! sensible default config in `cold` mode. Pass `--mode warm-b`,
-//! `--mode warm-bc`, `--sweep` for the full matrix, or
-//! `--num-buckets <N>` (etc.) for a specific config. Use `--arity <N>` to
-//! pick 2, 3, or 4; with `--sweep` and no explicit `--arity`, all three
-//! arities are swept.
+//! **Warm-mode caveat:** the prebuilt queue holds `QUEUE_HEADROOM` slots
+//! per segment. If criterion's measurement budget calls `build_query`
+//! more than `QUEUE_HEADROOM` times, the bench panics on queue exhaustion
+//! — bump `QUEUE_HEADROOM` if you raise criterion's budgets above default.
 //!
 //! **Output:** `results/ikpir_client_decode_throughput.csv`
 //! Columns: mode, arity, num_buckets, bucket_size, value_bits, batch,
 //! mean_qps, min_qps, max_qps, stddev_qps, response_bytes
-//!
-//! **Sweep semantics:** `--sweep` (or `--sweep --mode cold`) iterates all
-//! three modes across the config matrix. `--sweep --mode warm-b` or
-//! `--sweep --mode warm-bc` pins to a single mode while sweeping configs.
-//! `response_bytes` is deterministic given the params; sampled once per row.
 
 mod helpers;
 
 use helpers::MakeStore;
 use ikpir_client::{FrodoConfig, FrodoPirBackend, IkpirClient, PirResponseBundle};
-use ikpir_server::IkpirServer;
-use segmented_cuckoo::{
-    CuckooError,
-    Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
-};
+use ikpir_server::{BackendWireSize, IkpirServer};
+use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
+use std::cell::RefCell;
 use std::io::Write;
-use std::time::Instant;
 
 type Client   = IkpirClient<FrodoPirBackend>;
 type Response = PirResponseBundle<FrodoPirBackend>;
 
-const MAX_KICKS: u32 = 2_500;
+const HEADER: &str = "mode,arity,num_buckets,bucket_size,value_bits,batch,\
+    mean_qps,min_qps,max_qps,stddev_qps,response_bytes";
+
+/// Cap on prepared slots for warm modes. Matches `query_throughput`.
+const QUEUE_HEADROOM: u32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum Mode {
-    /// No preprocessing — decode recomputes `c = sᵀ·H` on the fly.
-    Cold,
-    /// Phase B only (queries cheap, decode still on-the-fly). Matches the
-    /// dynamic-database paper scenario where Phase C is skipped.
-    WarmB,
-    /// Phase B + Phase C — decode is one vector subtract + rounding.
-    WarmBc,
-}
+enum Mode { Cold, WarmB, WarmBc }
 impl Mode {
     fn as_csv(self) -> &'static str {
         match self { Mode::Cold => "cold", Mode::WarmB => "warm-b", Mode::WarmBc => "warm-bc" }
@@ -66,212 +48,131 @@ impl Mode {
 }
 
 #[derive(Clone, clap::Parser)]
-#[command(about = "Measure ikpir-client decode throughput (queries/sec).")]
+#[command(about = "Measure ikpir-client decode throughput (queries/sec) via criterion.")]
 struct Cli {
-    /// Run the full hardcoded matrix
-    /// (num_buckets per arity × bucket_size ∈ {2,4} × value_bits ∈ {8,64,256}).
-    #[arg(long)]
-    sweep: bool,
-
-    /// Cuckoo arity (2, 3, or 4). With --sweep and no --arity, sweep all three.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4))]
-    arity: Option<u32>,
-
-    /// Preprocessing mode: cold (default), warm-b, or warm-bc.
-    #[arg(long, value_enum, default_value_t = Mode::Cold)]
-    mode: Mode,
-
-    #[arg(long, default_value_t = 256)]  num_buckets: u32,
-    #[arg(long, default_value_t = 4)]    bucket_size: u32,
-    #[arg(long, default_value_t = 64)]   value_bits: u32,
-    #[arg(long, default_value_t = 12)]   fingerprint_bits: u32,
-    #[arg(long, default_value_t = 8)]    plaintext_bits: u32,
-    #[arg(long, default_value_t = 1774)] lwe_dim: u32,
-    #[arg(long, default_value_t = 64)]   batch: u32,
-    #[arg(long, default_value_t = 2)]    warmup: u32,
-    #[arg(long, default_value_t = 5)]    trials: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
+    arity: u32,
+    #[arg(long, value_enum, default_value_t = Mode::Cold)] mode: Mode,
+    #[arg(long, default_value_t = 16_384)] num_buckets: u32,
+    #[arg(long, default_value_t = 4)]      bucket_size: u32,
+    #[arg(long, default_value_t = 256)]    value_bits: u32,
+    #[arg(long, default_value_t = 32)]     fingerprint_bits: u32,
+    #[arg(long, default_value_t = 8)]      plaintext_bits: u32,
+    #[arg(long, default_value_t = 1774)]   lwe_dim: u32,
+    #[arg(long, default_value_t = 64)]     batch: u32,
 }
 
-fn build<S>(cli: &Cli, num_buckets: u32, bucket_size: u32, value_bits: u32) -> Option<(IkpirServer<S, FrodoPirBackend>, Client, u32)>
-where S: MakeStore {
-    let mut store = S::make_store(
-        num_buckets, bucket_size, cli.fingerprint_bits, value_bits, cli.plaintext_bits,
-    ).ok()?;
-    store.set_max_kicks(MAX_KICKS);
+fn run_one<S: MakeStore>(
+    csv: &mut std::io::BufWriter<std::fs::File>,
+    cli: &Cli,
+    arity: u32,
+    num_buckets: u32,
+) {
+    use clap::parser::ValueSource;
+    let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
 
-    let vsize = (value_bits as usize).div_ceil(8);
-    let mut value = vec![0u8; vsize];
-    let target_load: u32 = ((num_buckets * bucket_size) as f64 * 0.80) as u32;
-    let mut inserted = 0u32;
-    for k in 0u32..target_load {
-        for (i, b) in value.iter_mut().enumerate() {
-            *b = (k.wrapping_mul(17).wrapping_add(i as u32) & 0xFF) as u8;
-        }
-        match store.insert(k.to_le_bytes(), &value) {
-            Ok(())                       => inserted = k + 1,
-            Err(CuckooError::TableFull)  => break,
-            Err(e)                       => panic!("build: {e:?}"),
-        }
-    }
+    let (store, n_inserted) = helpers::populate_until_full::<S>(
+        num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
+    );
+    if n_inserted == 0 { eprintln!("  Skip: empty store"); return; }
+
     let server: IkpirServer<S, FrodoPirBackend> =
         IkpirServer::new(store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
-    let client: Client = Client::from_setup(server.setup());
-    Some((server, client, inserted))
-}
+    let bundle = server.setup();
 
-fn pre_build_responses<S>(server: &IkpirServer<S, FrodoPirBackend>, client: &mut Client, n_inserted: u32, batch: u32) -> Vec<(Vec<u8>, Response)>
-where S: MakeStore {
-    (0..batch)
-        .map(|i| {
-            let key = (i % n_inserted).to_le_bytes().to_vec();
-            let q   = client.build_query(&key);
-            let r   = server.answer(&q).expect("answer");
-            (key, r)
-        })
-        .collect()
-}
+    // Probe geometry — response_bytes is constant per (params, lwe_dim).
+    let mut probe = Client::from_setup(bundle.clone());
+    let probe_q = probe.build_query(&0u32.to_le_bytes());
+    let response_bytes = server.answer(&probe_q).expect("answer ok").wire_byte_size();
+    let query_bytes_for_geom = probe_q.wire_byte_size();
 
-fn time_decode_batch(client: &Client, batch: &[(Vec<u8>, Response)]) -> f64 {
-    let start = Instant::now();
-    for (key, r) in batch {
-        let _ = client.decode(key, r).expect("decode");
-    }
-    let elapsed_s = start.elapsed().as_secs_f64();
-    batch.len() as f64 / elapsed_s
-}
-
-/// Apply the configured preprocessing mode. Critical to call BEFORE
-/// `pre_build_responses`: each `build_query` consumes a prepared slot,
-/// so the queue must be filled to size `>= batch` first.
-fn warm_client(client: &mut Client, mode: Mode, batch: u32) {
-    match mode {
-        Mode::Cold => {}
-        Mode::WarmB => {
-            client.precompute_queries(batch);
-        }
-        Mode::WarmBc => {
-            client.precompute_queries(batch);
-            client.precompute_decodes();
-        }
-    }
-}
-
-fn run_one<S>(
-    csv: &mut std::io::BufWriter<std::fs::File>,
-    cli: &Cli,
-    arity: u32,
-    num_buckets: u32,
-    bucket_size: u32,
-    value_bits:  u32,
-)
-where S: MakeStore {
-    let mode_label = cli.mode.as_csv();
-    let (server, mut client, n_inserted) = match build::<S>(cli, num_buckets, bucket_size, value_bits) {
-        Some(t) => t,
-        None => {
-            eprintln!("  Skip arity={arity} num_buckets={num_buckets} bs={bucket_size} vb={value_bits}");
-            return;
-        }
+    let params_store = server.params();
+    let cps = params_store.cells_per_slot();
+    let store_state = helpers::StoreState {
+        capacity:       (num_buckets as u64) * (cli.bucket_size as u64),
+        populated:      n_inserted,
+        load_pct:       100.0 * n_inserted as f64 / (num_buckets as f64 * cli.bucket_size as f64),
+        cells_per_slot: cps,
+        row_width:      cli.bucket_size * cps,
+        segment_rows:   params_store.segment_size(),
     };
-    if n_inserted == 0 { return; }
+    let geom = helpers::Geometry {
+        hint_per_seg_bytes:       FrodoPirBackend::hint_byte_size(&bundle.hints[0]),
+        setup_bundle_bytes:       bundle.wire_byte_size(),
+        query_bytes:              query_bytes_for_geom,
+        response_bytes,
+        hint_delta_typical_bytes: None,
+    };
+    let mode_str = cli.mode.as_csv();
+    let knobs = [
+        helpers::Knob { name: "mode",        value: mode_str.to_string(),        is_default: matches.value_source("mode") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "arity",       value: arity.to_string(),           is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "num_buckets",  value: num_buckets.to_string(),     is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",  value: cli.bucket_size.to_string(), is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",   value: cli.value_bits.to_string(),  is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",      value: cli.lwe_dim.to_string(),     is_default: matches.value_source("lwe_dim") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "batch",        value: cli.batch.to_string(),       is_default: matches.value_source("batch") != Some(ValueSource::CommandLine) },
+    ];
+    helpers::print_preamble("decode_throughput", &knobs, &store_state, &geom);
 
-    warm_client(&mut client, cli.mode, cli.batch);
-    let batch = pre_build_responses(&server, &mut client, n_inserted, cli.batch);
-    let response_bytes = batch[0].1.wire_byte_size();
-
-    for _ in 0..cli.warmup { let _ = time_decode_batch(&client, &batch); }
-
-    let mut samples = Vec::with_capacity(cli.trials as usize);
-    for _ in 0..cli.trials {
-        samples.push(time_decode_batch(&client, &batch));
+    // Fresh client for the timed bench. Optionally warm (queue + decodes).
+    let client_cell = RefCell::new(Client::from_setup(server.setup()));
+    {
+        let mut c = client_cell.borrow_mut();
+        match cli.mode {
+            Mode::Cold => {}
+            Mode::WarmB | Mode::WarmBc => { c.precompute_queries(QUEUE_HEADROOM); }
+        }
+        if matches!(cli.mode, Mode::WarmBc) { c.precompute_decodes(); }
     }
-    let s = helpers::compute_stats(&samples);
+
+    let n = n_inserted as u32;
+    let keys: Vec<Vec<u8>> = (0..cli.batch).map(|i| (i % n).to_le_bytes().to_vec()).collect();
+    let mut idx = 0usize;
+    let crit = helpers::run_criterion_throughput_batched(
+        "decode_throughput",
+        1,
+        || {
+            let key = keys[idx % keys.len()].clone();
+            idx = idx.wrapping_add(1);
+            let q = client_cell.borrow_mut().build_query(&key);
+            let r = server.answer(&q).expect("answer ok");
+            (key, r)
+        },
+        |slot: &mut (Vec<u8>, Response)| {
+            let (key, r) = slot;
+            let _ = client_cell.borrow_mut().decode(key, r).expect("decode");
+        },
+    );
+
     writeln!(
         csv,
-        "{mode_label},{arity},{num_buckets},{bucket_size},{value_bits},{},{:.2},{:.2},{:.2},{:.2},{response_bytes}",
-        cli.batch, s.mean, s.min, s.max, s.stddev,
-    )
-    .unwrap();
+        "{mode_str},{arity},{num_buckets},{},{},{},{:.2},{:.2},{:.2},{:.2},{response_bytes}",
+        cli.bucket_size, cli.value_bits, cli.batch,
+        crit.mean_ops_per_s, crit.min_ops_per_s, crit.max_ops_per_s, crit.stddev_ops_per_s,
+    ).unwrap();
     println!(
-        "  mode={mode_label:<7} arity={arity} num_buckets={num_buckets:<5} bs={bucket_size} vb={value_bits:<4} | \
-         mean={:.2} qps (±{:.2}) | r={response_bytes}B",
-        s.mean, s.stddev,
+        "  mode={mode_str:<7} arity={arity} nb={num_buckets:<6} | \
+         mean={:.2} qps (±{:.2}) r={response_bytes}B",
+        crit.mean_ops_per_s, crit.stddev_ops_per_s,
     );
-}
-
-fn dispatch(
-    csv: &mut std::io::BufWriter<std::fs::File>,
-    cli: &Cli,
-    arity: u32,
-    num_buckets: u32,
-    bucket_size: u32,
-    value_bits: u32,
-) {
-    match arity {
-        2 => run_one::<Segmented2aryScheme>(csv, cli, 2, num_buckets, bucket_size, value_bits),
-        3 => run_one::<Segmented3aryScheme>(csv, cli, 3, num_buckets, bucket_size, value_bits),
-        4 => run_one::<Segmented4aryScheme>(csv, cli, 4, num_buckets, bucket_size, value_bits),
-        _ => unreachable!("clap value_parser bounds arity to 2..=4"),
-    }
-}
-
-fn sweep_buckets(arity: u32) -> &'static [u32] {
-    match arity {
-        2 | 4 => &[64, 256, 1024],
-        3     => &[96, 384, 1536],
-        _     => unreachable!(),
-    }
-}
-
-fn resolve_num_buckets(cli: &Cli, arity: u32) -> u32 {
-    if cli.num_buckets == 256 && arity == 3 { 384 } else { cli.num_buckets }
 }
 
 fn main() {
-    let cli: Cli = helpers::parse_cli();
-    let mut csv = helpers::csv_writer(
-        "ikpir_client_decode_throughput.csv",
-        "mode,arity,num_buckets,bucket_size,value_bits,batch,mean_qps,min_qps,max_qps,stddev_qps,response_bytes",
-    );
-
-    println!("=== ikpir-client decode throughput (FrodoPirBackend) ===");
-    println!(
-        "Config: mode={}, fingerprint_bits={}, plaintext_bits={}, lwe_dim={}, warmup={}, trials={}, batch={}",
-        cli.mode.as_csv(), cli.fingerprint_bits, cli.plaintext_bits, cli.lwe_dim, cli.warmup, cli.trials, cli.batch,
-    );
-
-    let arities: Vec<u32> = match (cli.sweep, cli.arity) {
-        (true,  None)    => vec![2, 3, 4],
-        (true,  Some(a)) => vec![a],
-        (false, opt)     => vec![opt.unwrap_or(2)],
+    let (cli, matches) = helpers::parse_cli_with_matches::<Cli>();
+    let num_buckets = if matches.value_source("num_buckets") == Some(clap::parser::ValueSource::CommandLine) {
+        cli.num_buckets
+    } else {
+        helpers::default_num_buckets_for_arity(cli.arity)
     };
 
-    // Pragmatic mode-sweep semantics: `--sweep` (or `--sweep --mode cold`)
-    // iterates all three modes; `--sweep --mode warm-b` and
-    // `--sweep --mode warm-bc` pin a single mode.
-    let modes: Vec<Mode> = match (cli.sweep, cli.mode) {
-        (true,  Mode::Cold)   => vec![Mode::Cold, Mode::WarmB, Mode::WarmBc],
-        (true,  Mode::WarmB)  => vec![Mode::WarmB],
-        (true,  Mode::WarmBc) => vec![Mode::WarmBc],
-        (false, m)            => vec![m],
-    };
+    let mut csv = helpers::csv_writer("ikpir_client_decode_throughput.csv", HEADER);
 
-    for &mode in &modes {
-        let cli_local = Cli { mode, ..cli.clone() };
-        for &arity in &arities {
-            if cli_local.sweep {
-                for &nb in sweep_buckets(arity) {
-                    for &bs in &[2u32, 4] {
-                        for &vb in &[8u32, 64, 256] {
-                            dispatch(&mut csv, &cli_local, arity, nb, bs, vb);
-                        }
-                    }
-                }
-            } else {
-                let nb = resolve_num_buckets(&cli_local, arity);
-                dispatch(&mut csv, &cli_local, arity, nb, cli_local.bucket_size, cli_local.value_bits);
-            }
-        }
+    match cli.arity {
+        2 => run_one::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
+        3 => run_one::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
+        4 => run_one::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
+        _ => unreachable!("clap value_parser bounds arity to 2..=4"),
     }
     println!("\nResults written to results/ikpir_client_decode_throughput.csv");
 }

@@ -94,7 +94,7 @@ without a full rebuild.
 | Backend trait contract | `backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` |
 | FrodoPIR config knobs | `backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
 | Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs` |
-| Benches | `benches/setup_throughput.rs`, `benches/answer_throughput.rs`, `benches/incremental_vs_rebuild.rs` |
+| Benches | `benches/setup_latency.rs`, `benches/answer_throughput.rs`, `benches/incremental_vs_rebuild.rs` (+ `end_to_end_fpr`, `failure_modes`, `wire_sizes`, `setup_to_first_query`, `steady_state_workload`) |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:
 
@@ -109,6 +109,29 @@ without a full rebuild.
 5. If implementing `IncrementalPirBackend`: `server_patch_hint` and
    `client_patch_state` must keep `Hint` and `ClientState` consistent
    with the updated DB for all future queries.
+
+### Bench layer (under `benches/`)
+
+- Each bench is `harness = false` and parses CLI via `clap` (see helpers
+  `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
+  through `MakeStore` / `CloneStore`; the typed scheme is picked once in
+  `main` based on `--arity`.
+- One invocation = one CSV row (append-mode writer); the orchestrator
+  is responsible for `rm`-ing the CSV before sweeping.
+- Shared helpers in `benches/helpers.rs` (deliberately duplicated across
+  crates — same content lives in `ikpir-client/benches/helpers.rs`):
+    - `default_num_buckets_for_arity(arity)` — academic-scale defaults
+      (2-ary → 16384, 3-ary → 24576, 4-ary → 16384).
+    - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
+      — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
+    - `print_preamble(name, knobs, store_state, geom)` — the standard
+      `=== <bench> ===` / Parameters / KV store / Geometry banner.
+    - `run_criterion_throughput(label, elems, body)` and
+      `run_criterion_throughput_batched(label, elems, setup, routine)` —
+      criterion wrappers used by `answer_throughput`; the latter is
+      mirrored on the client side for the four client microbenches.
+- `answer_throughput` is the only criterion-backed server bench. It emits
+  `target/criterion/answer_throughput/...` for browsable HTML/JSON.
 
 **Per-segment data flow:**
 

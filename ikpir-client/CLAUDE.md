@@ -74,7 +74,34 @@ server is the setup bundle.
 | Recover from a gap | `client.rs::IkpirClient::reset_from` |
 | Debug a fingerprint mismatch | `client.rs::IkpirClient::decode` — check `candidate_buckets` + `unpack_slot_cells` |
 | Integration tests | `tests/client_e2e.rs` (4 tests) |
-| Benches | `benches/query_throughput.rs`, `benches/decode_throughput.rs`, `benches/apply_delta_throughput.rs` |
+| Benches | `benches/query_throughput.rs`, `benches/decode_throughput.rs`, `benches/apply_delta_throughput.rs`, `benches/preprocess_throughput.rs`, `benches/client_setup_latency.rs`, `benches/client_memory_footprint.rs` |
+
+### Bench layer (under `benches/`)
+
+- Each bench is `harness = false` and parses CLI via `clap` (see helpers
+  `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
+  through `MakeStore` / `CloneStore`; the typed scheme is picked once in
+  `main` based on `--arity`.
+- One invocation = one CSV row (append-mode writer); the orchestrator
+  is responsible for `rm`-ing the CSV before sweeping.
+- Shared helpers in `benches/helpers.rs` (deliberately duplicated across
+  crates — same content lives in `ikpir-server/benches/helpers.rs`):
+    - `default_num_buckets_for_arity(arity)` — academic-scale defaults
+      (2-ary → 16384, 3-ary → 24576, 4-ary → 16384).
+    - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
+      — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
+    - `print_preamble(name, knobs, store_state, geom)` — the standard
+      `=== <bench> ===` / Parameters / KV store / Geometry banner.
+    - `run_criterion_throughput(label, elems, body)` and
+      `run_criterion_throughput_batched(label, elems, setup, routine)` —
+      criterion wrappers. The batched form uses `iter_custom` with an
+      inner per-call `Instant` so per-iteration setup is excluded from
+      the timing bracket; used by `query_throughput`, `decode_throughput`,
+      `apply_delta_throughput`, `preprocess_throughput`.
+- The four criterion microbenches also emit
+  `target/criterion/{query_throughput,decode_throughput,apply_delta_throughput,preprocess_phase_b,preprocess_phase_c}/`
+  for browsable HTML/JSON. `client_setup_latency` and
+  `client_memory_footprint` stay on manual timing / closed-form math.
 
 **Per-segment data flow (client annotations):**
 

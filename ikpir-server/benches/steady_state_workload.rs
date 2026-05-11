@@ -1,20 +1,16 @@
 //! **Intent:** Mixed insert/query workload measuring steady-state per-op
 //! latency under a configurable query-to-mutation interleaving. This is the
-//! metric that matters for a live IKPIR deployment — the existing throughput
-//! benches are all single-operation microbenchmarks.
+//! metric that matters for a live IKPIR deployment — the other benches are
+//! single-operation microbenchmarks.
 //!
-//! **Method:** Pre-populate a server to ~40% load (not timed). Then run
-//! `n_inserts + n_queries` operations interleaved: every `query_ratio`-th op
-//! is a query, the rest are inserts. For inserts, also `client.apply_delta`
-//! is timed (since the client cannot otherwise stay in sync). For queries,
-//! `client.build_query → server.answer → client.decode` is timed end-to-end.
+//! **Method:** Populate to `--load-factor` (default 0.50), snapshot the cell
+//! array, then per trial clone via `from_cells` and run `n_inserts + n_queries`
+//! operations interleaved: every `query_ratio`-th op is a query, the rest are
+//! inserts. For inserts, `client.apply_delta` is also timed (client must stay
+//! in sync). For queries, `build_query → answer → decode` is timed end-to-end.
 //!
-//! On `IkpirError::TableFull` we stop further inserts gracefully and report
-//! what completed; the row reflects the partial workload.
-//!
-//! **Invocation:** `cargo bench --bench steady_state_workload` runs a single
-//! default config. Pass `--sweep` for the full matrix; pass
-//! `--n-inserts <N> --n-queries <N> --query-ratio <K>` to pin the workload.
+//! On `IkpirError::TableFull` inserts stop gracefully; the row reflects the
+//! partial workload.
 //!
 //! **Output:** `results/ikpir_steady_state_workload.csv`
 //! Columns: arity, num_buckets, bucket_size, value_bits, lwe_dim,
@@ -23,108 +19,81 @@
 
 mod helpers;
 
-use helpers::MakeStore;
+use helpers::CloneStore;
 use ikpir_client::IkpirClient;
-use ikpir_server::{FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer};
+use ikpir_server::{BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer};
 use segmented_cuckoo::{
-    CuckooError,
+    CuckooParams,
     Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
 };
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 type Client = IkpirClient<FrodoPirBackend>;
-const MAX_KICKS: u32 = 2_500;
 
-#[derive(clap::Parser)]
+const HEADER: &str = "arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+    n_inserts,n_queries,query_ratio,total_ms,mean_ms_per_op,mean_insert_ms,mean_query_ms";
+
+#[derive(Clone, clap::Parser)]
 #[command(about = "Mixed insert/query workload: amortised per-op latency.")]
 struct Cli {
-    #[arg(long)] sweep: bool,
-    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4))] arity: Option<u32>,
-    #[arg(long, default_value_t = 256)]  num_buckets: u32,
-    #[arg(long, default_value_t = 4)]    bucket_size: u32,
-    #[arg(long, default_value_t = 64)]   value_bits: u32,
-    #[arg(long, default_value_t = 12)]   fingerprint_bits: u32,
-    #[arg(long, default_value_t = 8)]    plaintext_bits: u32,
-    #[arg(long, default_value_t = 1774)] lwe_dim: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
+    arity: u32,
+    #[arg(long, default_value_t = 16_384)] num_buckets: u32,
+    #[arg(long, default_value_t = 4)]      bucket_size: u32,
+    #[arg(long, default_value_t = 256)]    value_bits: u32,
+    #[arg(long, default_value_t = 32)]     fingerprint_bits: u32,
+    #[arg(long, default_value_t = 8)]      plaintext_bits: u32,
+    #[arg(long, default_value_t = 1774)]   lwe_dim: u32,
     /// Inserts to attempt in the workload.
-    #[arg(long, default_value_t = 200)]  n_inserts: u32,
+    #[arg(long, default_value_t = 4096)]   n_inserts: u32,
     /// Queries to attempt in the workload.
-    #[arg(long, default_value_t = 20)]   n_queries: u32,
-    /// Operation interleaving: every `query_ratio`-th op is a query, the
-    /// rest are inserts (until either budget is exhausted).
-    #[arg(long, default_value_t = 10)]   query_ratio: u32,
-    #[arg(long, default_value_t = 1)]    warmup: u32,
-    #[arg(long, default_value_t = 3)]    trials: u32,
+    #[arg(long, default_value_t = 410)]    n_queries: u32,
+    /// Operation interleaving: every `query_ratio`-th op is a query.
+    #[arg(long, default_value_t = 10)]     query_ratio: u32,
+    #[arg(long, default_value_t = 1)]      warmup: u32,
+    #[arg(long, default_value_t = 3)]      trials: u32,
+    /// Load factor before the workload starts.
+    #[arg(long, default_value_t = 0.50)]   load_factor: f64,
 }
 
-fn build_seeded<S>(
-    cli: &Cli,
-    num_buckets: u32,
-    bucket_size: u32,
-    value_bits: u32,
-) -> Option<(IkpirServer<S, FrodoPirBackend>, Client, u32)>
-where S: MakeStore {
-    let mut store = S::make_store(
-        num_buckets, bucket_size, cli.fingerprint_bits, value_bits, cli.plaintext_bits,
-    ).ok()?;
-    store.set_max_kicks(MAX_KICKS);
+struct TrialResult {
+    total_ms:     f64,
+    mean_per_op:  f64,
+    mean_insert:  f64,
+    mean_query:   f64,
+    done_inserts: u32,
+    done_queries: u32,
+}
 
-    let vsize = (value_bits as usize).div_ceil(8);
-    let mut value = vec![0u8; vsize];
-    let target_load: u32 = ((num_buckets * bucket_size) as f64 * 0.40) as u32;
-    let mut last_seeded: u32 = 0;
-    for k in 0u32..target_load {
-        for (i, b) in value.iter_mut().enumerate() {
-            *b = (k.wrapping_mul(17).wrapping_add(i as u32) & 0xFF) as u8;
-        }
-        match store.insert(k.to_le_bytes(), &value) {
-            Ok(())                       => last_seeded = k,
-            Err(CuckooError::TableFull)  => break,
-            Err(e)                       => panic!("build_seeded: {e:?}"),
-        }
-    }
-    if last_seeded < 2 { return None; }
-    let server: IkpirServer<S, FrodoPirBackend> =
+fn run_trial<S: CloneStore>(
+    cli:      &Cli,
+    cells:    &[u32],
+    params:   CuckooParams,
+    n_seed:   u64,
+) -> TrialResult {
+    let store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
+    let mut server: IkpirServer<S, FrodoPirBackend> =
         IkpirServer::new(store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
-    let client: Client = Client::from_setup(server.setup());
-    Some((server, client, last_seeded + 1))
-}
+    let mut client: Client = Client::from_setup(server.setup());
 
-/// Returns (total_ms, mean_ms_per_op, mean_insert_ms, mean_query_ms,
-/// done_inserts, done_queries).
-fn time_workload<S>(
-    cli: &Cli,
-    server: &mut IkpirServer<S, FrodoPirBackend>,
-    client: &mut Client,
-    seed_count: u32,
-    value_bits: u32,
-) -> (f64, f64, f64, f64, u32, u32)
-where S: MakeStore {
-    let n_inserts = cli.n_inserts;
-    let n_queries = cli.n_queries;
-    let n_ops     = n_inserts + n_queries;
-    let vsize     = (value_bits as usize).div_ceil(8);
+    let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
-
-    let mut next_key   = seed_count;
+    let n_ops = cli.n_inserts + cli.n_queries;
+    let mut next_key = n_seed as u32;
     let mut insert_total = Duration::ZERO;
     let mut query_total  = Duration::ZERO;
-    let mut done_i: u32 = 0;
-    let mut done_q: u32 = 0;
+    let mut done_i = 0u32;
+    let mut done_q = 0u32;
     let mut stop_inserts = false;
 
     let start = Instant::now();
     for op in 0..n_ops {
-        // Query slot when (op % query_ratio == 0) AND query budget remains;
-        // otherwise insert. If inserts are exhausted or have stalled, the
-        // remaining ops are queries.
-        let do_query = (op % cli.query_ratio == 0 && done_q < n_queries)
-                    || done_i >= n_inserts || stop_inserts;
-        if do_query && done_q < n_queries {
-            // Bias the queried key into the seeded range so we always exercise
-            // a hit path (steady-state user queries are usually hits).
-            let key_u = if seed_count > 0 { op % seed_count } else { 0 };
+        let do_query = (op % cli.query_ratio == 0 && done_q < cli.n_queries)
+                    || done_i >= cli.n_inserts
+                    || stop_inserts;
+        if do_query && done_q < cli.n_queries {
+            let key_u = if n_seed > 0 { (op as u64 % n_seed) as u32 } else { 0 };
             let key = key_u.to_le_bytes();
             let t = Instant::now();
             let q = client.build_query(&key);
@@ -132,7 +101,7 @@ where S: MakeStore {
             let _ = client.decode(&key, &r).expect("decode ok");
             query_total += t.elapsed();
             done_q += 1;
-        } else if done_i < n_inserts && !stop_inserts {
+        } else if done_i < cli.n_inserts && !stop_inserts {
             for (i, b) in value.iter_mut().enumerate() {
                 *b = (next_key.wrapping_mul(17).wrapping_add(i as u32) & 0xFF) as u8;
             }
@@ -145,142 +114,112 @@ where S: MakeStore {
                     done_i += 1;
                     next_key += 1;
                 }
-                Err(IkpirError::TableFull) => {
-                    stop_inserts = true;
-                    // Drop the elapsed time of the failed attempt; it is the
-                    // rollback path, already measured in failure_modes.rs.
-                }
+                Err(IkpirError::TableFull) => { stop_inserts = true; }
                 Err(e) => panic!("insert: {e:?}"),
             }
         }
-        if done_i >= n_inserts && done_q >= n_queries { break; }
+        if done_i >= cli.n_inserts && done_q >= cli.n_queries { break; }
     }
-    let total = start.elapsed();
-
+    let total_ms = start.elapsed().as_secs_f64() * 1e3;
     let done_ops = (done_i + done_q).max(1) as f64;
+    let mean_per_op = total_ms / done_ops;
     let mean_insert = if done_i > 0 { insert_total.as_secs_f64() * 1e3 / done_i as f64 } else { 0.0 };
     let mean_query  = if done_q > 0 { query_total.as_secs_f64()  * 1e3 / done_q as f64 } else { 0.0 };
-    let total_ms    = total.as_secs_f64() * 1e3;
-    let mean_per_op = total_ms / done_ops;
-    (total_ms, mean_per_op, mean_insert, mean_query, done_i, done_q)
+    TrialResult { total_ms, mean_per_op, mean_insert, mean_query, done_inserts: done_i, done_queries: done_q }
 }
 
-fn run_one<S>(
+fn run_one<S: CloneStore>(
     csv: &mut std::io::BufWriter<std::fs::File>,
     cli: &Cli,
     arity: u32,
     num_buckets: u32,
-    bucket_size: u32,
-    value_bits:  u32,
-)
-where S: MakeStore {
-    let mut totals       = Vec::with_capacity(cli.trials as usize);
-    let mut per_ops      = Vec::with_capacity(cli.trials as usize);
-    let mut ins_means    = Vec::with_capacity(cli.trials as usize);
-    let mut q_means      = Vec::with_capacity(cli.trials as usize);
-    let mut last_done_i  = 0u32;
-    let mut last_done_q  = 0u32;
+) {
+    use clap::parser::ValueSource;
+    let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
 
+    let (seed_store, n_seed) = helpers::populate_to_load::<S>(
+        cli.load_factor, num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
+    );
+    if n_seed < 2 { eprintln!("  Skip: seed too small"); return; }
+
+    let cells  = seed_store.snapshot_cells();
+    let params = seed_store.params();
+
+    // Geometry (build once for preamble).
+    let cps = params.cells_per_slot();
+    let tmp_store = S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
+    let tmp_server: IkpirServer<S, FrodoPirBackend> =
+        IkpirServer::new(tmp_store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
+    let bundle = tmp_server.setup();
+    let store_state = helpers::StoreState {
+        capacity:       (num_buckets as u64) * (cli.bucket_size as u64),
+        populated:      n_seed,
+        load_pct:       100.0 * n_seed as f64 / (num_buckets as f64 * cli.bucket_size as f64),
+        cells_per_slot: cps,
+        row_width:      cli.bucket_size * cps,
+        segment_rows:   params.segment_size(),
+    };
+    let geom = helpers::Geometry {
+        hint_per_seg_bytes:       FrodoPirBackend::hint_byte_size(&bundle.hints[0]),
+        setup_bundle_bytes:       bundle.wire_byte_size(),
+        query_bytes:              0,
+        response_bytes:           0,
+        hint_delta_typical_bytes: None,
+    };
+    let knobs = [
+        helpers::Knob { name: "arity",        value: arity.to_string(),                  is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "num_buckets",   value: num_buckets.to_string(),            is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",   value: cli.bucket_size.to_string(),        is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",    value: cli.value_bits.to_string(),         is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",       value: cli.lwe_dim.to_string(),            is_default: matches.value_source("lwe_dim") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "load_factor",   value: format!("{:.2}", cli.load_factor),  is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "n_inserts",     value: cli.n_inserts.to_string(),          is_default: matches.value_source("n_inserts") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "n_queries",     value: cli.n_queries.to_string(),          is_default: matches.value_source("n_queries") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "query_ratio",   value: cli.query_ratio.to_string(),        is_default: matches.value_source("query_ratio") != Some(ValueSource::CommandLine) },
+    ];
+    helpers::print_preamble("steady_state_workload", &knobs, &store_state, &geom);
+
+    let mut samples: Vec<TrialResult> = Vec::with_capacity(cli.trials as usize);
     for trial in 0..(cli.warmup + cli.trials) {
-        let (mut server, mut client, seed_count) =
-            match build_seeded::<S>(cli, num_buckets, bucket_size, value_bits) {
-                Some(t) => t,
-                None    => {
-                    eprintln!("  Skip arity={arity} num_buckets={num_buckets} bs={bucket_size} vb={value_bits}");
-                    return;
-                }
-            };
-        let (total, per_op, mean_i, mean_q, done_i, done_q) =
-            time_workload::<S>(cli, &mut server, &mut client, seed_count, value_bits);
-        if trial >= cli.warmup {
-            totals.push(total);
-            per_ops.push(per_op);
-            ins_means.push(mean_i);
-            q_means.push(mean_q);
-            last_done_i = done_i;
-            last_done_q = done_q;
-        }
+        let r = run_trial::<S>(cli, &cells, params, n_seed);
+        if trial >= cli.warmup { samples.push(r); }
     }
-    let n = totals.len() as f64;
-    let mean_total  = totals.iter().sum::<f64>() / n;
-    let mean_per_op = per_ops.iter().sum::<f64>() / n;
-    let mean_ins    = ins_means.iter().sum::<f64>() / n;
-    let mean_qry    = q_means.iter().sum::<f64>() / n;
-
+    let n = samples.len() as f64;
+    let mean = |sel: fn(&TrialResult) -> f64| samples.iter().map(sel).sum::<f64>() / n;
+    let m_total  = mean(|r| r.total_ms);
+    let m_per_op = mean(|r| r.mean_per_op);
+    let m_ins    = mean(|r| r.mean_insert);
+    let m_q      = mean(|r| r.mean_query);
+    let last = samples.last().unwrap();
     writeln!(
         csv,
-        "{arity},{num_buckets},{bucket_size},{value_bits},{},{last_done_i},{last_done_q},{},{:.3},{:.6},{:.6},{:.6}",
-        cli.lwe_dim, cli.query_ratio, mean_total, mean_per_op, mean_ins, mean_qry,
-    )
-    .unwrap();
+        "{arity},{num_buckets},{},{},{},{},{},{},{:.3},{:.6},{:.6},{:.6}",
+        cli.bucket_size, cli.value_bits, cli.lwe_dim,
+        last.done_inserts, last.done_queries, cli.query_ratio,
+        m_total, m_per_op, m_ins, m_q,
+    ).unwrap();
     println!(
-        "  arity={arity} num_buckets={num_buckets:<5} bs={bucket_size} vb={value_bits:<4} | \
-         {last_done_i}I + {last_done_q}Q in {mean_total:.3}ms | \
-         per_op={mean_per_op:.6}ms ins={mean_ins:.6}ms q={mean_qry:.6}ms"
+        "  arity={arity} nb={num_buckets:<6} bs={} vb={:<4} | \
+         {}I + {}Q in {m_total:.3}ms | per_op={m_per_op:.3}ms ins={m_ins:.3}ms q={m_q:.3}ms",
+        cli.bucket_size, cli.value_bits, last.done_inserts, last.done_queries,
     );
-}
-
-fn dispatch(
-    csv: &mut std::io::BufWriter<std::fs::File>,
-    cli: &Cli,
-    arity: u32,
-    num_buckets: u32,
-    bucket_size: u32,
-    value_bits: u32,
-) {
-    match arity {
-        2 => run_one::<Segmented2aryScheme>(csv, cli, 2, num_buckets, bucket_size, value_bits),
-        3 => run_one::<Segmented3aryScheme>(csv, cli, 3, num_buckets, bucket_size, value_bits),
-        4 => run_one::<Segmented4aryScheme>(csv, cli, 4, num_buckets, bucket_size, value_bits),
-        _ => unreachable!("clap value_parser bounds arity to 2..=4"),
-    }
-}
-
-fn sweep_buckets(arity: u32) -> &'static [u32] {
-    match arity {
-        2 | 4 => &[64, 256, 1024],
-        3     => &[96, 384, 1536],
-        _     => unreachable!(),
-    }
-}
-
-fn resolve_num_buckets(cli: &Cli, arity: u32) -> u32 {
-    if cli.num_buckets == 256 && arity == 3 { 384 } else { cli.num_buckets }
 }
 
 fn main() {
-    let cli: Cli = helpers::parse_cli();
-    let mut csv = helpers::csv_writer(
-        "ikpir_steady_state_workload.csv",
-        "arity,num_buckets,bucket_size,value_bits,lwe_dim,n_inserts,n_queries,query_ratio,total_ms,mean_ms_per_op,mean_insert_ms,mean_query_ms",
-    );
-
-    println!("=== ikpir steady-state workload (FrodoPirBackend) ===");
-    println!(
-        "Config: fingerprint_bits={}, plaintext_bits={}, lwe_dim={}, n_inserts={}, n_queries={}, query_ratio={}, warmup={}, trials={}",
-        cli.fingerprint_bits, cli.plaintext_bits, cli.lwe_dim,
-        cli.n_inserts, cli.n_queries, cli.query_ratio, cli.warmup, cli.trials,
-    );
-
-    let arities: Vec<u32> = match (cli.sweep, cli.arity) {
-        (true,  None)    => vec![2, 3, 4],
-        (true,  Some(a)) => vec![a],
-        (false, opt)     => vec![opt.unwrap_or(2)],
+    let (cli, matches) = helpers::parse_cli_with_matches::<Cli>();
+    let num_buckets = if matches.value_source("num_buckets") == Some(clap::parser::ValueSource::CommandLine) {
+        cli.num_buckets
+    } else {
+        helpers::default_num_buckets_for_arity(cli.arity)
     };
 
-    for &arity in &arities {
-        if cli.sweep {
-            for &nb in sweep_buckets(arity) {
-                for &bs in &[2u32, 4] {
-                    for &vb in &[8u32, 64, 256] {
-                        dispatch(&mut csv, &cli, arity, nb, bs, vb);
-                    }
-                }
-            }
-        } else {
-            let nb = resolve_num_buckets(&cli, arity);
-            dispatch(&mut csv, &cli, arity, nb, cli.bucket_size, cli.value_bits);
-        }
+    let mut csv = helpers::csv_writer("ikpir_steady_state_workload.csv", HEADER);
+
+    match cli.arity {
+        2 => run_one::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
+        3 => run_one::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
+        4 => run_one::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
+        _ => unreachable!("clap value_parser bounds arity to 2..=4"),
     }
     println!("\nResults written to results/ikpir_steady_state_workload.csv");
 }
