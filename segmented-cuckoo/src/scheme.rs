@@ -321,6 +321,44 @@ impl IndexScheme for Segmented4aryScheme {
     }
 }
 
+// ─── IKPIR bridge ────────────────────────────────────────────────────────────
+
+/// Which segmented index scheme is in use.
+///
+/// Carried by [`CuckooParams`](crate::CuckooParams) so the IKPIR client can dispatch
+/// `candidate_buckets` without holding a live `CuckooKVStore`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SchemeKind {
+    /// 2-ary bipartite scheme; `num_buckets` is a power of 2 ≥ 2.
+    Segmented2ary,
+    /// 3-ary scheme; `num_buckets = 3·2^t`.
+    Segmented3ary,
+    /// 4-ary scheme; `num_buckets` is a power of 2 ≥ 4.
+    Segmented4ary,
+}
+
+/// Associates a segmented scheme struct with its [`SchemeKind`] discriminant.
+///
+/// Only the three segmented schemes implement this; standard schemes are excluded
+/// because [`CuckooKVStore`](crate::CuckooKVStore) is segmented-only.
+pub trait SchemeMeta {
+    /// The [`SchemeKind`] variant for this scheme.
+    const KIND: SchemeKind;
+}
+
+impl SchemeMeta for Segmented2aryScheme {
+    const KIND: SchemeKind = SchemeKind::Segmented2ary;
+}
+
+impl SchemeMeta for Segmented3aryScheme {
+    const KIND: SchemeKind = SchemeKind::Segmented3ary;
+}
+
+impl SchemeMeta for Segmented4aryScheme {
+    const KIND: SchemeKind = SchemeKind::Segmented4ary;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

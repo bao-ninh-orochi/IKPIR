@@ -51,7 +51,7 @@
 //!
 //! ## Architecture
 //!
-//! This module depends on [`crate::data_layout::FingerprintTable`] for bit-packed storage and on
+//! This module depends on [`crate::fingerprint_table::FingerprintTable`] for bit-packed storage and on
 //! [`crate::scheme::IndexScheme`] for index computation. The split ensures that all insert,
 //! lookup, and delete mechanics are written once and the six concrete scheme types add no
 //! duplicated logic.
@@ -78,7 +78,7 @@
 use rand::Rng;
 use std::fmt;
 
-use crate::data_layout::FingerprintTable;
+use crate::fingerprint_table::FingerprintTable;
 use crate::scheme::{
     IndexScheme, Segmented3aryScheme, Segmented4aryScheme, Segmented2aryScheme,
     Standard3aryScheme, Standard4aryScheme, Standard2aryScheme,
@@ -999,7 +999,7 @@ impl<S: IndexScheme> CuckooFilter<S> {
 
         for _ in 0..self.max_kicks {
             // Evict a random slot from cur_index
-            let slot = rng.random_range(0..self.table.slots_per_bucket());
+            let slot = rng.random_range(0..self.table.bucket_size());
             let evicted_fingerprint = self.table.read(cur_index, slot);
 
             // Write cur_fingerprint into this slot
@@ -1242,7 +1242,7 @@ impl<S: IndexScheme> CuckooFilter<S> {
     /// ```
     pub fn load_factor(&self) -> f64 {
         self.num_items as f64
-            / (self.table.num_buckets() as f64 * self.table.slots_per_bucket() as f64)
+            / (self.table.num_buckets() as f64 * self.table.bucket_size() as f64)
     }
 
     /// Override the maximum number of cuckoo kicks before declaring the table full.

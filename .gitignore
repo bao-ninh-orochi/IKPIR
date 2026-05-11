@@ -1,10 +1,11 @@
 # Rust build artefacts
 /target
-/crates/*/target
 
 # Per-crate transient bench output (cargo bench CWD is the crate dir).
 # Paper-figure CSVs live in `results/paper/` and are tracked.
-/crates/*/results
+/segmented-cuckoo/results
+/ikpir-server/results
+/ikpir-client/results
 
 # Ignore everything in `results/` except the curated subtree that backs the paper.
 results/*

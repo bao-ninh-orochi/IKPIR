@@ -38,23 +38,36 @@ macro_rules! demo {
 }
 
 fn main() {
-    // Each segmented variant: 64-bit values, 12-bit fingerprints.
+    // Each segmented variant: 64-bit values, 12-bit fingerprints, plaintext_bits=8.
     demo!(
         "Segmented 2-ary KV store",
-        Segmented2aryCuckooKVStore::new(128, 4, 12, 64).unwrap()
+        Segmented2aryCuckooKVStore::new(128, 4, 12, 64, 8).unwrap()
     );
     demo!(
         "Segmented 3-ary KV store",
-        Segmented3aryCuckooKVStore::new(96, 4, 12, 64).unwrap() // 3 * 32 = 96
+        Segmented3aryCuckooKVStore::new(96, 4, 12, 64, 8).unwrap() // 3 * 32 = 96
     );
     demo!(
         "Segmented 4-ary KV store",
-        Segmented4aryCuckooKVStore::new(64, 4, 12, 64).unwrap()
+        Segmented4aryCuckooKVStore::new(64, 4, 12, 64, 8).unwrap()
     );
 
     // from_num_items: auto-size for an expected workload.
     demo!(
         "Segmented 2-ary KV store (from_num_items=10_000)",
-        Segmented2aryCuckooKVStore::from_num_items(10_000, 4, 12, 64).unwrap()
+        Segmented2aryCuckooKVStore::from_num_items(10_000, 4, 12, 64, 8).unwrap()
     );
+
+    // plaintext_bits=9: demonstrate cell layout difference vs pb=8.
+    {
+        let s = Segmented2aryCuckooKVStore::new(128, 4, 12, 64, 9).unwrap();
+        println!("=== pb=9 dimension demo ===");
+        println!(
+            "cells_per_slot={} (vs {} at pb=8)  as_cells().len()={}",
+            s.cells_per_slot(),
+            Segmented2aryCuckooKVStore::new(128, 4, 12, 64, 8).unwrap().cells_per_slot(),
+            s.as_cells().len()
+        );
+        println!();
+    }
 }

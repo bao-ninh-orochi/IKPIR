@@ -36,13 +36,14 @@
 //! # Module structure
 //!
 //! ```text
-//! lib.rs         — public API, type aliases
-//! filter.rs      — CuckooFilter<S> generic implementation
-//! scheme.rs      — IndexScheme trait + 6 scheme structs
-//! hash.rs        — fingerprint hash functions, item hashing, index reconstruction
-//! data_layout.rs — DataLayout (raw bit-packed slot storage) + FingerprintTable + FingerprintValueTable wrappers
-//! store.rs       — CuckooKVStore<S> generic implementation (insert/get/delete/update with kicking + rollback)
-//! util.rs        — helper compute next power of 2/3/4
+//! lib.rs                     — public API, type aliases
+//! filter.rs                  — CuckooFilter<S> generic implementation
+//! scheme.rs                  — IndexScheme trait + 6 scheme structs
+//! hash.rs                    — fingerprint hash functions, item hashing, index reconstruction
+//! fingerprint_table.rs       — FingerprintTable: bit-packed Vec<u8> fingerprint storage for the filter
+//! fingerprint_value_table.rs — FingerprintValueTable: Vec<u32> cell-based storage for the KV store
+//! store.rs                   — CuckooKVStore<S> generic implementation (insert/get/delete/update with kicking + rollback)
+//! util.rs                    — helper compute next power of 2/3/4
 //! ```
 //!
 //! # Security considerations
@@ -85,7 +86,8 @@
 //! assert!(filter.contain(b"item".as_ref()));
 //! ```
 
-pub(crate) mod data_layout;
+pub(crate) mod fingerprint_table;
+pub(crate) mod fingerprint_value_table;
 pub(crate) mod filter;
 pub(crate) mod hash;
 pub(crate) mod scheme;
@@ -94,10 +96,10 @@ pub(crate) mod util;
 
 pub use filter::{CuckooError, CuckooFilter, MAX_LOAD_FACTOR, SUPPORTED_ARITIES, SUPPORTED_BUCKET_SIZES};
 pub use scheme::{
-    IndexScheme, Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
-    Standard2aryScheme, Standard3aryScheme, Standard4aryScheme,
+    IndexScheme, SchemeKind, SchemeMeta, Segmented2aryScheme, Segmented3aryScheme,
+    Segmented4aryScheme, Standard2aryScheme, Standard3aryScheme, Standard4aryScheme,
 };
-pub use store::CuckooKVStore;
+pub use store::{pack_slot_cells, unpack_slot_cells, CuckooKVStore, CuckooParams, OccupiedSlot, SlotMutation};
 
 // ════════════════════════════════════════════════════════════════════════════
 // ░░ SEGMENTED SCHEMES ░░
@@ -272,7 +274,7 @@ pub type Standard4aryCuckooFilter = CuckooFilter<Standard4aryScheme>;
 /// ```rust
 /// use segmented_cuckoo::Segmented2aryCuckooKVStore;
 ///
-/// let mut store = Segmented2aryCuckooKVStore::new(64, 4, 12, 8).unwrap();
+/// let mut store = Segmented2aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
 /// store.insert("hello", &[0xAB]).unwrap();
 /// assert_eq!(store.get("hello"), Some(vec![0xAB]));
 ///
@@ -301,7 +303,7 @@ pub type Segmented2aryCuckooKVStore = CuckooKVStore<Segmented2aryScheme>;
 /// use segmented_cuckoo::Segmented3aryCuckooKVStore;
 ///
 /// // num_buckets = 3 * 32 = 96
-/// let mut store = Segmented3aryCuckooKVStore::new(96, 4, 12, 8).unwrap();
+/// let mut store = Segmented3aryCuckooKVStore::new(96, 4, 12, 8, 8).unwrap();
 /// store.insert("data", &[0x42]).unwrap();
 /// assert_eq!(store.get("data"), Some(vec![0x42]));
 /// ```
@@ -324,7 +326,7 @@ pub type Segmented3aryCuckooKVStore = CuckooKVStore<Segmented3aryScheme>;
 /// ```rust
 /// use segmented_cuckoo::Segmented4aryCuckooKVStore;
 ///
-/// let mut store = Segmented4aryCuckooKVStore::new(64, 4, 12, 8).unwrap();
+/// let mut store = Segmented4aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
 /// store.insert("data", &[0x42]).unwrap();
 /// assert_eq!(store.get("data"), Some(vec![0x42]));
 /// ```

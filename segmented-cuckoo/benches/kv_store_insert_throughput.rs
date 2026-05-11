@@ -21,6 +21,7 @@ use std::time::Instant;
 
 const MAX_KICKS: u32 = 2500;
 const FINGERPRINT_BITS: u32 = 12;
+const PLAINTEXT_BITS: u32 = 8;
 const WARMUP_TRIALS: usize = 3;
 const MEASURE_TRIALS: usize = 10;
 
@@ -35,7 +36,7 @@ macro_rules! bench_kv_insert {
         let vsize = (value_bits as usize).div_ceil(8);
         let value: Vec<u8> = (0..vsize).map(|i| (i as u8).wrapping_mul(37).wrapping_add(7)).collect();
 
-        match <$store_ty>::from_num_items(TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits) {
+        match <$store_ty>::from_num_items(TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits, PLAINTEXT_BITS) {
             Err(e) => {
                 eprintln!("  Skip {} bucket_size={} value_bits={}: {}", $label, bucket_size, value_bits, e);
             }
@@ -47,7 +48,7 @@ macro_rules! bench_kv_insert {
                 // Warmup
                 for _ in 0..WARMUP_TRIALS {
                     let mut store = <$store_ty>::from_num_items(
-                        TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits,
+                        TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits, PLAINTEXT_BITS,
                     ).unwrap();
                     store.set_max_kicks(MAX_KICKS);
                     let mut i = 0u64;
@@ -66,7 +67,7 @@ macro_rules! bench_kv_insert {
                 let mut lf_vals = Vec::with_capacity(MEASURE_TRIALS);
                 for _trial in 0..MEASURE_TRIALS {
                     let mut store = <$store_ty>::from_num_items(
-                        TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits,
+                        TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits, PLAINTEXT_BITS,
                     ).unwrap();
                     store.set_max_kicks(MAX_KICKS);
                     let start = Instant::now();

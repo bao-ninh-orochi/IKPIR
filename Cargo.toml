@@ -16,8 +16,9 @@ license      = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 segmented-cuckoo = { path = "segmented-cuckoo", version = "0.1" }
-ikpir-server     = { path = "ikpir-server",     version = "0.1" }
-ikpir-client     = { path = "ikpir-client",     version = "0.1" }
+ikpir-server     = { path = "ikpir-server",     version = "0.1", default-features = false }
+ikpir-client     = { path = "ikpir-client",     version = "0.1", default-features = false }
+clap         = { version = "4", features = ["derive"] }
 rand         = "0.9"
 rand_chacha  = "0.9"
 xxhash-rust  = { version = "0.8", features = ["xxh3"] }

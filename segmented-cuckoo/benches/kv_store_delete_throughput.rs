@@ -21,6 +21,7 @@ use std::time::Instant;
 
 const MAX_KICKS: u32 = 500;
 const FINGERPRINT_BITS: u32 = 12;
+const PLAINTEXT_BITS: u32 = 8;
 const WARMUP_TRIALS: usize = 3;
 const MEASURE_TRIALS: usize = 10;
 
@@ -36,7 +37,7 @@ macro_rules! bench_kv_delete {
         let value: Vec<u8> = (0..vsize).map(|i| (i as u8).wrapping_mul(37).wrapping_add(7)).collect();
 
         // Probe: how many items fit? `0` means the constructor was rejected.
-        let count: u64 = match <$store_ty>::from_num_items(TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits) {
+        let count: u64 = match <$store_ty>::from_num_items(TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits, PLAINTEXT_BITS) {
             Err(e) => {
                 eprintln!("  Skip {} bucket_size={} value_bits={}: {}", $label, bucket_size, value_bits, e);
                 0
@@ -60,7 +61,7 @@ macro_rules! bench_kv_delete {
         } else {
             // Warmup
             for _ in 0..WARMUP_TRIALS {
-                let mut store = <$store_ty>::from_num_items(TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits).unwrap();
+                let mut store = <$store_ty>::from_num_items(TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits, PLAINTEXT_BITS).unwrap();
                 store.set_max_kicks(MAX_KICKS);
                 for i in 0u64..count {
                     let _ = store.insert(i.to_le_bytes(), &value);
@@ -74,7 +75,7 @@ macro_rules! bench_kv_delete {
             let mut lf_vals = Vec::with_capacity(MEASURE_TRIALS);
             let mut last_num_buckets: u32 = 0;
             for _trial in 0..MEASURE_TRIALS {
-                let mut store = <$store_ty>::from_num_items(TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits).unwrap();
+                let mut store = <$store_ty>::from_num_items(TARGET_ITEMS, bucket_size, FINGERPRINT_BITS, value_bits, PLAINTEXT_BITS).unwrap();
                 store.set_max_kicks(MAX_KICKS);
                 for i in 0u64..count {
                     let _ = store.insert(i.to_le_bytes(), &value);

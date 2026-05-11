@@ -1,6 +1,9 @@
 [package]
 name        = "ikpir-client"
-description = "Client-side IKPIR protocol: index extraction, PIR query construction, response decoding"
+description = "Client-side IKPIR protocol: PIR query construction, response decoding, incremental hint sync"
+keywords    = ["pir", "keyword-pir", "frodopir", "lwe", "incremental"]
+categories  = ["cryptography", "data-structures"]
+readme      = "README.md"
 
 version.workspace      = true
 edition.workspace      = true
@@ -9,8 +12,43 @@ authors.workspace      = true
 repository.workspace   = true
 license.workspace      = true
 
+autobenches = false
+
 [lints]
 workspace = true
 
 [dependencies]
 segmented-cuckoo = { workspace = true }
+ikpir-server     = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+clap     = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name    = "query_throughput"
+harness = false
+
+[[bench]]
+name    = "decode_throughput"
+harness = false
+
+[[bench]]
+name    = "apply_delta_throughput"
+harness = false
+
+[[bench]]
+name    = "preprocess_throughput"
+harness = false
+
+[[bench]]
+name    = "client_setup_latency"
+harness = false
+
+[[bench]]
+name    = "client_memory_footprint"
+harness = false

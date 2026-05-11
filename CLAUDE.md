@@ -33,30 +33,39 @@ Responsibilities:
 
 ### `ikpir-server`
 
-Implements all server-side logic of the IKPIR protocol.
-
-Responsibilities:
-- **Create database** — initialise a `SegmentedCuckooKVStore` and populate it with the initial set of `(key, value)` pairs.
-- **Preprocessing PIR** — compute the PIR hint / preprocessing matrix from the current database state (compatible with FrodoPIR / SimplePIR preprocessing).
-- **Transfer preprocessing matrix** — send the preprocessing material to the client at setup time.
-- **Handle PIR request** — receive an encoded PIR query from the client.
-- **Process PIR request** — evaluate the PIR query against the current database array.
-- **Response PIR request** — send the PIR response back to the client.
-- **Insert `(key, value)`** — insert a new entry into the key-value store.
-- **Delete key** — remove a key (and its associated value) from the key-value store.
-- **Update value** — change the value stored for a given key from `v` to `v'`.
-- **Re-compute preprocessing** — incrementally update the PIR preprocessing material to reflect the latest database mutation without a full rebuild.
+Wraps a `CuckooKVStore` in per-segment Index-PIR sub-databases; exposes
+setup, answer, insert, update, delete, and full_rebuild. Incremental
+hint patching keeps the client in sync without a full rebuild. Backend
+tunables are passed via the `IndexPirBackend::Config` associated type
+(e.g. `FrodoConfig { lwe_dim }`); see
+[`ikpir-server/CLAUDE.md`](ikpir-server/CLAUDE.md) for the full
+per-segment architecture, protocol invariants, and backend-author checklist.
 
 ### `ikpir-client`
 
-Implements all client-side logic of the IKPIR protocol.
+Holds `CuckooParams` and per-segment `ClientState`; translates keyword
+lookups into PIR query/response bundles and applies incremental hint deltas.
+See [`ikpir-client/CLAUDE.md`](ikpir-client/CLAUDE.md) for the epoch
+state machine, failure-mode table, and entry-point map.
 
-Responsibilities:
-- **Extract indices** — given a query keyword `k`, use the SCF public rule to derive the fixed set of database array indices that encode `fp(k) ‖ v`.
-- **Preprocessing** — receive and store the preprocessing matrix sent by the server; perform client-side setup.
-- **Create PIR request** — encode the target index set into a single Index-PIR query using the stored preprocessing material.
-- **Post-process PIR response** — decode the server's response, verify the fingerprint `fp(k)`, and extract the value `v`.
-- **Re-compute preprocessing** — apply incremental updates to the local preprocessing state when the server database mutates.
+## Benches and visualization
+
+Each crate ships `clap`-parsed benches that emit CSV under `results/`,
+plus a `scripts/plot.py` (matplotlib + pandas) that turns those CSVs into
+PNG charts under `results/plots/`. Default invocation runs a single
+sensible config; `--sweep` runs the full hardcoded matrix; specific
+flags (`--num-buckets`, `--bucket-size`, `--value-bits`, ...) pick an
+exact config.
+
+```bash
+cargo bench -p ikpir-server --bench answer_throughput
+cargo bench -p ikpir-server --bench answer_throughput -- --sweep
+cargo bench -p ikpir-server --bench answer_throughput -- \
+    --num-buckets 1024 --bucket-size 4 --value-bits 64
+
+cd ikpir-server && pip install -r scripts/requirements.txt && \
+    python scripts/plot.py
+```
 
 ## Design principles
 

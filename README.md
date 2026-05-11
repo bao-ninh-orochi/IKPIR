@@ -65,3 +65,56 @@ Combined with an efficient preprocessing-update technique, SCF yields an
 The construction is compatible with **any single-server Index-based PIR**.
 This repository targets in particular **FrodoPIR** and **SimplePIR**, two
 LWE-based Index-PIR schemes that offer high server throughput and well-studied post-quantum security.
+
+## Implementation status
+
+| Component | Status |
+|---|---|
+| Segmented Cuckoo Filter + KV store | Shipped (`segmented-cuckoo`) |
+| Server protocol (setup / answer / insert / update / delete / full_rebuild) | Shipped (`ikpir-server`) |
+| Client protocol (from_setup / build_query / decode / apply_delta / reset_from) | Shipped (`ikpir-client`) |
+| FrodoPIR backend | Shipped |
+| SimplePIR backend | Planned |
+
+## Repository tour
+
+| Resource | Purpose |
+|---|---|
+| [`segmented-cuckoo/CLAUDE.md`](segmented-cuckoo/CLAUDE.md) | Filter + KV store internals, file map, design decisions |
+| [`ikpir-server/CLAUDE.md`](ikpir-server/CLAUDE.md) | Server crate internals, per-segment architecture, backend-author checklist |
+| [`ikpir-server/README.md`](ikpir-server/README.md) | Server quick start and backend implementation guide |
+| [`ikpir-client/CLAUDE.md`](ikpir-client/CLAUDE.md) | Client crate internals, epoch state machine, failure modes |
+| [`ikpir-client/README.md`](ikpir-client/README.md) | Client quick start and lifecycle overview |
+
+## Benches and visualization
+
+Each crate ships `clap`-parsed benches that emit CSV under `results/`,
+mirroring `segmented-cuckoo`'s style. Default invocation runs a single
+sensible config; `--sweep` runs the full hardcoded parameter matrix;
+specific flags (`--num-buckets`, `--bucket-size`, `--value-bits`,
+`--lwe-dim`, ...) pick an exact configuration.
+
+```bash
+# Server: setup, answer, and the headline incremental-vs-rebuild crossover
+cargo bench -p ikpir-server --bench setup_throughput
+cargo bench -p ikpir-server --bench answer_throughput       -- --sweep
+cargo bench -p ikpir-server --bench incremental_vs_rebuild  -- --n-mutations 64
+
+# Client: query construction, decode, and apply_delta
+cargo bench -p ikpir-client --bench query_throughput        -- --sweep
+cargo bench -p ikpir-client --bench decode_throughput
+cargo bench -p ikpir-client --bench apply_delta_throughput
+
+# Plus the original segmented-cuckoo benches (load_factor, fpr, throughputs)
+cargo bench -p segmented-cuckoo
+```
+
+Each crate also ships a `scripts/plot.py` (matplotlib + pandas) that
+turns the CSV outputs into PNG charts under `results/plots/`:
+
+```bash
+cd ikpir-server && pip install -r scripts/requirements.txt && \
+    python scripts/plot.py        # all plots
+cd ikpir-client && pip install -r scripts/requirements.txt && \
+    python scripts/plot.py --list # list individual functions
+```
