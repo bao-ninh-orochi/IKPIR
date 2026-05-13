@@ -45,10 +45,6 @@ name    = "incremental_vs_rebuild"
 harness = false
 
 [[bench]]
-name    = "end_to_end_fpr"
-harness = false
-
-[[bench]]
 name    = "failure_modes"
 harness = false
 

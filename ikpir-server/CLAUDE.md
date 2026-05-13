@@ -94,7 +94,7 @@ without a full rebuild.
 | Backend trait contract | `backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` |
 | FrodoPIR config knobs | `backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
 | Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs` |
-| Benches | `benches/setup_latency.rs`, `benches/answer_throughput.rs`, `benches/incremental_vs_rebuild.rs` (+ `end_to_end_fpr`, `failure_modes`, `wire_sizes`, `setup_to_first_query`, `steady_state_workload`) |
+| Benches | `benches/setup_latency.rs`, `benches/answer_throughput.rs`, `benches/incremental_vs_rebuild.rs` (+ `failure_modes`, `wire_sizes`, `setup_to_first_query`, `steady_state_workload`) |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:
 

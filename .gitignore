@@ -1,6 +1,9 @@
 # Rust build artefacts
 /target
 
+# references papers
+*.pdf
+
 # Per-crate transient bench output (cargo bench CWD is the crate dir).
 # Paper-figure CSVs live in `results/paper/` and are tracked.
 /segmented-cuckoo/results

@@ -54,7 +54,6 @@ seven benches use a manual `Instant`-based timing loop.
 | `incremental_vs_rebuild` | Incremental hint patch vs `full_rebuild` for N mutations | `ikpir_server_incremental_vs_rebuild.csv` | `--n-mutations`, `--load-factor` |
 | `setup_to_first_query` | Cold-start latency to first decoded answer; per-phase breakdown | `ikpir_setup_to_first_query.csv` | `--mode`, `--num-buckets` |
 | `steady_state_workload` | Mixed insert/query workload at a configurable query-to-mutation ratio | `ikpir_steady_state_workload.csv` | `--query-ratio`, `--n-inserts`, `--load-factor` |
-| `end_to_end_fpr` | End-to-end false-positive rate when querying absent keys | `ikpir_end_to_end_fpr.csv` | `--fingerprint-bits`, `--bucket-size` |
 | `wire_sizes` | Minimum on-wire byte sizes of every IKPIR bundle shape (no timing) | `ikpir_wire_sizes.csv` | `--num-buckets`, `--value-bits`, `--load-factor` |
 | `failure_modes` | Rejection-path latency for `StaleEpoch` and `TableFull` | `ikpir_failure_modes.csv` | `--arity` |
 
@@ -81,7 +80,6 @@ Every bench accepts these config knobs (defaults are academic-paper scale):
 | `setup_to_first_query` | `--warmup 2`, `--trials 5`, `--mode cold` (`cold`/`warm-b`/`warm-bc`) |
 | `steady_state_workload` | `--warmup 1`, `--trials 3`, `--n-inserts 4096`, `--n-queries 410`, `--query-ratio 10`, `--load-factor 0.50` |
 | `incremental_vs_rebuild` | `--n-mutations 1024`, `--load-factor 0.80` (numeric or the sentinel `full` → populate to `TableFull`) |
-| `end_to_end_fpr` | `--n-queried 100000` (absent keys per config) |
 | `wire_sizes` | `--load-factor 0.50` |
 | `failure_modes` | `--num-trials 2000` per failure kind, `--num-buckets 256` (stale-epoch), `--full-num-buckets 16` (table-full), `--arity 2` |
 
@@ -147,9 +145,6 @@ cargo bench -p ikpir-server --bench setup_to_first_query -- \
 cargo bench -p ikpir-server --bench steady_state_workload -- \
     --n-inserts 4096 --n-queries 410 --query-ratio 50
 
-# End-to-end FPR at one fingerprint width.
-cargo bench -p ikpir-server --bench end_to_end_fpr -- --fingerprint-bits 16
-
 # Wire-size catalogue at one config.
 cargo bench -p ikpir-server --bench wire_sizes -- --arity 3 --num-buckets 24576
 
@@ -184,7 +179,7 @@ Plot ↔ bench mapping:
 | `incremental_vs_rebuild` | `incremental_vs_rebuild` | `incremental_vs_rebuild.png` |
 
 Benches without a packaged plotter (`setup_to_first_query`,
-`steady_state_workload`, `end_to_end_fpr`, `wire_sizes`, `failure_modes`)
+`steady_state_workload`, `wire_sizes`, `failure_modes`)
 emit CSV under `results/` for ad-hoc analysis with pandas, gnuplot, etc.
 
 Override paths via `IKPIR_SERVER_RESULTS_DIR` / `IKPIR_SERVER_PLOTS_DIR`.

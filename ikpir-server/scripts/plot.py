@@ -298,49 +298,7 @@ def plot_incremental_per_op():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4. end_to_end_fpr — false-positive rate at varying fingerprint widths
-# ═════════════════════════════════════════════════════════════════════════════
-
-def plot_end_to_end_fpr():
-    """Observed FPR (n_fp / n_queried) vs fingerprint_bits.
-
-    Input:  results/ikpir_end_to_end_fpr.csv
-    Output: results/plots/end_to_end_fpr.png
-    Anchor: ChalametPIR §6 false-positive analysis.
-    Plots empirical FPR alongside the theoretical 2⁻fp_bits curve.
-    """
-    df = _load("ikpir_end_to_end_fpr.csv")
-    fig, ax = plt.subplots(figsize=(9, 6))
-
-    for (ar, nb), grp in df.groupby(["arity", "num_buckets"]):
-        grp = grp.sort_values("fingerprint_bits")
-        # Use a tiny positive floor for the log scale; mark zero-FPR rows explicitly.
-        observed = grp["fpr"].clip(lower=1e-12)
-        ax.plot(
-            grp["fingerprint_bits"], observed,
-            marker=ARITY_MARKERS.get(int(ar), "x"),
-            linestyle=ARITY_LINESTYLES.get(int(ar), "-"),
-            label=f"arity={int(ar)} nb={int(nb)}",
-            linewidth=1.4,
-        )
-
-    fp_bits = sorted(df["fingerprint_bits"].unique())
-    if fp_bits:
-        theoretical = [2.0 ** (-fb) for fb in fp_bits]
-        ax.plot(fp_bits, theoretical, linestyle=":", color="black",
-                label="theoretical 2⁻ᶠᵇ", linewidth=1.4)
-
-    ax.set_yscale("log")
-    ax.set_xlabel("fingerprint_bits")
-    ax.set_ylabel("FPR (observed)")
-    ax.set_title("End-to-end FPR — ikpir-server")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3, which="both")
-    _save(fig, "end_to_end_fpr.png")
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 5. failure_modes — rejection-path latencies
+# 4. failure_modes — rejection-path latencies
 # ═════════════════════════════════════════════════════════════════════════════
 
 def plot_failure_modes():
@@ -554,7 +512,6 @@ PLOT_FUNCTIONS = {
     "answer_throughput":       plot_answer_throughput,
     "incremental_vs_rebuild":  plot_incremental_vs_rebuild,
     "incremental_per_op":      plot_incremental_per_op,
-    "end_to_end_fpr":          plot_end_to_end_fpr,
     "failure_modes":           plot_failure_modes,
     "wire_sizes":              plot_wire_sizes,
     "wire_deltas":             plot_wire_deltas,
@@ -567,7 +524,6 @@ CSV_FOR_PLOT = {
     "answer_throughput":       "ikpir_server_answer_throughput.csv",
     "incremental_vs_rebuild":  "ikpir_server_incremental_vs_rebuild.csv",
     "incremental_per_op":      "ikpir_server_incremental_vs_rebuild.csv",
-    "end_to_end_fpr":          "ikpir_end_to_end_fpr.csv",
     "failure_modes":           "ikpir_failure_modes.csv",
     "wire_sizes":              "ikpir_wire_sizes.csv",
     "wire_deltas":             "ikpir_wire_sizes.csv",

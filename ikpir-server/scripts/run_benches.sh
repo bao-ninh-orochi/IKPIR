@@ -11,7 +11,6 @@
 #   setup_latency           A (m sweep) + C (arity sweep)
 #   answer_throughput       A (m sweep) + B (w sweep) + C (arity sweep)
 #   incremental_vs_rebuild  F (n_mutations × num_buckets)
-#   end_to_end_fpr          D (fingerprint_bits sweep)
 #   failure_modes           single config (rejection-path microbench)
 #   wire_sizes              A (m sweep) + B (w sweep) — wire-size catalogue
 #   setup_to_first_query    G (mode × num_buckets)
@@ -139,24 +138,6 @@ run_incremental_vs_rebuild() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# end_to_end_fpr — D (fingerprint_bits sweep)
-# ─────────────────────────────────────────────────────────────────────────────
-run_end_to_end_fpr() {
-    step "end_to_end_fpr"
-    rm -f "$RESULTS_DIR/ikpir_end_to_end_fpr.csv"
-
-    for fb in "${MATRIX_D_FINGERPRINT_BITS[@]}"; do
-        note "D: fingerprint_bits=$fb (n_queried=$MATRIX_D_N_QUERIED)"
-        "${CARGO[@]}" end_to_end_fpr -- \
-            --arity "$MATRIX_D_ARITY" --num-buckets "$MATRIX_D_NUM_BUCKETS" \
-            --bucket-size "$MATRIX_D_BUCKET_SIZE" --value-bits "$MATRIX_D_VALUE_BITS" \
-            --fingerprint-bits "$fb" --lwe-dim "$MATRIX_D_LWE_DIM" \
-            --n-queried "$MATRIX_D_N_QUERIED"
-    done
-    ok "→ $RESULTS_DIR/ikpir_end_to_end_fpr.csv"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
 # failure_modes — single config (rejection-path microbench)
 # ─────────────────────────────────────────────────────────────────────────────
 run_failure_modes() {
@@ -260,7 +241,6 @@ ALL_BENCHES=(
     setup_latency
     answer_throughput
     incremental_vs_rebuild
-    end_to_end_fpr
     failure_modes
     wire_sizes
     setup_to_first_query
@@ -272,7 +252,6 @@ run_one() {
         setup_latency)           run_setup_latency ;;
         answer_throughput)       run_answer_throughput ;;
         incremental_vs_rebuild)  run_incremental_vs_rebuild ;;
-        end_to_end_fpr)          run_end_to_end_fpr ;;
         failure_modes)           run_failure_modes ;;
         wire_sizes)              run_wire_sizes ;;
         setup_to_first_query)    run_setup_to_first_query ;;

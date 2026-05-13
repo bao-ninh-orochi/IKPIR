@@ -105,24 +105,6 @@ MATRIX_C_BUCKET_SIZE=4
 MATRIX_C_LWE_DIM=1774
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Matrix D — fingerprint-bits / FPR sweep
-# Maps to ChalametPIR §6 false-positive analysis.
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Fixed: arity=2, bucket_size=4, value_bits=256, num_buckets=16384 (m≈2^16)
-# Vary:  fingerprint_bits ∈ {8, 10, 12, 16, 20, 24, 32}
-# Querying ~100 000 absent keys → fpr resolves down to ~2⁻¹⁷ before falling
-# below sampling floor.
-
-MATRIX_D_FINGERPRINT_BITS=(8 10 12 16 20 24 32)
-MATRIX_D_ARITY=2
-MATRIX_D_NUM_BUCKETS=16384
-MATRIX_D_BUCKET_SIZE=4
-MATRIX_D_VALUE_BITS=256
-MATRIX_D_LWE_DIM=1774
-MATRIX_D_N_QUERIED=100000
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Matrix E — LWE-dim sweep
 # Covers ChalametPIR (n=1774, FrodoPIR), Hao-2025 (n=1024, SimplePIR),
 # and HintlessPIR (n=1408).
