@@ -1,3 +1,25 @@
+//! Empirical load-factor sweep across every `CuckooFilter` variant.
+//!
+//! # Purpose
+//!
+//! Inserts items until `TableFull` for each `(scheme, num_buckets,
+//! bucket_size, fingerprint_bits)` and prints the achieved load factor.
+//! Useful for picking `num_buckets` / `bucket_size` for a target capacity
+//! when sizing an IKPIR deployment.
+//!
+//! # Run
+//!
+//! ```text
+//! cargo run -p segmented-cuckoo --example load_factor --release
+//! ```
+//!
+//! # What to look for
+//!
+//! - Segmented variants consistently hit higher load factors than
+//!   standard at the same `bucket_size`.
+//! - Larger `bucket_size` lifts load factor at the cost of more
+//!   per-bucket scan work.
+
 use segmented_cuckoo::{
     Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, Segmented2aryCuckooFilter,
     Standard3aryCuckooFilter, Standard4aryCuckooFilter, Standard2aryCuckooFilter,

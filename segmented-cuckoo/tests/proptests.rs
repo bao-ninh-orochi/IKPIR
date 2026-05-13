@@ -1,12 +1,32 @@
 //! Property-based tests for `segmented-cuckoo`.
 //!
-//! Uses `proptest` (already a dev-dep). Each test runs 64 cases by default.
+//! # Purpose
+//!
+//! Stress the cell-layout invariants, mutation-log replay correctness,
+//! and snapshot/restore round-trip across a randomly sampled cross-product
+//! of `(plaintext_bits, fingerprint_bits, value_bits)`. Catches edge cases
+//! that the unit tests' fixed parameter grid misses (notably ragged-tail
+//! cells when `value_bits` is not a multiple of `plaintext_bits`).
+//!
+//! # Design / architecture
+//!
+//! Uses `proptest` (already a dev-dep). Each test runs 64 cases by
+//! default. All tests are 2-ary because the cell-layout properties under
+//! test are arity-independent; sampling more arities would only add
+//! redundant coverage.
+//!
+//! # Related files
+//!
+//! - `src/store.rs` and `src/fingerprint_value_table.rs` — the code under
+//!   test.
+//! - `tests/proptests.rs` — file you are reading.
 
 use proptest::prelude::*;
 use segmented_cuckoo::{pack_slot_cells, unpack_slot_cells, CuckooParams, SchemeKind, Segmented2aryCuckooKVStore};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Build a `Segmented2aryCuckooKVStore`, panicking on invalid params.
 fn make_store(
     num_buckets: u32,
     bucket_size: u32,
@@ -19,13 +39,13 @@ fn make_store(
 }
 
 // ─── FVT cell-layout property ────────────────────────────────────────────────
-//
-// Random valid (pb, fp_bits, value_bits) triple. After writing a key, the value
-// must round-trip and no high bits should be set in any cell.
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
+    /// **Random `(plaintext_bits, fingerprint_bits, value_bits)` triple.**
+    /// After writing a key, the value must round-trip and the
+    /// ChalametPIR high-bits-zero invariant must hold on every cell.
     #[test]
     fn prop_fvt_cell_layout_roundtrip(
         pb in 1u32..=32u32,
@@ -67,11 +87,10 @@ proptest! {
     }
 
     // ─── Mutation-log replay property ────────────────────────────────────────
-    //
-    // Perform a random mix of inserts and deletes with the log enabled.
-    // Drain all mutations, replay them onto a fresh empty store via `apply_mutation`,
-    // and assert `as_cells()` matches.
 
+    /// **Random insert/delete sequence.** Drain the mutation log,
+    /// replay it via `apply_mutation` on a fresh empty store, and assert
+    /// the resulting cell array matches the original byte-for-byte.
     #[test]
     fn prop_mutation_log_replay(
         ops in proptest::collection::vec(
@@ -111,6 +130,9 @@ proptest! {
 
     // ─── Snapshot / restore property ─────────────────────────────────────────
 
+    /// **Random insert sequence.** `snapshot_cells` → `from_cells`
+    /// must produce a store where every previously-inserted key is still
+    /// retrievable.
     #[test]
     fn prop_snapshot_restore(
         keys in proptest::collection::vec(0u32..100u32, 1..20),
@@ -140,10 +162,11 @@ proptest! {
     }
 
     // ─── candidate_buckets property ──────────────────────────────────────────
-    //
-    // params().candidate_buckets(key) must return non-zero fp and indices
-    // within the expected segment ranges.
 
+    /// **Random key bytes.** `params().candidate_buckets(key)` must
+    /// return a non-zero fingerprint and indices inside the expected
+    /// per-segment ranges (`[0, segment_size)` for `i0`,
+    /// `[segment_size, num_buckets)` for `i1`).
     #[test]
     fn prop_candidate_buckets_in_range(
         key in proptest::collection::vec(any::<u8>(), 0..32),
@@ -163,6 +186,8 @@ proptest! {
 
     // ─── pack_slot_cells / unpack_slot_cells ─────────────────────────────────
 
+    /// **Random fingerprint + value triple.** `pack_slot_cells` →
+    /// `unpack_slot_cells` is the identity (modulo `fp_bits` masking).
     #[test]
     fn prop_pack_unpack_roundtrip(
         pb        in 1u32..=32u32,
@@ -221,6 +246,9 @@ proptest! {
         prop_assert_eq!(got_bytes, value_bytes, "value round-trip failed");
     }
 
+    /// **Cross-check against the live store.** `pack_slot_cells` must
+    /// produce a byte-identical layout to the cells written by
+    /// `CuckooKVStore::insert` for the same `(fp, value)` pair.
     #[test]
     fn prop_pack_matches_fvt_write(
         pb        in 1u32..=32u32,
@@ -285,6 +313,9 @@ proptest! {
             "pack_slot_cells output differs from FVT cell layout at pb={} fp_bits={} vb={}", pb, fp_bits, value_bits);
     }
 
+    /// **Cross-check against the live store.** `unpack_slot_cells` on a
+    /// slot's cell range must return the same `(fp, value)` the store
+    /// originally inserted.
     #[test]
     fn prop_unpack_matches_fvt_read(
         pb        in 1u32..=32u32,
@@ -327,6 +358,8 @@ proptest! {
 
     // ─── from_cells rejects wrong-size array ─────────────────────────────────
 
+    /// **Wrong-size cell array.** `from_cells` must reject both
+    /// oversized and undersized arrays with `InvalidParams`.
     #[test]
     fn prop_from_cells_rejects_wrong_size(
         extra in 1usize..100usize,

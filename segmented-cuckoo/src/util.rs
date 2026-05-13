@@ -1,30 +1,53 @@
-//! Shared arithmetic utilities used by filter constructors.
+//! Shared arithmetic utilities used by filter and KV-store constructors.
 //!
-//! This module contains small, pure helpers that are too general to belong to any single
-//! domain module. The exports are [`next_power_of_2`], [`next_power_of_3`], and
-//! [`next_power_of_4`], which drive the auto-sizing logic in every `from_num_items`
-//! constructor, plus their `is_power_of_*` predicates.
+//! # Purpose
+//!
+//! Small, pure helpers that are too general to belong to any single domain
+//! module: `next_power_of_*` for rounding up requested capacity to a valid
+//! `num_buckets`, and `is_power_of_*` predicates for the matching
+//! validation checks.
+//!
+//! # Design / architecture
+//!
+//! Each `from_num_items` constructor rounds the requested item count up to
+//! a valid `num_buckets` via one of these helpers; `is_power_of_*` then
+//! flags caller-supplied `num_buckets` that would violate the scheme's
+//! shape constraint. Hot path is `next_power_of_2`, which delegates to
+//! the `BSR` / `LZCNT` hardware intrinsic; the 3- and 4-ary helpers
+//! iterate (constructors are not on a hot path).
+//!
+//! # Related files
+//!
+//! - `store.rs` / `filter.rs` — every `new` / `from_num_items` constructor.
+//! - `scheme.rs` — segmented-3ary geometry depends on
+//!   `is_power_of_3`-style assertions to enforce
+//!   `num_buckets = 3 · 2^t`.
 
-/// Return the smallest power of 2 that is ≥ `x`.
+/// Smallest power of 2 that is ≥ `x`.
 ///
-/// Used by every `from_num_items` constructor to round a required bucket count up to the
-/// nearest valid table size. All filter indexing schemes require `num_buckets` to be a power of 2
-/// (or a multiple of a power of 2 for segmented-3ary), so this function provides the
-/// canonical rounding step.
+/// # Purpose
+///
+/// Canonical rounding step used by every `from_num_items` constructor:
+/// turns a requested bucket count into the nearest valid power-of-2 table
+/// size.
 ///
 /// # Arguments
 ///
-/// - `x` — the value to round up. Any `u64` is accepted; `0` is treated as `1` so the
-///   return value is always ≥ 1.
+/// - `x` — value to round up. `0` is special-cased to return `1`.
+///
+/// # Constraints
+///
+/// Panics if `x > u64::MAX / 2` (the result would overflow `u64`).
 ///
 /// # Returns
 ///
-/// The smallest `p` such that `p` is a power of 2 and `p >= x`. Always in `[1, 2^63]`.
+/// The smallest `p` such that `p` is a power of 2 and `p ≥ x`. Always in
+/// `[1, 2^63]`.
 ///
-/// # Performance
+/// # Complexity
 ///
-/// O(1) — delegates to [`u64::next_power_of_two`] which is a single hardware intrinsic
-/// (`BSR` / `LZCNT`) on x86-64.
+/// `O(1)` — delegates to [`u64::next_power_of_two`], a single hardware
+/// intrinsic (`BSR` / `LZCNT`) on x86-64.
 ///
 /// # Examples
 ///
@@ -45,7 +68,25 @@ pub fn next_power_of_2(x: u64) -> u64 {
     x.next_power_of_two()
 }
 
-/// Return the smallest power of 3 that is ≥ `x`. Returns 1 for x=0.
+/// Smallest power of 3 that is ≥ `x`.
+///
+/// # Purpose
+///
+/// Used by `Standard3aryCuckooFilter::from_num_items` to round up to a
+/// valid `num_buckets = 3^t`.
+///
+/// # Arguments
+///
+/// - `x` — value to round up. `0` and `1` both return `1`.
+///
+/// # Returns
+///
+/// The smallest `p = 3^t` with `p ≥ x`.
+///
+/// # Complexity
+///
+/// `O(log_3(x))` iterations — bounded above by ~40 for any `u64`. Not on a
+/// hot path.
 pub fn next_power_of_3(x: u64) -> u64 {
     if x <= 1 {
         return 1;
@@ -57,7 +98,24 @@ pub fn next_power_of_3(x: u64) -> u64 {
     p
 }
 
-/// Return the smallest power of 4 that is ≥ `x`. Returns 1 for x=0.
+/// Smallest power of 4 that is ≥ `x`.
+///
+/// # Purpose
+///
+/// Used by `Standard4aryCuckooFilter::from_num_items` to round up to a
+/// valid `num_buckets = 4^t`.
+///
+/// # Arguments
+///
+/// - `x` — value to round up. `0` and `1` both return `1`.
+///
+/// # Returns
+///
+/// The smallest `p = 4^t` with `p ≥ x`.
+///
+/// # Complexity
+///
+/// `O(log_4(x))` iterations — bounded above by ~32 for any `u64`.
 pub fn next_power_of_4(x: u64) -> u64 {
     if x <= 1 {
         return 1;
@@ -69,7 +127,19 @@ pub fn next_power_of_4(x: u64) -> u64 {
     p
 }
 
-/// Return `true` if `n` is a power of 3 (`3^t` for some `t ≥ 0`).
+/// `true` iff `n` is a power of 3 (`3^t` for some `t ≥ 0`).
+///
+/// # Arguments
+///
+/// - `n` — value to test. `0` is not a power of 3 (returns `false`).
+///
+/// # Returns
+///
+/// `true` if `n ∈ {1, 3, 9, 27, …}`, `false` otherwise.
+///
+/// # Complexity
+///
+/// `O(log_3(n))` divisions in the worst case.
 pub fn is_power_of_3(n: u32) -> bool {
     if n == 0 {
         return false;
@@ -81,15 +151,34 @@ pub fn is_power_of_3(n: u32) -> bool {
     v == 1
 }
 
-/// Return `true` if `n` is a power of 4 (`4^t = 2^(2t)` for `t ≥ 0`).
+/// `true` iff `n` is a power of 4 (`4^t = 2^(2t)` for `t ≥ 0`).
+///
+/// # Arguments
+///
+/// - `n` — value to test. `0` returns `false`.
+///
+/// # Returns
+///
+/// `true` if `n ∈ {1, 4, 16, 64, …}`, `false` otherwise.
+///
+/// # Rationale
+///
+/// A power of 4 is also a power of 2 with an even number of trailing
+/// zeros — checking both predicates is `O(1)` (two intrinsics).
 pub fn is_power_of_4(n: u32) -> bool {
     n.is_power_of_two() && (n.trailing_zeros() % 2 == 0)
 }
 
 #[cfg(test)]
 mod tests {
+    //! Unit tests for the power-of-`k` helpers. Each test pins a
+    //! representative cross-section of the input range, including the
+    //! boundary cases (`0`, `1`) and the failure mode for
+    //! `next_power_of_2`.
+
     use super::*;
 
+    /// `next_power_of_2` rounds up correctly and is identity on a power of 2.
     #[test]
     fn test_next_power_of_2() {
         assert_eq!(next_power_of_2(0), 1);
@@ -101,6 +190,7 @@ mod tests {
         assert_eq!(next_power_of_2(17), 32);
     }
 
+    /// `next_power_of_3` rounds up to `3^t` correctly.
     #[test]
     fn test_next_power_of_3() {
         assert_eq!(next_power_of_3(0), 1);
@@ -114,6 +204,7 @@ mod tests {
         assert_eq!(next_power_of_3(244), 729);
     }
 
+    /// `next_power_of_4` rounds up to `4^t` correctly.
     #[test]
     fn test_next_power_of_4() {
         assert_eq!(next_power_of_4(0), 1);
@@ -127,6 +218,7 @@ mod tests {
         assert_eq!(next_power_of_4(257), 1024);
     }
 
+    /// `is_power_of_3` recognises `3^t` and rejects everything else.
     #[test]
     fn test_is_power_of_3() {
         assert!(!is_power_of_3(0));
@@ -140,6 +232,8 @@ mod tests {
         assert!(!is_power_of_3(6));
     }
 
+    /// `is_power_of_4` recognises `4^t` and rejects everything else
+    /// (including powers of 2 that are not powers of 4, like 2, 8, 32).
     #[test]
     fn test_is_power_of_4() {
         assert!(!is_power_of_4(0));
@@ -154,6 +248,7 @@ mod tests {
         assert!(is_power_of_4(256));
     }
 
+    /// `next_power_of_2` panics on inputs that would overflow `u64`.
     #[test]
     #[should_panic(expected = "exceeds")]
     fn next_power_of_2_panics_on_huge() {

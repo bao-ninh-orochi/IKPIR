@@ -1,19 +1,31 @@
-//! **Intent:** Measure raw insert speed for each scheme at its natural load factor.
+//! **Intent:** Measure raw insert speed for each scheme at its natural
+//! load factor.
 //!
-//! **Method:** Insert sequential keys until `TableFull`, timing the full loop. Divide total
-//! insertions by elapsed ns to get Mops/sec. 3 warmup trials, then 10 timed trials.
+//! **Method:** Insert sequential keys until `TableFull`, timing the full
+//! loop. Divide total insertions by elapsed ns to get Mops/sec. 3 warmup
+//! trials, then 10 timed trials.
 //!
-//! **Rationale:** "Insert until full" is the only fair comparison method. Inserting a fixed
-//! number of items (e.g. 1 M) would confound throughput with load factor: the same 1 M items
-//! might fill standard 3-ary to ~90% (near full, expensive kicking) but segmented 3-ary to
-//! only ~70% (sparse, cheap kicking), making the standard variant appear artificially slow.
-//! Measuring over the full fill trajectory puts all schemes under comparable conditions.
+//! **Arguments (CLI):** none — sweeps a built-in cross-product (see
+//! `NUM_BUCKETS_VALUES` / `BUCKET_SIZE_VALUES` constants below). One CSV
+//! row per `(scheme, arity, num_buckets, bucket_size)`.
 //!
-//! **Parameters:** num_buckets ∈ {2^16, 2^18, 2^20}. bucket_size ∈ {1, 2, 3, 4}. fingerprint_bits = 12.
-//! 3 warmup + 10 measured trials.
+//! **Design rationale:** "Insert until full" is the only fair comparison
+//! method. Inserting a fixed number of items (e.g. 1 M) would confound
+//! throughput with load factor: the same 1 M items might fill standard
+//! 3-ary to ~90% (near full, expensive kicking) but segmented 3-ary to
+//! only ~70% (sparse, cheap kicking), making the standard variant appear
+//! artificially slow. Measuring over the full fill trajectory puts all
+//! schemes under comparable conditions.
+//!
+//! **Parameters:** `num_buckets ∈ {2^16, 2^18, 2^20}`,
+//! `bucket_size ∈ {1, 2, 3, 4}`, `fingerprint_bits = 12`, `max_kicks =
+//! 2500`. 3 warmup + 10 measured trials per cell. Standard 3-ary uses
+//! the matching power-of-3 size; standard 4-ary uses the matching
+//! power-of-4 size.
 //!
 //! **Output:** `results/insert_throughput.csv`
-//! Columns: scheme, arity, num_buckets, bucket_size, mean_inserted, mean_lf, mean_duration_ns, mean_mops, min_mops, max_mops, stddev_mops
+//! Columns: scheme, arity, num_buckets, bucket_size, mean_inserted,
+//! mean_lf, mean_duration_ns, mean_mops, min_mops, max_mops, stddev_mops
 
 mod helpers;
 

@@ -1,44 +1,61 @@
 //! Cell-based fingerprint-and-value storage for the IKPIR KV store.
 //!
-//! # Overview
+//! # Purpose
 //!
-//! [`FingerprintValueTable`] is the physical storage layer for the `CuckooKVStore`. Unlike
-//! [`FingerprintTable`](crate::fingerprint_table::FingerprintTable), which uses bit-packed
-//! `Vec<u8>` storage optimised for minimal memory, this type uses a flat `Vec<u32>` of
-//! *cells*, where each cell holds at most `plaintext_bits` payload bits in its low bits
-//! with the high `(32 - plaintext_bits)` bits always zero.
+//! Provides [`FingerprintValueTable`], the physical storage layer underneath
+//! [`CuckooKVStore`](crate::CuckooKVStore). Holds one
+//! `(fingerprint, value)` entry per slot in a flat `Vec<u32>` of *cells*,
+//! laid out so the ChalametPIR / FrodoPIR `vec_mult_u32_u32` matvec can
+//! consume the array directly.
 //!
-//! This layout matches ChalametPIR's `construct_row` convention: the PIR matvec operates
-//! over `u32` cells and assumes `cell & ((1 << plaintext_bits) - 1) == cell` for every
-//! cell. Aligned `u32` reads amortise the cost of the matvec inner loop and allow LLVM to
-//! auto-vectorise it, at the cost of a `⌈32 / plaintext_bits⌉`× space overhead relative
-//! to the bit-packed representation.
+//! # Design / architecture
 //!
-//! # Layout invariants
+//! - **Cells, not bytes.** Unlike
+//!   [`FingerprintTable`](crate::fingerprint_table::FingerprintTable) — which
+//!   bit-packs into `Vec<u8>` to minimise filter footprint — this type uses a
+//!   flat `Vec<u32>` where each cell carries at most `plaintext_bits` payload
+//!   bits in its low bits, with the high `(32 − plaintext_bits)` bits always
+//!   zero. The PIR matvec accumulates cells into a `u64`; the high-bit-zero
+//!   invariant is what prevents overflow inside that accumulator.
+//! - **Slot layout.** `cells_per_slot = ⌈(fingerprint_bits + value_bits)
+//!   / plaintext_bits⌉`. Slot `s` occupies cells
+//!   `[s · cells_per_slot, (s + 1) · cells_per_slot)`. Within a slot, the
+//!   fingerprint occupies the leading `fingerprint_bits` of the bit-stream
+//!   and the value occupies the next `value_bits`; either may straddle a
+//!   cell boundary. The trailing cell may carry fewer than `plaintext_bits`
+//!   bits (ragged tail).
+//! - **Empty-slot convention.** `fingerprint == 0` flags an empty slot. The
+//!   non-zero fingerprint invariant lives in the hash layer
+//!   ([`crate::hash`]).
+//! - **No tail padding.** Every cell read is an aligned `u32` load; the
+//!   unaligned-wide-load trick that `FingerprintTable` uses is not needed
+//!   here.
+//! - **Trade-off.** Cell-based storage costs `⌈32 / plaintext_bits⌉`× the
+//!   bit-packed representation but lets LLVM auto-vectorise the matvec inner
+//!   loop, which is the IKPIR hot path.
 //!
-//! - `cells_per_slot = ⌈(fingerprint_bits + value_bits) / plaintext_bits⌉`. The last cell
-//!   of every slot may carry fewer than `plaintext_bits` payload bits (ragged tail).
-//! - Each cell carries up to `plaintext_bits` payload bits in its low bits; the high
-//!   `(32 - plaintext_bits)` bits are **always zero**. This invariant is what makes the
-//!   PIR matvec correct — ChalametPIR's `vec_mult_u32_u32` (utils.rs:72–87) assumes it.
-//! - Slot `s` occupies cells `[s · cells_per_slot, (s + 1) · cells_per_slot)`,
-//!   contiguously in `cells`.
-//! - Within a slot, the fingerprint occupies bits `[0, fingerprint_bits)` of the
-//!   bit-stream (across the leading cells); the value occupies bits
-//!   `[fingerprint_bits, fingerprint_bits + value_bits)`. Either may straddle cell
-//!   boundaries.
-//! - Empty-slot convention: `fingerprint == 0` means the slot is empty; value bits in
-//!   that slot are meaningless.
-//! - **No 8-byte tail padding** — every cell read is an aligned `u32` load; no unaligned
-//!   wide-load trick is needed (contrast with `FingerprintTable`'s 8-byte tail padding).
+//! # Related files
+//!
+//! - `store.rs` — sole consumer; wraps this table inside `CuckooKVStore`
+//!   and drives all reads/writes.
+//! - `fingerprint_table.rs` — bit-packed counterpart for the
+//!   filter-only `CuckooFilter`.
+//! - `lib.rs` — module-level docs that point users at the type aliases.
 
 /// Cell-based fingerprint-and-value storage for the IKPIR cuckoo KV store.
 ///
-/// Each entry `(fingerprint, value)` occupies `cells_per_slot` consecutive cells in a flat
-/// `Vec<u32>`. Cell `c` of the flat array corresponds to slot `c / cells_per_slot`, at
-/// cell-within-slot position `c % cells_per_slot`.
+/// # Purpose
 ///
-/// See the module-level documentation for the full layout invariants.
+/// Physical storage for the SCF-backed key-value store. Each `(fp, value)`
+/// entry occupies `cells_per_slot` consecutive `u32` cells; cell `c` maps to
+/// slot `c / cells_per_slot` at intra-slot position `c % cells_per_slot`.
+///
+/// # Rationale
+///
+/// The flat `Vec<u32>` layout, combined with the high-bit-zero invariant on
+/// each cell, lets the PIR backend (FrodoPIR's `vec_mult_u32_u32`) treat the
+/// array as a row-major plaintext matrix without any decoding. See the
+/// module-level docs for the full layout invariants.
 pub(crate) struct FingerprintValueTable {
     /// Flat cell array. Length = `num_slots * cells_per_slot`.
     cells: Vec<u32>,
@@ -57,21 +74,38 @@ pub(crate) struct FingerprintValueTable {
 }
 
 impl FingerprintValueTable {
-    /// Create a cell-based fingerprint-value table.
+    /// Create an empty cell-based fingerprint-value table of the given shape.
+    ///
+    /// # Purpose
+    ///
+    /// Allocate the flat cell array and cache the per-slot cell count so the
+    /// hot-path `read_bits` / `write_bits` helpers do not have to recompute
+    /// `⌈entry_bits / plaintext_bits⌉` on every call.
     ///
     /// # Arguments
     ///
-    /// - `num_buckets`      — total number of buckets.
+    /// - `num_buckets`      — total number of buckets in the table.
     /// - `bucket_size`      — slots per bucket.
-    /// - `fingerprint_bits` — fingerprint bit width. Must be in `1..=32`.
-    /// - `value_bits`       — value bit width. Must be ≥ 1.
-    /// - `plaintext_bits`   — PIR plaintext cell width. Must be in `1..=32`.
+    /// - `fingerprint_bits` — fingerprint width in bits.
+    /// - `value_bits`       — value width in bits.
+    /// - `plaintext_bits`   — PIR plaintext cell width in bits (each cell
+    ///   carries this many low-order payload bits).
     ///
-    /// # Panics
+    /// # Constraints
     ///
-    /// Panics if `fingerprint_bits` is not in `1..=32`, `value_bits == 0`,
-    /// `plaintext_bits` is not in `1..=32`, or if
-    /// `num_buckets * bucket_size * cells_per_slot` overflows `usize`.
+    /// - `fingerprint_bits` must be in `1..=32`.
+    /// - `value_bits` must be ≥ 1.
+    /// - `plaintext_bits` must be in `1..=32`.
+    /// - `num_buckets · bucket_size · cells_per_slot` must fit in `usize`.
+    ///
+    /// # Returns
+    ///
+    /// A zero-initialised table; every slot is empty (`fingerprint == 0`).
+    ///
+    /// # Complexity
+    ///
+    /// `O(num_buckets · bucket_size · cells_per_slot)` time and memory
+    /// (one `vec![0u32; …]` allocation).
     pub(crate) fn new(
         num_buckets: u32,
         bucket_size: u32,
@@ -146,43 +180,44 @@ impl FingerprintValueTable {
         self.cells_per_slot
     }
 
-    /// Total number of slots: `num_buckets * bucket_size`.
+    /// Total number of slots: `num_buckets · bucket_size`.
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn num_slots(&self) -> u64 {
         self.num_buckets as u64 * self.bucket_size as u64
     }
 
-    /// Number of cells needed to hold the fingerprint: `⌈fingerprint_bits / plaintext_bits⌉`.
+    /// Cells needed for one fingerprint: `⌈fingerprint_bits / plaintext_bits⌉`.
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn fingerprint_size_in_cells(&self) -> u32 {
         self.fingerprint_bits.div_ceil(self.plaintext_bits)
     }
 
-    /// Number of cells needed to hold the value: `⌈value_bits / plaintext_bits⌉`.
+    /// Cells needed for one value: `⌈value_bits / plaintext_bits⌉`.
     #[inline]
     pub(crate) fn value_size_in_cells(&self) -> u32 {
         self.value_bits.div_ceil(self.plaintext_bits)
     }
 
-    /// Number of cells per slot — same as `cells_per_slot()`.
+    /// Cells per slot — same as [`cells_per_slot`](Self::cells_per_slot).
     #[inline]
     #[allow(dead_code)]
     pub(crate) fn entry_size_in_cells(&self) -> u32 {
         self.cells_per_slot
     }
 
-    /// Total number of cells in the flat array: `num_slots * cells_per_slot`.
+    /// Total length of the flat cell array: `num_slots · cells_per_slot`.
     #[inline]
     pub(crate) fn size_in_cells(&self) -> usize {
         self.cells.len()
     }
 
-    /// Byte size of the flat cell array: `4 * size_in_cells()`.
+    /// Heap footprint of the flat cell array, in bytes: `4 · size_in_cells()`.
     ///
-    /// This reflects the actual `Vec<u32>` allocation. It is larger than the bit-packed
-    /// equivalent by a factor of `⌈32 / plaintext_bits⌉ · (plaintext_bits / 8)`.
+    /// Larger than the bit-packed equivalent by a factor of
+    /// `⌈32 / plaintext_bits⌉ · (plaintext_bits / 8)` — the price paid for
+    /// PIR-matvec-friendly alignment.
     #[inline]
     pub(crate) fn size_in_bytes(&self) -> usize {
         4 * self.size_in_cells()
@@ -210,7 +245,8 @@ impl FingerprintValueTable {
 
     /// Read up to 32 bits from the cell stream starting at `bit_offset`.
     ///
-    /// `n_bits` must be in `1..=32`. Reads at most `⌈n_bits / plaintext_bits⌉ + 1` cells.
+    /// `n_bits` must be in `1..=32`. Reads at most
+    /// `⌈n_bits / plaintext_bits⌉ + 1` cells.
     #[inline]
     fn read_bits(&self, bit_offset: u64, n_bits: u32) -> u32 {
         let pb = self.plaintext_bits as u64;
@@ -239,8 +275,9 @@ impl FingerprintValueTable {
 
     /// Write `n_bits` low bits of `value` into the cell stream at `bit_offset`.
     ///
-    /// `n_bits` must be in `1..=32`. Preserves bits outside the `[bit_offset, bit_offset+n_bits)`
-    /// window. High `(32 − plaintext_bits)` bits of touched cells remain zero.
+    /// `n_bits` must be in `1..=32`. Preserves bits outside
+    /// `[bit_offset, bit_offset + n_bits)`. High `(32 − plaintext_bits)` bits
+    /// of touched cells remain zero.
     #[inline]
     fn write_bits(&mut self, bit_offset: u64, n_bits: u32, value: u32) {
         let pb = self.plaintext_bits as u64;
@@ -280,42 +317,89 @@ impl FingerprintValueTable {
 
     // ── Public cell-based API ─────────────────────────────────────────────────
 
-    /// Return a shared reference to the flat cell array for PIR backend access.
+    /// Borrow the flat cell array for PIR backend access.
     ///
-    /// Length = `num_slots * cells_per_slot`. Each cell holds at most `plaintext_bits`
-    /// payload bits in its low bits; high bits are always zero.
+    /// # Purpose
+    ///
+    /// Hand the PIR matvec a contiguous, alignment-friendly slice without a
+    /// copy. The caller treats this as a row-major plaintext matrix of shape
+    /// `num_slots × cells_per_slot`.
+    ///
+    /// # Returns
+    ///
+    /// A shared slice of length `num_slots · cells_per_slot`. Every cell
+    /// carries at most `plaintext_bits` payload bits in its low bits; the
+    /// high `(32 − plaintext_bits)` bits are guaranteed zero.
     pub(crate) fn as_cells(&self) -> &[u32] {
         &self.cells
     }
 
     /// Read the fingerprint stored at `(bucket, slot)`.
     ///
-    /// # Panics
+    /// # Arguments
+    ///
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `slot`   — slot index within the bucket, `< bucket_size`.
+    ///
+    /// # Constraints
     ///
     /// Panics if `bucket >= num_buckets` or `slot >= bucket_size`.
+    ///
+    /// # Returns
+    ///
+    /// The stored fingerprint (`0` if the slot is empty).
+    ///
+    /// # Complexity
+    ///
+    /// `O(⌈fingerprint_bits / plaintext_bits⌉)` cell reads.
     pub(crate) fn read_fingerprint(&self, bucket: u32, slot: u32) -> u32 {
         self.assert_in_range(bucket, slot);
         self.read_bits(self.slot_bit_offset(bucket, slot), self.fingerprint_bits)
     }
 
-    /// Write `fingerprint` into the cell-stream at `(bucket, slot)`.
+    /// Overwrite the fingerprint at `(bucket, slot)`.
     ///
-    /// # Panics
+    /// # Arguments
     ///
-    /// Panics if `bucket >= num_buckets` or `slot >= bucket_size`.
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `slot`   — slot index within the bucket, `< bucket_size`.
+    /// - `fp`     — new fingerprint (`0` marks the slot empty).
+    ///
+    /// # Constraints
+    ///
+    /// Panics if `bucket >= num_buckets` or `slot >= bucket_size`. The value
+    /// portion of the slot is **not** touched.
+    ///
+    /// # Complexity
+    ///
+    /// `O(⌈fingerprint_bits / plaintext_bits⌉)` cell read-modify-writes.
     pub(crate) fn write_fingerprint(&mut self, bucket: u32, slot: u32, fp: u32) {
         self.assert_in_range(bucket, slot);
         self.write_bits(self.slot_bit_offset(bucket, slot), self.fingerprint_bits, fp);
     }
 
-    /// Read `value_size_in_cells()` cells from `(bucket, slot)` into `out`.
+    /// Read all value cells of `(bucket, slot)` into `out`.
     ///
-    /// `out` must have length `value_size_in_cells()`.
+    /// # Purpose
     ///
-    /// # Panics
+    /// Zero-allocation reader used by the streaming `CuckooKVStore::get_into`
+    /// path; the caller owns `out`.
+    ///
+    /// # Arguments
+    ///
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `slot`   — slot index within the bucket, `< bucket_size`.
+    /// - `out`    — destination slice; one entry per value cell. Each entry
+    ///   is masked to its tail-bit width (the last cell may be ragged).
+    ///
+    /// # Constraints
     ///
     /// Panics if `bucket >= num_buckets`, `slot >= bucket_size`, or
     /// `out.len() != value_size_in_cells()`.
+    ///
+    /// # Complexity
+    ///
+    /// `O(value_size_in_cells())` cell reads.
     pub(crate) fn read_value(&self, bucket: u32, slot: u32, out: &mut [u32]) {
         self.assert_in_range(bucket, slot);
         let n_cells = self.value_size_in_cells();
@@ -332,15 +416,25 @@ impl FingerprintValueTable {
         }
     }
 
-    /// Write `value` cells into `(bucket, slot)`, starting at bit offset `fingerprint_bits`.
+    /// Overwrite the value cells of `(bucket, slot)`.
     ///
-    /// `value` must have length `value_size_in_cells()`. Input cells are masked to
-    /// `plaintext_bits` low bits before writing.
+    /// # Arguments
     ///
-    /// # Panics
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `slot`   — slot index within the bucket, `< bucket_size`.
+    /// - `value`  — `value_size_in_cells()` cells; each is masked to its
+    ///   tail-bit width before write so stray high bits never escape into
+    ///   the cell stream.
+    ///
+    /// # Constraints
     ///
     /// Panics if `bucket >= num_buckets`, `slot >= bucket_size`, or
-    /// `value.len() != value_size_in_cells()`.
+    /// `value.len() != value_size_in_cells()`. The fingerprint portion of the
+    /// slot is **not** touched.
+    ///
+    /// # Complexity
+    ///
+    /// `O(value_size_in_cells())` cell read-modify-writes.
     pub(crate) fn write_value(&mut self, bucket: u32, slot: u32, value: &[u32]) {
         self.assert_in_range(bucket, slot);
         let n_cells = self.value_size_in_cells();
@@ -362,48 +456,112 @@ impl FingerprintValueTable {
 
     /// Write `fingerprint ‖ value` into `(bucket, slot)` in one call.
     ///
-    /// Equivalent to `write_fingerprint` followed by `write_value`, but avoids
-    /// a second bounds check.
+    /// # Purpose
     ///
-    /// # Panics
+    /// Convenience wrapper for the common "drop a complete entry into a
+    /// slot" path, used by both `insert` and the cuckoo kick chain.
+    ///
+    /// # Arguments
+    ///
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `slot`   — slot index within the bucket, `< bucket_size`.
+    /// - `fp`     — fingerprint (non-zero for occupied slots).
+    /// - `value`  — `value_size_in_cells()` cells.
+    ///
+    /// # Constraints
     ///
     /// Panics if `bucket >= num_buckets`, `slot >= bucket_size`, or
     /// `value.len() != value_size_in_cells()`.
+    ///
+    /// # Rationale
+    ///
+    /// Equivalent to [`write_fingerprint`](Self::write_fingerprint) followed
+    /// by [`write_value`](Self::write_value), but inlined to avoid a second
+    /// bounds check.
+    ///
+    /// # Complexity
+    ///
+    /// `O(cells_per_slot)` cell read-modify-writes.
     pub(crate) fn write(&mut self, bucket: u32, slot: u32, fp: u32, value: &[u32]) {
         self.write_fingerprint(bucket, slot, fp);
         self.write_value(bucket, slot, value);
     }
 
-    /// Return `true` if `fingerprint` is present in any slot of `bucket`.
+    /// Test whether `fp` is present in any slot of `bucket`.
     ///
-    /// `fingerprint == 0` is allowed (matches empty slots).
+    /// # Arguments
     ///
-    /// # Panics
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `fp`     — fingerprint to probe. `fp == 0` is allowed and matches
+    ///   any empty slot (the caller must filter out the empty case if that
+    ///   is undesirable).
+    ///
+    /// # Constraints
     ///
     /// Panics if `bucket >= num_buckets`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if some slot in `bucket` has fingerprint `fp`, else `false`.
+    ///
+    /// # Complexity
+    ///
+    /// `O(bucket_size · ⌈fingerprint_bits / plaintext_bits⌉)` cell reads.
     pub(crate) fn contain(&self, bucket: u32, fp: u32) -> bool {
         (0..self.bucket_size).any(|s| self.read_fingerprint(bucket, s) == fp)
     }
 
-    /// Return the slot index of `fingerprint` within `bucket`, or `None` if absent.
+    /// Locate the first slot in `bucket` carrying fingerprint `fp`.
     ///
-    /// `fingerprint == 0` is allowed (matches empty slots).
+    /// # Arguments
     ///
-    /// # Panics
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `fp`     — fingerprint to locate. `fp == 0` matches empty slots.
+    ///
+    /// # Constraints
     ///
     /// Panics if `bucket >= num_buckets`.
+    ///
+    /// # Returns
+    ///
+    /// `Some(slot)` for the first matching slot in scan order, else `None`.
+    ///
+    /// # Complexity
+    ///
+    /// `O(bucket_size · ⌈fingerprint_bits / plaintext_bits⌉)` worst case;
+    /// short-circuits on first match.
     pub(crate) fn find(&self, bucket: u32, fp: u32) -> Option<u32> {
         (0..self.bucket_size).find(|&s| self.read_fingerprint(bucket, s) == fp)
     }
 
     /// Insert `fingerprint ‖ value` into the first empty slot of `bucket`.
     ///
-    /// Returns `Some(slot)` on success, `None` if all slots are occupied.
+    /// # Purpose
     ///
-    /// # Panics
+    /// Direct insertion — does **not** perform cuckoo kicking. The caller
+    /// (`CuckooKVStore::insert`) drives the kick chain when this returns
+    /// `None`.
     ///
-    /// Panics if `bucket >= num_buckets`, `fingerprint == 0`, or
+    /// # Arguments
+    ///
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `fp`     — fingerprint to write. Must be non-zero.
+    /// - `value`  — value cells; length must equal `value_size_in_cells()`.
+    ///
+    /// # Constraints
+    ///
+    /// Panics if `bucket >= num_buckets`, `fp == 0`, or
     /// `value.len() != value_size_in_cells()`.
+    ///
+    /// # Returns
+    ///
+    /// `Some(slot)` if an empty slot was found and written, `None` if every
+    /// slot in `bucket` is already occupied.
+    ///
+    /// # Complexity
+    ///
+    /// `O(bucket_size + cells_per_slot)` — scan for empty slot, then one
+    /// `write`.
     pub(crate) fn insert(&mut self, bucket: u32, fp: u32, value: &[u32]) -> Option<u32> {
         assert!(fp != 0, "fingerprint cannot be zero");
         assert_eq!(
@@ -421,14 +579,30 @@ impl FingerprintValueTable {
         None
     }
 
-    /// Delete the first occurrence of `fingerprint` from `bucket` by zeroing its slot.
+    /// Delete the first occurrence of `fp` in `bucket` and zero its slot.
     ///
-    /// Zeros both fingerprint and value bits so subsequent `read_value` on the empty slot
-    /// returns all zeros.
+    /// # Purpose
     ///
-    /// # Panics
+    /// Removes both the fingerprint and value bits so a subsequent
+    /// [`read_value`](Self::read_value) on the now-empty slot returns all
+    /// zeros — required for PIR matvec correctness on freed slots.
     ///
-    /// Panics if `bucket >= num_buckets` or `fingerprint == 0`.
+    /// # Arguments
+    ///
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `fp`     — fingerprint to delete. Must be non-zero.
+    ///
+    /// # Constraints
+    ///
+    /// Panics if `bucket >= num_buckets` or `fp == 0`.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a matching slot was found and cleared, `false` otherwise.
+    ///
+    /// # Complexity
+    ///
+    /// `O(bucket_size + cells_per_slot)` on hit, `O(bucket_size)` on miss.
     #[allow(dead_code)]
     pub(crate) fn delete(&mut self, bucket: u32, fp: u32) -> bool {
         assert!(fp != 0, "fingerprint cannot be zero");
@@ -447,13 +621,38 @@ impl FingerprintValueTable {
 
     /// Reconstruct a table from a previously-snapshotted cell array.
     ///
-    /// Validates that `cells.len() == expected size_in_cells` and that every cell
-    /// satisfies the ChalametPIR high-bits-zero invariant. O(N) cost; designed for
-    /// snapshot-restore only, not the hot path.
+    /// # Purpose
     ///
-    /// # Errors
+    /// Snapshot-restore path used by `CuckooKVStore::from_cells`: lets a
+    /// caller persist `as_cells().to_vec()`, then later rebuild the table
+    /// without replaying every insert.
     ///
-    /// Returns a static error string on length mismatch or invariant violation.
+    /// # Arguments
+    ///
+    /// - `cells`            — flat cell array previously obtained from
+    ///   [`as_cells`](Self::as_cells); length must equal
+    ///   `num_buckets · bucket_size · cells_per_slot`.
+    /// - `num_buckets`      — table shape (must match the snapshot).
+    /// - `bucket_size`      — table shape (must match the snapshot).
+    /// - `fingerprint_bits` — table shape (must match the snapshot).
+    /// - `value_bits`       — table shape (must match the snapshot).
+    /// - `plaintext_bits`   — table shape (must match the snapshot).
+    ///
+    /// # Constraints
+    ///
+    /// Validates `cells.len()` and the high-bits-zero invariant
+    /// (`cell & ~((1 << plaintext_bits) - 1) == 0`) on every cell. Cheap
+    /// integrity guard against a corrupt or wrong-shape snapshot.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(table)` on success, `Err(&'static str)` on length mismatch or
+    /// invariant violation.
+    ///
+    /// # Complexity
+    ///
+    /// `O(cells.len())` — a single linear scan; designed for snapshot-restore
+    /// only, not the hot path.
     pub(crate) fn from_cells(
         cells: Vec<u32>,
         num_buckets: u32,
@@ -487,10 +686,29 @@ impl FingerprintValueTable {
         })
     }
 
-    /// Read `out.len()` consecutive value cells starting at `cell_start` within `(bucket, slot)`.
+    /// Read a contiguous chunk of value cells starting at intra-slot index
+    /// `cell_start`.
     ///
-    /// Each output cell carries `min(plaintext_bits, value_bits − cell_start·plaintext_bits)` bits.
-    /// Used by the streaming `get_into` path to avoid a full `Vec` allocation.
+    /// # Purpose
+    ///
+    /// Streaming primitive behind `CuckooKVStore::get_into`: lets the caller
+    /// pull the value out one chunk at a time into a caller-owned buffer
+    /// (no heap allocation per call).
+    ///
+    /// # Arguments
+    ///
+    /// - `bucket`     — bucket index, `< num_buckets`.
+    /// - `slot`       — slot index within the bucket, `< bucket_size`.
+    /// - `cell_start` — intra-slot cell index (counting from the start of
+    ///   the value portion, i.e. cell `0` is the cell containing
+    ///   `value_bits[0..plaintext_bits]`).
+    /// - `out`        — destination slice, written cell-by-cell. Each
+    ///   produced cell holds
+    ///   `min(plaintext_bits, value_bits − cell_start · plaintext_bits)` bits.
+    ///
+    /// # Complexity
+    ///
+    /// `O(out.len())` cell reads.
     pub(crate) fn read_value_cells_chunk(
         &self,
         bucket: u32,
@@ -507,9 +725,28 @@ impl FingerprintValueTable {
         }
     }
 
-    /// Read all value cells from `(bucket, slot)` into a heap-allocated boxed slice.
+    /// Read every value cell of `(bucket, slot)` into a freshly allocated
+    /// boxed slice.
     ///
-    /// One allocation per call. Used by the mutation log to snapshot old/new cell state.
+    /// # Purpose
+    ///
+    /// Used by the mutation log to capture the *old* cell state of a slot
+    /// before a mutation overwrites it.
+    ///
+    /// # Arguments
+    ///
+    /// - `bucket` — bucket index, `< num_buckets`.
+    /// - `slot`   — slot index within the bucket, `< bucket_size`.
+    ///
+    /// # Returns
+    ///
+    /// `Box<[u32]>` of length `value_size_in_cells()`. One allocation per
+    /// call; mutation-log frequency is amortised by the
+    /// `enable_mutation_log` opt-in.
+    ///
+    /// # Complexity
+    ///
+    /// `O(value_size_in_cells())` cell reads + one allocation.
     pub(crate) fn read_value_to_box(&self, bucket: u32, slot: u32) -> Box<[u32]> {
         let n = self.value_size_in_cells() as usize;
         let mut buf = vec![0u32; n];
@@ -517,13 +754,32 @@ impl FingerprintValueTable {
         buf.into_boxed_slice()
     }
 
-    /// Update the value for the first slot in `bucket` matching `fingerprint`.
+    /// Replace the value of the first slot in `bucket` matching `fp`.
     ///
-    /// Returns `true` if found and updated, `false` if `fingerprint` was not in `bucket`.
+    /// # Purpose
     ///
-    /// # Panics
+    /// Direct in-place update path for `CuckooKVStore::update`; does **not**
+    /// touch the fingerprint or move the entry.
+    ///
+    /// # Arguments
+    ///
+    /// - `bucket`    — bucket index, `< num_buckets`.
+    /// - `fp`        — fingerprint of the target entry.
+    /// - `new_value` — replacement value cells; length must equal
+    ///   `value_size_in_cells()`.
+    ///
+    /// # Constraints
     ///
     /// Panics if `new_value.len() != value_size_in_cells()`.
+    ///
+    /// # Returns
+    ///
+    /// `true` on a successful update, `false` if `fp` was not in `bucket`.
+    ///
+    /// # Complexity
+    ///
+    /// `O(bucket_size + value_size_in_cells())` on hit, `O(bucket_size)` on
+    /// miss.
     #[allow(dead_code)]
     pub(crate) fn update_value(&mut self, bucket: u32, fp: u32, new_value: &[u32]) -> bool {
         assert_eq!(
@@ -542,6 +798,21 @@ impl FingerprintValueTable {
 
 #[cfg(test)]
 mod tests {
+    //! Unit tests for [`FingerprintValueTable`].
+    //!
+    //! Covers four invariants this storage layer must hold for the PIR
+    //! matvec to remain correct:
+    //!
+    //! 1. **Roundtrip** — `write(fp, v); read_fingerprint() == fp;
+    //!    read_value() == v` for every `(plaintext_bits, fingerprint_bits,
+    //!    value_bits)` combination the IKPIR config matrix uses.
+    //! 2. **High-bit-zero** — after any write, every cell of `as_cells()`
+    //!    has zero in its top `(32 − plaintext_bits)` bits.
+    //! 3. **Empty-slot semantics** — fresh tables have all-zero fingerprints;
+    //!    `delete` returns to that state.
+    //! 4. **Panic contracts** — every bounds / length / non-zero-fp
+    //!    precondition is checked.
+
     use super::*;
 
     fn make_fvt(nb: u32, bs: u32, fb: u32, vb: u32, pb: u32) -> FingerprintValueTable {
@@ -589,6 +860,9 @@ mod tests {
         }
     }
 
+    /// Sweeps a representative cross-product of `(plaintext_bits,
+    /// fingerprint_bits, value_bits)` and asserts roundtrip + high-bit-zero
+    /// after every write. The cross-product covers the IKPIR config matrix.
     #[test]
     fn cell_api_roundtrip_param() {
         for &pb in &[8u32, 9, 10, 12, 16, 32] {
@@ -601,6 +875,7 @@ mod tests {
         }
     }
 
+    /// A freshly constructed table has all slots empty (`fingerprint == 0`).
     #[test]
     fn empty_slot_semantics() {
         let fvt = make_fvt(4, 4, 12, 8, 8);
@@ -612,6 +887,8 @@ mod tests {
         }
     }
 
+    /// `insert` followed by `find` returns the slot index; an absent
+    /// fingerprint returns `None`.
     #[test]
     fn insert_then_find() {
         let mut fvt = make_fvt(4, 4, 12, 8, 8);
@@ -621,6 +898,8 @@ mod tests {
         assert_eq!(fvt.find(0, 0x99), None);
     }
 
+    /// `insert` into a fully occupied bucket returns `None` (caller is
+    /// expected to drive the cuckoo kick chain at the `CuckooKVStore` level).
     #[test]
     fn insert_into_full_bucket_returns_none() {
         let mut fvt = make_fvt(4, 2, 12, 8, 8);
@@ -630,6 +909,8 @@ mod tests {
         assert_eq!(fvt.insert(0, 3, &v), None); // full
     }
 
+    /// `delete` zeros both the fingerprint and the value bits — important for
+    /// PIR matvec correctness on freed slots.
     #[test]
     fn delete_clears_slot() {
         let mut fvt = make_fvt(4, 4, 12, 8, 8);
@@ -642,6 +923,8 @@ mod tests {
         assert_eq!(out[0], 0);
     }
 
+    /// `update_value` overwrites only the value cells, leaving the
+    /// fingerprint unchanged.
     #[test]
     fn update_value_preserves_fingerprint() {
         let mut fvt = make_fvt(4, 4, 12, 8, 8);
@@ -655,6 +938,9 @@ mod tests {
         assert_eq!(out[0], 0xBB);
     }
 
+    /// The high-bit-zero invariant survives a representative random write
+    /// pattern at `plaintext_bits = 9` (a value chosen because it forces
+    /// straddling and ragged-tail bits in every slot).
     #[test]
     fn as_cells_high_bit_invariant_random_writes() {
         let pb = 9u32;
@@ -673,6 +959,8 @@ mod tests {
         }
     }
 
+    /// `as_cells().len() == num_buckets · bucket_size · cells_per_slot` —
+    /// pins the shape contract the PIR matvec relies on.
     #[test]
     fn as_cells_dimensions() {
         let nb = 16u32;
@@ -683,6 +971,8 @@ mod tests {
         assert_eq!(fvt.as_cells().len(), expected);
     }
 
+    /// `read_bits` / `write_bits` correctly handle a fingerprint that
+    /// straddles a cell boundary (`plaintext_bits=9`, `fingerprint_bits=12`).
     #[test]
     fn cell_boundary_straddle_fp() {
         // pb=9, fp_bits=12 — fp straddles cells 0 and 1
@@ -696,6 +986,8 @@ mod tests {
         }
     }
 
+    /// `read_bits` / `write_bits` correctly handle a value that straddles a
+    /// cell boundary (`plaintext_bits=10`, `value_bits=14`).
     #[test]
     fn cell_boundary_straddle_value() {
         // pb=10, fp_bits=4, vb=14 — value straddles two cells
@@ -711,6 +1003,8 @@ mod tests {
 
     // ── Wide value (vb=1024) ──────────────────────────────────────────────────
 
+    /// Wide values (`value_bits = 1024`) at `plaintext_bits = 8` roundtrip
+    /// without truncation. Pins the byte-aligned hot path.
     #[test]
     fn wide_value_roundtrip_at_pb_8_vb_1024() {
         let pb = 8u32;
@@ -724,6 +1018,9 @@ mod tests {
         assert_eq!(out, value);
     }
 
+    /// Wide values at `plaintext_bits = 9` roundtrip — verifies ragged-tail
+    /// masking in the last value cell and the high-bit-zero invariant
+    /// simultaneously.
     #[test]
     fn wide_value_roundtrip_at_pb_9_vb_1024() {
         let pb = 9u32;
@@ -751,6 +1048,8 @@ mod tests {
 
     // ── Panic tests ───────────────────────────────────────────────────────────
 
+    /// `insert` rejects a zero fingerprint (would collide with the
+    /// empty-slot sentinel).
     #[test]
     #[should_panic(expected = "fingerprint cannot be zero")]
     fn insert_panics_on_zero_fp() {
@@ -758,6 +1057,7 @@ mod tests {
         let _ = fvt.insert(0, 0, &[0u32]);
     }
 
+    /// `delete` rejects a zero fingerprint (matches the `insert` contract).
     #[test]
     #[should_panic(expected = "fingerprint cannot be zero")]
     fn delete_panics_on_zero_fp() {
@@ -765,6 +1065,7 @@ mod tests {
         let _ = fvt.delete(0, 0);
     }
 
+    /// `read_fingerprint` panics on out-of-range bucket index.
     #[test]
     #[should_panic(expected = "out of range")]
     fn read_fingerprint_panics_on_oob_bucket() {
@@ -772,6 +1073,7 @@ mod tests {
         let _ = fvt.read_fingerprint(4, 0);
     }
 
+    /// `read_fingerprint` panics on out-of-range slot index.
     #[test]
     #[should_panic(expected = "out of range")]
     fn read_fingerprint_panics_on_oob_slot() {
@@ -779,6 +1081,7 @@ mod tests {
         let _ = fvt.read_fingerprint(0, 4);
     }
 
+    /// `read_value` panics if the destination slice has the wrong length.
     #[test]
     #[should_panic(expected = "out length must equal value_size_in_cells")]
     fn read_value_panics_on_wrong_length() {
@@ -787,6 +1090,7 @@ mod tests {
         fvt.read_value(0, 0, &mut out);
     }
 
+    /// `write_value` panics if the source slice has the wrong length.
     #[test]
     #[should_panic(expected = "value length must equal value_size_in_cells")]
     fn write_value_panics_on_wrong_length() {

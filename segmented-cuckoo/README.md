@@ -66,18 +66,20 @@ sharing identical insert/lookup/delete logic and differing only in index computa
 
 ```
 src/
-  lib.rs             -- public API, type aliases for all 6 filter types and KV stores
-  filter.rs          -- CuckooFilter<S>: generic insert/lookup/delete with cuckoo kicking
-  scheme.rs          -- IndexScheme trait + 6 concrete scheme structs
-  hash.rs            -- xxHash3 item hashing, fingerprint-hash functions, index reconstruction
-  data_layout.rs     -- DataLayout, FingerprintTable, FingerprintValueTable: bit-packed slot storage
-  store.rs           -- CuckooKVStore<S>: fingerprint-and-value KV store with kicking + rollback
-  util.rs            -- next_power_of_2, power-of-3 and power-of-4 helpers
+  lib.rs                     -- public API, type aliases for all 6 filter types and the 3 segmented KV stores
+  filter.rs                  -- CuckooFilter<S>: generic insert/lookup/delete with cuckoo kicking
+  scheme.rs                  -- IndexScheme trait + 6 concrete scheme structs + SchemeMeta marker trait
+  hash.rs                    -- xxHash3 item hashing, fingerprint-hash functions, index reconstruction
+  fingerprint_table.rs       -- FingerprintTable: bit-packed Vec<u8> slot storage for the filter
+  fingerprint_value_table.rs -- FingerprintValueTable: cell-based Vec<u32> slot storage for the KV store (high-bits-zero invariant)
+  store.rs                   -- CuckooKVStore<S>: fingerprint-and-value KV store with kicking + rollback + opt-in mutation log
+  util.rs                    -- next_power_of_2, power-of-3 and power-of-4 helpers
 
 examples/
-  basic_usage.rs          -- demo of both 2-ary filter types
-  kv_store_basic_usage.rs -- demo of Segmented2aryCuckooKVStore insert/get/delete/update
-  load_factor.rs          -- fill filters to capacity and print max load factor
+  basic_usage.rs            -- demo of all 6 filter types (Standard/Segmented × 2/3/4-ary)
+  kv_store_basic_usage.rs   -- demo of all 3 segmented KV stores (insert/get/get_into/update/delete)
+  load_factor.rs            -- fill filters to capacity and print max load factor
+  pir_plaintext_recovery.rs -- IKPIR client-side recovery geometry without LWE
 
 benches/             -- standalone benchmark binaries (no clap; write CSV to results/)
   load_factor.rs                -- max load factor (sweeps max_kicks ∈ {500..5000})
@@ -89,7 +91,7 @@ benches/             -- standalone benchmark binaries (no clap; write CSV to res
   kv_store_insert_throughput.rs -- KV-store insert MOps/s
   kv_store_lookup_throughput.rs -- KV-store lookup MOps/s (50/50 hit/miss)
   kv_store_delete_throughput.rs -- KV-store delete MOps/s
-scripts/plot.py      -- matplotlib charts from CSV results (10 plot functions)
+scripts/plot.py      -- matplotlib charts from CSV results
 results/             -- generated CSV data and plots (gitignored)
 ```
 
@@ -123,15 +125,15 @@ cargo run --example load_factor      # fill to capacity, print load factors
 **Library usage:**
 
 ```rust
-use segmented_cuckoo::SegmentedCuckooFilter;
+use segmented_cuckoo::Segmented2aryCuckooFilter;
 
-let mut f = SegmentedCuckooFilter::new(1024, 4, 12).unwrap();
+let mut f = Segmented2aryCuckooFilter::new(1024, 4, 12).unwrap();
 f.insert("hello").unwrap();
 assert!(f.contain("hello"));
-f.delete("hello");
+f.delete("hello").unwrap();
 assert!(!f.contain("hello"));
 
-// Auto-size from expected item count
+// Auto-size from expected item count.
 use segmented_cuckoo::Standard3aryCuckooFilter;
 let mut f = Standard3aryCuckooFilter::from_num_items(100_000, 4, 12).unwrap();
 f.insert(b"item".as_ref()).unwrap();
@@ -139,10 +141,16 @@ f.insert(b"item".as_ref()).unwrap();
 
 **KV-store usage:**
 
+The KV-store constructor takes **five** parameters: the four filter-shape
+parameters plus `plaintext_bits` (PIR plaintext cell width, 1–32). Use
+`plaintext_bits = 8` for byte-aligned values (recommended; byte↔cell
+becomes a no-op when `value_bits % 8 == 0`).
+
 ```rust
 use segmented_cuckoo::Segmented2aryCuckooKVStore;
 
-let mut store = Segmented2aryCuckooKVStore::new(64, 4, 12, 64).unwrap();
+// num_buckets=64, bucket_size=4, fingerprint_bits=12, value_bits=64, plaintext_bits=8.
+let mut store = Segmented2aryCuckooKVStore::new(64, 4, 12, 64, 8).unwrap();
 store.insert("hello", &[0u8; 8]).unwrap();
 assert_eq!(store.get("hello"), Some(vec![0u8; 8]));
 
@@ -441,7 +449,7 @@ for b in load_factor insert_throughput lookup_throughput delete_throughput \
 done
 
 # Render every plot at once (one-time pip setup):
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r scripts/requirements.txt
 python scripts/plot.py                            # all available plots → results/plots/
 python scripts/plot.py --list                     # list plot functions
@@ -494,11 +502,11 @@ Standard 3-ary values are averaged over n ∈ {3^8..3^11}; segmented 3-ary over 
   well-known penalty of partial-key hashing vs. truly random hashing -- the xord-based
   offset has only `2^f` (or `3^f` for xor3) possible values rather than `n`.
 
-![Load factor for all configurations](images/load_factor_all.png)
+![Load factor for all configurations](results/plots/load_factor_all.png)
 
 *Figure: Maximum load factor across all 6 filter variants. Blue = standard, orange = segmented. Higher arity and larger b both push load factor toward 1.0.*
 
-![Load factor for b=2,3,4](images/load_factor_b234.png)
+![Load factor for b=2,3,4](results/plots/load_factor_b234.png)
 
 ### Insert throughput
 
@@ -530,9 +538,9 @@ For 2-ary, segmented is faster in 3 of 4 configurations. For 4-ary, standard is 
 of 4 configurations. The locality advantage of segmented (eviction chains stay within one
 segment) appears to benefit 2-ary more than 4-ary at these sizes.
 
-![Insert throughput, 2-ary](images/insert_throughput_2ary.png)
-![Insert throughput, 3-ary](images/insert_throughput_3ary.png)
-![Insert throughput, 4-ary](images/insert_throughput_4ary.png)
+![Insert throughput, 2-ary](results/plots/insert_throughput_2ary.png)
+![Insert throughput, 3-ary](results/plots/insert_throughput_3ary.png)
+![Insert throughput, 4-ary](results/plots/insert_throughput_4ary.png)
 
 ### Lookup throughput
 
@@ -555,8 +563,8 @@ differ between standard and segmented.
 For 2-ary and 4-ary at matched n, differences range from −9.3% to +51%. Throughput decreases
 with higher arity (more buckets to probe) and larger b (more slots to scan per bucket).
 
-![Lookup throughput, n=2^18 b=4](images/lookup_throughput_n262144_b4.png)
-![Lookup throughput, n=2^16 b=4](images/lookup_throughput_n65536_b4.png)
+![Lookup throughput, n=2^18 b=4](results/plots/lookup_throughput_n262144_b4.png)
+![Lookup throughput, n=2^16 b=4](results/plots/lookup_throughput_n65536_b4.png)
 
 ### Delete throughput
 
@@ -585,9 +593,9 @@ For 2-ary and 4-ary at matched n, differences are small (−8% to +13%) with no 
 winner. Delete is algorithmically similar to lookup (scan candidate buckets, clear match),
 so eviction locality does not affect its cost.
 
-![Delete throughput, 2-ary](images/delete_throughput_2ary.png)
-![Delete throughput, 3-ary](images/delete_throughput_3ary.png)
-![Delete throughput, 4-ary](images/delete_throughput_4ary.png)
+![Delete throughput, 2-ary](results/plots/delete_throughput_2ary.png)
+![Delete throughput, 3-ary](results/plots/delete_throughput_3ary.png)
+![Delete throughput, 4-ary](results/plots/delete_throughput_4ary.png)
 
 ### False-positive rate
 
@@ -608,18 +616,18 @@ indexing strategy (standard vs. segmented) has no measurable effect on false-pos
 as expected: FPR depends only on the fingerprint bit width and bucket size, not on how
 indices are computed.
 
-![FPR comparison across arity and b](images/fpr_comparison.png)
+![FPR comparison across arity and b](results/plots/fpr_comparison.png)
 
 *Figure: False-positive rate vs. fingerprint bits. The dashed line shows the theoretical bound d·b/2^f (where d is the arity). All 6 filter variants closely follow the bound.*
 
 ### Eviction chain statistics
 
-![Eviction chain statistics, 2-ary](images/eviction_2ary.png)
-![Eviction chain statistics, 3-ary](images/eviction_3ary.png)
-![Eviction chain statistics, 4-ary](images/eviction_4ary.png)
-![Mean kicks per insert, 2-ary](images/eviction_mean_kicks_2ary.png)
-![Mean kicks per insert, 3-ary](images/eviction_mean_kicks_3ary.png)
-![Mean kicks per insert, 4-ary](images/eviction_mean_kicks_4ary.png)
+![Eviction chain statistics, 2-ary](results/plots/eviction_2ary.png)
+![Eviction chain statistics, 3-ary](results/plots/eviction_3ary.png)
+![Eviction chain statistics, 4-ary](results/plots/eviction_4ary.png)
+![Mean kicks per insert, 2-ary](results/plots/eviction_mean_kicks_2ary.png)
+![Mean kicks per insert, 3-ary](results/plots/eviction_mean_kicks_3ary.png)
+![Mean kicks per insert, 4-ary](results/plots/eviction_mean_kicks_4ary.png)
 
 ---
 

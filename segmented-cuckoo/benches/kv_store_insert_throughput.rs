@@ -1,14 +1,29 @@
-//! **Intent:** Measure raw KV insert speed for each segmented variant across
-//! `arity`, `bucket_size`, and `value_bits`.
+//! **Intent:** Measure raw KV insert speed for each segmented variant
+//! across `arity`, `bucket_size`, and `value_bits`.
 //!
-//! **Method:** Insert sequential keys with a deterministic value until `TableFull`,
-//! timing the full loop. 3 warmup + 10 timed trials.
+//! **Method:** Insert sequential keys carrying a deterministic value
+//! until `TableFull`, timing the full loop. 3 warmup + 10 timed trials.
 //!
-//! **Parameters:** arity ∈ {2,3,4}, bucket_size ∈ {2,4}, value_bits ∈ {8, 64, 256, 1024}.
-//! fingerprint_bits = 12. num_buckets sized via from_num_items at a target capacity.
+//! **Arguments (CLI):** none — this bench sweeps a built-in
+//! cross-product (see constants below). One row per `(arity, bucket_size,
+//! value_bits)` is appended per run.
+//!
+//! **Design rationale:** "Insert until full" is the fair comparison
+//! method here for the same reason as `insert_throughput`: it puts every
+//! `(arity, bucket_size, value_bits)` configuration through its natural
+//! load-factor distribution, so the throughput number reflects the
+//! steady-state cost the IKPIR server will actually pay rather than a
+//! cherry-picked sparse-table regime. `value_bits` sweep also exposes
+//! cell-packing cost: at `value_bits = 1024` the `pack_value_bytes_to_cells`
+//! path dominates `insert`.
+//!
+//! **Parameters:** arity ∈ {2, 3, 4}, bucket_size ∈ {2, 4}, value_bits ∈
+//! {8, 64, 256, 1024}. `fingerprint_bits = 12`, `plaintext_bits = 8`.
+//! `num_buckets` sized via `from_num_items` at `2^16` target items.
 //!
 //! **Output:** `results/kv_store_insert_throughput.csv`
-//! Columns: scheme, arity, num_buckets, bucket_size, value_bits, mean_inserted, mean_lf, mean_mops
+//! Columns: scheme, arity, num_buckets, bucket_size, value_bits,
+//! mean_inserted, mean_lf, mean_mops
 
 mod helpers;
 

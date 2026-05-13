@@ -1,3 +1,24 @@
+//! Minimal usage demo for every `CuckooFilter` variant.
+//!
+//! # Purpose
+//!
+//! Sanity-check / first-touch example: shows `insert` / `contain` /
+//! `delete` on all six filter aliases (Standard / Segmented × 2/3/4-ary)
+//! using the same input set so the reader can compare outputs side by
+//! side.
+//!
+//! # Run
+//!
+//! ```text
+//! cargo run -p segmented-cuckoo --example basic_usage
+//! ```
+//!
+//! # What to look for
+//!
+//! - The same keys yield the same `contain` answers across all six
+//!   variants (false-positive aside).
+//! - `delete` is exact for keys that were genuinely inserted.
+
 use segmented_cuckoo::{
     Segmented3aryCuckooFilter, Segmented4aryCuckooFilter, Segmented2aryCuckooFilter,
     Standard3aryCuckooFilter, Standard4aryCuckooFilter, Standard2aryCuckooFilter,

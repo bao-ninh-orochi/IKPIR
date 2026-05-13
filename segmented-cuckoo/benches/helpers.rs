@@ -1,9 +1,33 @@
+//! Shared bench helpers for the `segmented-cuckoo` benches.
+//!
+//! # Purpose
+//!
+//! Two utilities every bench in this crate needs: a writer for the
+//! `results/*.csv` files this crate's benches emit, and a `Stats` /
+//! `compute_stats` pair for summarising trial samples.
+//!
+//! # Related files
+//!
+//! - `benches/insert_throughput.rs` and
+//!   `benches/kv_store_insert_throughput.rs` — sole consumers.
+
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Create a CSV writer at `results/{path}`, ensuring parent directories exist.
-/// Writes the header as the first line.
+/// Create a CSV writer at `results/{path}` and emit `header` as the first
+/// line.
+///
+/// # Arguments
+///
+/// - `path`   — file name relative to `results/` (parent dirs are created
+///   if missing).
+/// - `header` — comma-separated column header line.
+///
+/// # Returns
+///
+/// A `BufWriter<File>` positioned just after the header line; the caller
+/// appends one data row per `writeln!` call.
 pub fn csv_writer(path: &str, header: &str) -> BufWriter<fs::File> {
     let full_path = format!("results/{}", path);
     if let Some(parent) = Path::new(&full_path).parent() {
@@ -15,19 +39,36 @@ pub fn csv_writer(path: &str, header: &str) -> BufWriter<fs::File> {
     w
 }
 
-/// Aggregated statistics over a sample of f64 values.
+/// Aggregated statistics over a sample of `f64` values.
+///
+/// Returned by [`compute_stats`]; the four fields match the CSV columns
+/// the benches emit (`mean`, `min`, `max`, `stddev`).
 #[allow(dead_code)]
 pub struct Stats {
+    /// Arithmetic mean of the sample.
     pub mean: f64,
+    /// Smallest observed value.
     pub min: f64,
+    /// Largest observed value.
     pub max: f64,
+    /// Population standard deviation (`n` divisor, not `n-1`).
     pub stddev: f64,
 }
 
-/// Compute mean, min, max, and population stddev over `values`.
+/// Compute `(mean, min, max, population stddev)` over `values`.
 ///
-/// # Panics
+/// # Arguments
+///
+/// - `values` — non-empty slice of trial samples.
+///
+/// # Constraints
+///
 /// Panics if `values` is empty.
+///
+/// # Returns
+///
+/// A [`Stats`] with the four aggregates. Population stddev (divisor `n`)
+/// is used so a single trial yields `stddev = 0` rather than `NaN`.
 #[allow(dead_code)]
 pub fn compute_stats(values: &[f64]) -> Stats {
     assert!(!values.is_empty(), "compute_stats: empty slice");

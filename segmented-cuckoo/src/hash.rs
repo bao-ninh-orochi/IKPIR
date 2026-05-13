@@ -187,7 +187,7 @@ pub fn fingerprint_hash3(fingerprint: u32, range: u32) -> u32 {
 /// assert_eq!(fp2, 0xFFF);
 /// ```
 ///
-/// [`FingerprintTable`]: crate::data_layout::FingerprintTable
+/// [`FingerprintTable`]: crate::fingerprint_table::FingerprintTable
 #[inline]
 pub fn extract_fingerprint(h: u64, fingerprint_bits: u32) -> u32 {
     let mask = if fingerprint_bits >= 32 {

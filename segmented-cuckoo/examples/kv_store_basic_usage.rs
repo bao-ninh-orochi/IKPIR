@@ -1,3 +1,26 @@
+//! End-to-end tour of `CuckooKVStore` for every segmented variant.
+//!
+//! # Purpose
+//!
+//! The fastest way to see what the KV layer actually does: insert,
+//! `get`, `get_into` (zero-allocation read), `update`, and `delete`
+//! exercised on all three arities. Mirrors `basic_usage.rs` (which covers
+//! the filter-only types) but for the KV store added in a later phase.
+//!
+//! # Run
+//!
+//! ```text
+//! cargo run -p segmented-cuckoo --example kv_store_basic_usage
+//! ```
+//!
+//! # What to look for
+//!
+//! - The same key calls produce identical observed behaviour across
+//!   2-ary / 3-ary / 4-ary stores — the abstraction is uniform.
+//! - `get_into` returns the value into a caller-owned buffer without a
+//!   heap allocation.
+//! - `update` mutates only the value; `delete` removes the entry.
+
 use segmented_cuckoo::{
     Segmented2aryCuckooKVStore, Segmented3aryCuckooKVStore, Segmented4aryCuckooKVStore,
 };
