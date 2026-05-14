@@ -9,16 +9,28 @@
 //!   server-side mutations unless `apply_delta` is allowed to re-patch the
 //!   queued `c` values.
 //!
-//! **Method:** Populate to `TableFull`, build the server. Each criterion
-//! sample uses a fresh client (constructed in setup, untimed). Phase B
-//! times `precompute_queries(batch)`; Phase C times `precompute_decodes()`
-//! against a Phase-B-warmed client. Two criterion bench_function labels
-//! land in `target/criterion/{preprocess_phase_b,preprocess_phase_c}/`.
+//! **Method:** Populate to `TableFull`, build the server. Each
+//! criterion sample uses a fresh client (constructed in setup,
+//! untimed). Phase B times `precompute_queries(batch)`; Phase C times
+//! `precompute_decodes()` against a Phase-B-warmed client. Two
+//! criterion `bench_function` labels land in
+//! `target/criterion/{preprocess_phase_b,preprocess_phase_c}/`.
+//!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--lwe-dim`, `--batch` (queue depth per phase
+//! call). See `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** Together with `query_throughput` and
+//! `decode_throughput`, this bench characterises the FrodoPIR Fig. 1
+//! amortisation: how much of the per-query cost has already been paid
+//! before the first query is issued? Phase B is database-independent
+//! and reusable; Phase C is database-dependent and patched in lock-step
+//! with `apply_delta`.
 //!
 //! **Output:** `results/ikpir_client_preprocess_throughput.csv`
 //! Columns: arity, num_buckets, bucket_size, value_bits, batch,
-//! mean_phase_b_sps, stddev_phase_b_sps, mean_phase_c_sps, stddev_phase_c_sps
-//! (sps = slots/sec)
+//! mean_phase_b_sps, stddev_phase_b_sps, mean_phase_c_sps,
+//! stddev_phase_c_sps (sps = slots/sec)
 
 mod helpers;
 

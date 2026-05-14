@@ -8,6 +8,17 @@
 //! in setup). The criterion HTML/JSON report lands in
 //! `target/criterion/apply_delta_throughput/`.
 //!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--load-factor`, `--batch` (deltas per timed
+//! window), `--precomputed-slots` (Phase-B/C queue depth at window
+//! start). See `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** `apply_delta` is the client steady-state
+//! cost — the throughput here determines how many mutations/sec a
+//! client can absorb before falling behind. The `precomputed_slots`
+//! axis exposes the Phase-C patching overhead: warm queues pay
+//! `O(prepared · row_deltas · (lwe_dim + n_cells))` extra per delta.
+//!
 //! **Output:** `results/ikpir_client_apply_delta_throughput.csv`
 //! Columns: arity, num_buckets, bucket_size, value_bits, batch,
 //! precomputed_slots, mean_dps, min_dps, max_dps, stddev_dps

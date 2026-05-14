@@ -88,24 +88,40 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 
 ## Benches and visualization
 
-Each crate ships `clap`-parsed benches that emit CSV under `results/`,
-mirroring `segmented-cuckoo`'s style. Each invocation runs a single config
-and appends one row to its CSV (`csv_writer` is append-aware); sweeping
-across configs is the orchestrator's job — a shell or Python wrapper that
-`rm`s the CSV first, then loops over configs.
+Each crate ships `clap`-parsed benches that emit CSV under `results/`.
+Each invocation runs a single config and appends one row to its CSV
+(`csv_writer` is append-aware); sweeping across configs is the
+orchestrator's job — `rm` the CSV first, then loop.
+
+The canonical sweep is **`./scripts/run_all.sh`**, which iterates every
+bench over a paper-derived config matrix (see `scripts/configs.sh`) and
+then renders all plots:
 
 ```bash
-# Server: setup latency, answer rate, and the headline incremental crossover
+./scripts/run_all.sh                                 # default profile, ~30–45 min
+IKPIR_BENCH_PROFILE=quick ./scripts/run_all.sh       # smaller matrix, ~5–10 min
+IKPIR_BENCH_PROFILE=full  ./scripts/run_all.sh       # adds m=2^22, ~1+ hour
+
+./scripts/run_all.sh --plot-only                     # re-plot from existing CSVs
+./scripts/run_all.sh --server-only                   # skip client benches
+./ikpir-server/scripts/run_benches.sh answer_throughput
+```
+
+Per-crate orchestrators (`<crate>/scripts/run_benches.sh`) run just that
+crate. For one-off measurements, invoke `cargo bench` directly:
+
+```bash
+# Server: setup latency, answer rate, and the headline incremental crossover.
 cargo bench -p ikpir-server --bench setup_latency
 cargo bench -p ikpir-server --bench answer_throughput
-cargo bench -p ikpir-server --bench incremental_vs_rebuild  -- --n-mutations 1024
+cargo bench -p ikpir-server --bench incremental_vs_rebuild -- --n-mutations 1024
 
-# Client: query construction, decode, and apply_delta
+# Client: query construction, decode, and apply_delta.
 cargo bench -p ikpir-client --bench query_throughput
 cargo bench -p ikpir-client --bench decode_throughput
 cargo bench -p ikpir-client --bench apply_delta_throughput
 
-# Plus the original segmented-cuckoo benches (load_factor, fpr, throughputs)
+# Filter / KV-store baselines (load_factor, fpr, throughputs).
 cargo bench -p segmented-cuckoo
 ```
 

@@ -1,9 +1,37 @@
 //! [`IkpirServer`] — the server-side state machine.
 //!
+//! # Purpose
+//!
 //! Wraps a [`segmented_cuckoo::CuckooKVStore`] in per-segment Index-PIR
-//! sub-databases. The server owns the only authoritative copy of the cell
-//! array, mutation log, and hint matrices; the client carries only
-//! preprocessing material derived from the [`ServerSetupBundle`].
+//! sub-databases and exposes the protocol surface
+//! (`setup` / `answer` / `insert` / `update` / `delete` / `full_rebuild`).
+//!
+//! # Design / architecture
+//!
+//! - **Ownership.** The server owns the only authoritative copy of the
+//!   cell array, mutation log, and hint matrices. The client carries
+//!   only preprocessing material derived from the [`ServerSetupBundle`].
+//! - **Per-segment partition.** An arity-`k` SCF splits the store into
+//!   `k` independent Index-PIR sub-databases. `answer` runs the active
+//!   backend's `server_answer` once per segment over a contiguous slice
+//!   of `self.store.as_cells()`.
+//! - **Mutation log → incremental hint.** Every successful mutation
+//!   drains the SCF mutation log, folds it via
+//!   [`fold_mutations_into_row_deltas`] into sparse per-segment row
+//!   deltas, applies them in-place via
+//!   [`IncrementalPirBackend::server_patch_hint`], and bumps the
+//!   strict-monotone `epoch`.
+//! - **`backend_config` is persistent.** Captured at construction time
+//!   and re-used by every `full_rebuild`, so hint dimensions stay stable
+//!   across the server's lifetime.
+//!
+//! # Related files
+//!
+//! - `lib.rs` — re-exports `IkpirServer` and the segmented type aliases.
+//! - `wire.rs` — the four bundle types the server emits and consumes.
+//! - `hint_patch.rs` — incremental-hint folding.
+//! - `backend/mod.rs` — `IndexPirBackend` / `IncrementalPirBackend`
+//!   trait contract.
 
 use segmented_cuckoo::{
     CuckooError, CuckooKVStore, CuckooParams, IndexScheme, SchemeMeta, Segmented2aryScheme,
@@ -15,11 +43,22 @@ use crate::hint_patch::fold_mutations_into_row_deltas;
 use crate::wire::{HintDeltaBundle, PirQueryBundle, PirResponseBundle, ServerSetupBundle};
 use crate::IkpirError;
 
-/// Server-side IKPIR engine, generic over the SCF scheme `S` and PIR backend `B`.
+/// Server-side IKPIR engine, generic over the SCF scheme `S` and PIR
+/// backend `B`.
+///
+/// # Purpose
+///
+/// Holds the authoritative server state: the `CuckooKVStore`, one
+/// `B::ServerParams` and `B::Hint` per segment, the captured
+/// `B::Config`, and the strict-monotone `epoch`. Drives the IKPIR
+/// protocol surface end-to-end.
+///
+/// # Rationale
 ///
 /// Prefer the type aliases [`Segmented2aryIkpirServer`],
 /// [`Segmented3aryIkpirServer`], and [`Segmented4aryIkpirServer`] over
-/// instantiating this type directly.
+/// instantiating this type directly — the scheme parameter is fixed at
+/// the SCF level, so users rarely need to spell it out.
 ///
 /// # Threading
 ///
@@ -35,34 +74,56 @@ pub struct IkpirServer<S: IndexScheme + SchemeMeta, B: IndexPirBackend> {
 }
 
 impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
-    /// Build a server from a populated `CuckooKVStore` and a backend config.
+    /// Build a server from a populated `CuckooKVStore` and a backend
+    /// config.
     ///
-    /// Runs `B::server_setup` once per segment to produce the initial hints,
-    /// enables the store's mutation log, and sets `epoch = 0`. The supplied
-    /// `backend_config` is persisted on the server and re-used by every
-    /// future [`Self::full_rebuild`] call so all hints share the same
-    /// dimensions across the server's lifetime.
+    /// # Purpose
     ///
-    /// `O(arity × n_rows × lwe_dim × row_width)` arithmetic plus a per-segment
-    /// random `seed` sample.
+    /// One-shot constructor that runs `B::server_setup` once per segment
+    /// to produce the initial hints, enables the store's mutation log,
+    /// and sets `epoch = 0`.
     ///
-    /// Pass `B::Config::default()` if you don't need to override any backend
-    /// knobs (e.g. `FrodoConfig::default()` selects FrodoPIR's 128-bit
-    /// security `lwe_dim = 1774`).
+    /// # Arguments
     ///
-    /// # Invariants
+    /// - `store`          — populated SCF KV store; ownership moves into
+    ///   the server.
+    /// - `backend_config` — backend-specific tunables (e.g.
+    ///   `FrodoConfig::default()` for FrodoPIR's 128-bit security
+    ///   `lwe_dim = 1774`). Persisted on the server and re-used by every
+    ///   future [`Self::full_rebuild`] call.
     ///
-    /// `store.params().plaintext_bits` (and the rest of the SCF geometry —
-    /// `scheme_kind`, `num_buckets`, `bucket_size`, `fingerprint_bits`,
-    /// `value_bits`) is fixed for the lifetime of the `IkpirServer` /
-    /// `IkpirClient` pair sharing this setup. Mutation deltas and incremental
-    /// hint patches assume a constant cell width across the wire. If support
-    /// for changing `plaintext_bits` across rebuilds is ever needed, tag both
-    /// [`ServerSetupBundle`] and [`HintDeltaBundle`] with a parameter-identity
-    /// fingerprint (e.g. a hash of
-    /// `(scheme_kind, num_buckets, bucket_size, fingerprint_bits, value_bits,
-    /// plaintext_bits)`) and assert match on `IkpirClient::apply_delta` /
-    /// `IkpirClient::reset_from`.
+    /// # Constraints
+    ///
+    /// `store.params().plaintext_bits` (and the rest of the SCF geometry
+    /// — `scheme_kind`, `num_buckets`, `bucket_size`,
+    /// `fingerprint_bits`, `value_bits`) is fixed for the lifetime of
+    /// the `IkpirServer` / `IkpirClient` pair sharing this setup.
+    /// Mutation deltas and incremental hint patches assume a constant
+    /// cell width across the wire. If support for changing
+    /// `plaintext_bits` across rebuilds is ever needed, tag both
+    /// [`ServerSetupBundle`] and [`HintDeltaBundle`] with a
+    /// parameter-identity fingerprint (e.g. a hash of
+    /// `(scheme_kind, num_buckets, bucket_size, fingerprint_bits,
+    /// value_bits, plaintext_bits)`) and assert match on
+    /// `IkpirClient::apply_delta` / `IkpirClient::reset_from`.
+    ///
+    /// # Rationale
+    ///
+    /// Persisting `backend_config` (rather than re-asking the caller on
+    /// every rebuild) keeps `setup` ↔ `full_rebuild` symmetric: a client
+    /// can always rebuild against the same dimensions.
+    ///
+    /// # Returns
+    ///
+    /// An `IkpirServer` at `epoch = 0` with the mutation log enabled and
+    /// drained.
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity × n_rows × lwe_dim × row_width)` arithmetic plus a
+    /// per-segment seed sample. This is the hot path during cold start;
+    /// for FrodoPIR with `lwe_dim = 1774` and a 2-ary 16k-bucket store
+    /// it dominates the first-query latency.
     pub fn new(store: CuckooKVStore<S>, backend_config: B::Config) -> Self {
         let params       = store.params();
         let arity        = params.arity();
@@ -94,16 +155,33 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         s
     }
 
-    /// Backend-config snapshot held by this server. Useful for benchmarks
-    /// and tests that need to construct an oracle server with the same
-    /// dimensions.
+    /// Backend-config snapshot held by this server.
+    ///
+    /// # Rationale
+    ///
+    /// Useful for benchmarks and tests that need to construct an oracle
+    /// server (or a second client) with the same backend dimensions
+    /// without re-deriving them from configuration.
     pub fn backend_config(&self) -> &B::Config { &self.backend_config }
 
     /// Snapshot the full preprocessing state for a fresh client.
     ///
-    /// Cheap: just clones the `ServerParams` and `Hint` vectors. The client
-    /// drives [`IkpirClient::from_setup`](https://docs.rs/ikpir-client/latest/ikpir_client/struct.IkpirClient.html#method.from_setup)
-    /// off the result.
+    /// # Purpose
+    ///
+    /// First-time client bootstrap; also used to recover a client that
+    /// has fallen out of epoch sync (caller drives
+    /// `IkpirClient::reset_from`).
+    ///
+    /// # Returns
+    ///
+    /// A [`ServerSetupBundle`] holding clones of `params`,
+    /// `backend_params`, `hints`, and the current `epoch`.
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity)` shallow clones of `Vec<B::ServerParams>` /
+    /// `Vec<B::Hint>` plus the deep clone the backend types perform.
+    /// Cheap relative to [`Self::new`] / [`Self::full_rebuild`].
     pub fn setup(&self) -> ServerSetupBundle<B> {
         ServerSetupBundle {
             params:         self.params,
@@ -115,12 +193,35 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
 
     /// Answer a per-segment PIR query bundle.
     ///
-    /// Calls `B::server_answer` once per segment over `self.store.as_cells()`.
+    /// # Purpose
     ///
-    /// # Errors
+    /// Server hot path: runs `B::server_answer` once per segment over
+    /// `self.store.as_cells()` and returns the per-segment responses.
     ///
-    /// - [`IkpirError::StaleEpoch`] if `q.epoch != self.epoch`.
-    /// - [`IkpirError::MalformedQuery`] if `q.queries.len()` doesn't match arity.
+    /// # Arguments
+    ///
+    /// - `q` — query bundle from the client.
+    ///
+    /// # Constraints
+    ///
+    /// - `q.epoch` must equal `self.epoch` (the client is on the
+    ///   server's current view of the database).
+    /// - `q.queries.len()` must equal `params.arity()`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(PirResponseBundle)` carrying the per-segment responses and
+    ///   the current epoch.
+    /// - `Err(IkpirError::StaleEpoch)` if `q.epoch != self.epoch` — the
+    ///   client has missed at least one mutation.
+    /// - `Err(IkpirError::MalformedQuery)` if `q.queries.len()` doesn't
+    ///   match arity.
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity × n_rows × row_width × lwe_dim)` — dominates server CPU
+    /// at steady state. For FrodoPIR this is the matvec a `--bench
+    /// answer_throughput` run isolates.
     pub fn answer(&self, q: &PirQueryBundle<B>) -> Result<PirResponseBundle<B>, IkpirError>
     where
         B::Query:    Clone,
@@ -153,14 +254,33 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         Ok(PirResponseBundle { epoch: self.epoch, responses })
     }
 
-    /// Recompute every per-segment hint from scratch and increment `epoch`.
+    /// Recompute every per-segment hint from scratch and increment
+    /// `epoch`.
     ///
-    /// Re-uses the [`backend_config`](Self::backend_config) the server was
-    /// constructed with, so dimensions stay stable across rebuilds. Cost
-    /// equals the original [`Self::new`] setup cost. Use this after large
-    /// mutation bursts (when the cumulative incremental patch cost would
-    /// exceed a fresh setup), or to recover a client that has fallen out of
-    /// epoch sync.
+    /// # Purpose
+    ///
+    /// Escape hatch when the incremental hint patches have become more
+    /// expensive than a fresh setup, or when the server wants to flip
+    /// every connected client into a forced resync (each client's next
+    /// `apply_delta` will hit `FutureDelta`).
+    ///
+    /// # Rationale
+    ///
+    /// Re-uses the [`backend_config`](Self::backend_config) the server
+    /// was constructed with, so hint dimensions stay stable across the
+    /// rebuild. The mutation log is drained as part of the rebuild
+    /// (its deltas are now subsumed in the new hints) and the epoch is
+    /// bumped, so all in-flight client queries become stale.
+    ///
+    /// # Returns
+    ///
+    /// A [`ServerSetupBundle`] mirroring the new internal state — same
+    /// shape as [`Self::setup`].
+    ///
+    /// # Complexity
+    ///
+    /// Same as [`Self::new`]:
+    /// `O(arity × n_rows × lwe_dim × row_width)`.
     pub fn full_rebuild(&mut self) -> ServerSetupBundle<B> {
         let arity        = self.params.arity();
         let segment_size = self.params.segment_size();
@@ -196,7 +316,8 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         self.epoch
     }
 
-    /// SCF geometry parameters of the wrapped store.
+    /// SCF geometry parameters of the wrapped store. Same shape as
+    /// `ServerSetupBundle::params`.
     pub fn params(&self) -> CuckooParams {
         self.params
     }
@@ -207,40 +328,97 @@ where
     S: IndexScheme + SchemeMeta,
     B: IncrementalPirBackend,
 {
-    /// Insert a `(key, value)` pair, then patch every affected segment hint
-    /// in place. Returns the resulting [`HintDeltaBundle`] for the client to
-    /// apply.
+    /// Insert a `(key, value)` pair, patching every affected segment
+    /// hint in place.
     ///
-    /// On [`IkpirError::TableFull`] the store and hints are restored to the
-    /// pre-call state and `epoch` is *not* advanced.
+    /// # Arguments
+    ///
+    /// - `key`   — keyword bytes; hashed by the SCF to derive
+    ///   fingerprint + candidate buckets.
+    /// - `value` — raw bytes; length must equal `params.value_size_in_bytes()`.
+    ///
+    /// # Constraints
+    ///
+    /// Mutation log must be enabled (it is by default after
+    /// [`Self::new`]). Disabling the log breaks incremental correctness
+    /// — see [`CuckooKVStore::disable_mutation_log`].
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(HintDeltaBundle)` on success. `self.epoch` is incremented
+    ///   by 1; the delta carries the new epoch and the sparse row
+    ///   patches the client must apply.
+    /// - `Err(IkpirError::TableFull)` if the cuckoo kick budget is
+    ///   exhausted; the SCF rolls back and `self.epoch` is **not**
+    ///   advanced. The mutation log is drained to prevent leaked
+    ///   deltas (see
+    ///   `tests/incremental_correctness.rs::mutation_log_drained_on_failure`).
+    /// - `Err(IkpirError::InvalidInput)` if `value.len()` is wrong.
     ///
     /// # On `IkpirError::TableFull`
     ///
-    /// The SCF rolls back internally and the server's state is unchanged.
     /// Recovery requires a full rebuild at a larger `num_buckets`, but
-    /// [`segmented_cuckoo::CuckooKVStore`] discards keys after hashing — only
-    /// fingerprints and packed values are retained — so IKPIR cannot rebuild
-    /// itself from internal state. The application layer is expected to hold
-    /// an authoritative `(key, value)` map alongside the server and, on
-    /// `TableFull`, reconstruct a new [`IkpirServer`] from that map with a
-    /// larger `num_buckets`. The resulting fresh setup bundle must be
-    /// delivered to clients via
+    /// [`segmented_cuckoo::CuckooKVStore`] discards keys after hashing
+    /// — only fingerprints and packed values are retained — so IKPIR
+    /// cannot rebuild itself from internal state. The application
+    /// layer is expected to hold an authoritative `(key, value)` map
+    /// alongside the server and, on `TableFull`, reconstruct a new
+    /// [`IkpirServer`] from that map with a larger `num_buckets`. The
+    /// resulting fresh setup bundle must be delivered to clients via
     /// [`IkpirClient::reset_from`](https://docs.rs/ikpir-client/latest/ikpir_client/struct.IkpirClient.html#method.reset_from);
     /// `apply_delta` cannot bridge a `num_buckets` change.
+    ///
+    /// # Complexity
+    ///
+    /// SCF insert (`O(value_size_in_cells)` direct, up to
+    /// `O(max_kicks · value_size_in_cells)` with kicks) + sparse hint
+    /// patch (`O(touched_rows · cells_per_slot · lwe_dim)`).
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<HintDeltaBundle<B>, IkpirError> {
         self.store.insert(key, value).map_err(map_cuckoo_err)?;
         Ok(self.commit_mutations())
     }
 
-    /// Update the value for an existing key, then patch every affected segment hint.
-    /// Returns [`IkpirError::NotFound`] if the key is absent.
+    /// Update the value for an existing key, patching every affected
+    /// segment hint.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`   — key to update.
+    /// - `value` — replacement bytes; length must equal
+    ///   `params.value_size_in_bytes()`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(HintDeltaBundle)` on success; `self.epoch` is incremented.
+    /// - `Err(IkpirError::NotFound)` if the key is absent; server
+    ///   state and epoch are unchanged.
+    /// - `Err(IkpirError::InvalidInput)` if `value.len()` is wrong.
+    ///
+    /// # Complexity
+    ///
+    /// SCF update (`O(arity · bucket_size + value_size_in_cells)`) +
+    /// sparse hint patch on one row per arity.
     pub fn update(&mut self, key: &[u8], value: &[u8]) -> Result<HintDeltaBundle<B>, IkpirError> {
         self.store.update(key, value).map_err(map_cuckoo_err)?;
         Ok(self.commit_mutations())
     }
 
-    /// Delete an existing key, then patch every affected segment hint.
-    /// Returns [`IkpirError::NotFound`] if the key is absent.
+    /// Delete an existing key, patching every affected segment hint.
+    ///
+    /// # Arguments
+    ///
+    /// - `key` — key to remove.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(HintDeltaBundle)` on success; `self.epoch` is incremented.
+    /// - `Err(IkpirError::NotFound)` if the key is absent; server
+    ///   state and epoch are unchanged.
+    ///
+    /// # Complexity
+    ///
+    /// SCF delete (`O(arity · bucket_size · ⌈fingerprint_bits / plaintext_bits⌉)`)
+    /// + sparse hint patch on one row per arity.
     pub fn delete(&mut self, key: &[u8]) -> Result<HintDeltaBundle<B>, IkpirError> {
         self.store.delete(key).map_err(map_cuckoo_err)?;
         Ok(self.commit_mutations())

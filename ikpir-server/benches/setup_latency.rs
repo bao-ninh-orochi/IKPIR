@@ -1,12 +1,24 @@
 //! **Intent:** Measure server-side setup cost on the FrodoPIR backend.
 //!
-//! **Method:** Populate a store to `TableFull`, wrap it in `IkpirServer::new`,
-//! and time the wall-clock cost of that call. Repeats for `trials` trials.
+//! **Method:** Populate a store to `TableFull`, wrap it in
+//! `IkpirServer::new`, and time the wall-clock cost of that call.
+//! Repeats for `trials` trials.
+//!
+//! **Arguments (CLI):** `--arity` (2/3/4), `--num-buckets`,
+//! `--bucket-size`, `--value-bits`, `--lwe-dim` (FrodoConfig override),
+//! `--trials`. See `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** Setup is `O(arity · n_rows · lwe_dim ·
+//! row_width)` — the cold-start cost a deployment pays once on boot or
+//! whenever `full_rebuild` is triggered. The bundle-byte columns let
+//! us cross-reference the wire footprint against
+//! `incremental_vs_rebuild`.
 //!
 //! **Output:** `results/ikpir_server_setup_latency.csv`
 //! Columns: arity, num_buckets, bucket_size, value_bits, lwe_dim,
 //! mean_setup_ms, min_setup_ms, max_setup_ms, stddev_setup_ms,
-//! setup_bundle_bytes, hint_bytes_per_segment, server_params_bytes_per_segment
+//! setup_bundle_bytes, hint_bytes_per_segment,
+//! server_params_bytes_per_segment
 
 mod helpers;
 

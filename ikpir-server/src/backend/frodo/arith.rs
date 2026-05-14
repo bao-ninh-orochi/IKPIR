@@ -1,6 +1,44 @@
-/// Lift x ∈ Z_p into Z_q where q = 2^32 by multiplying by Δ = q / p
-/// (i.e. shift left by `32 - plaintext_bits`). Cells must already satisfy
-/// the high-bits-zero invariant `x < 2^plaintext_bits`.
+//! `round_p_to_q` / `round_q_to_p` — Δ-scaling between plaintext and
+//! ciphertext rings.
+//!
+//! # Purpose
+//!
+//! Move a value between `Z_p = Z_{2^plaintext_bits}` (the IKPIR cell
+//! ring) and `Z_q = Z_{2^32}` (the FrodoPIR ciphertext ring). The
+//! one-line description: multiply / divide by `Δ = q / p` with
+//! round-to-nearest on the way back.
+//!
+//! # Design / architecture
+//!
+//! - `round_p_to_q(x)` = `x << (32 - plaintext_bits)` (Δ is always a
+//!   power of two with our parameter set, so the multiply is a shift).
+//! - `round_q_to_p(y)` = `⌊(y + Δ/2) / Δ⌋` with wrapping `+ Δ/2` —
+//!   wrapping is safe because the shift drops the carry-out bits.
+//!
+//! Both functions are `#[inline]` and run in `O(1)`; they are called
+//! once per cell on the FrodoPIR hot path.
+//!
+//! # Related files
+//!
+//! - `backend.rs` — sole caller: `client_decode` calls `round_q_to_p`
+//!   per cell; `server_answer` and the patcher call `round_p_to_q`.
+
+/// Lift `x ∈ Z_p` into `Z_q` (`q = 2^32`).
+///
+/// # Arguments
+///
+/// - `x`              — value to lift; must satisfy
+///   `x < 2^plaintext_bits` (the high-bits-zero invariant).
+/// - `plaintext_bits` — log₂ of `p`; in `1..=31`.
+///
+/// # Returns
+///
+/// `x · Δ` where `Δ = q / p = 2^(32 − plaintext_bits)`. Equivalent to
+/// `x << (32 − plaintext_bits)`.
+///
+/// # Complexity
+///
+/// `O(1)` — a single shift; expected to be inlined into the matvec.
 #[inline]
 pub(crate) fn round_p_to_q(x: u32, plaintext_bits: u32) -> u32 {
     debug_assert!((1..=31).contains(&plaintext_bits));
@@ -8,8 +46,27 @@ pub(crate) fn round_p_to_q(x: u32, plaintext_bits: u32) -> u32 {
     x << (32 - plaintext_bits)
 }
 
-/// Round y ∈ Z_q to nearest multiple of Δ = q / p, then divide by Δ to
-/// recover the Z_p value: `⌊(y + Δ/2) / Δ⌋ mod p`.
+/// Round `y ∈ Z_q` to the nearest multiple of `Δ = q / p`, then divide
+/// by `Δ` to recover the `Z_p` value.
+///
+/// # Arguments
+///
+/// - `y`              — ciphertext-side scalar.
+/// - `plaintext_bits` — log₂ of `p`; in `1..=31`.
+///
+/// # Returns
+///
+/// `⌊(y + Δ/2) / Δ⌋ mod p`, computed without an explicit modulo (the
+/// shift discards the high bits).
+///
+/// # Rationale
+///
+/// `wrapping_add(Δ/2)` is intentional — the carry-out bits would be
+/// shifted away by `>> (32 − plaintext_bits)` even if `+ Δ/2` overflowed.
+///
+/// # Complexity
+///
+/// `O(1)` — one add and one shift.
 #[inline]
 pub(crate) fn round_q_to_p(y: u32, plaintext_bits: u32) -> u32 {
     debug_assert!((1..=31).contains(&plaintext_bits));
@@ -20,8 +77,16 @@ pub(crate) fn round_q_to_p(y: u32, plaintext_bits: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    //! Unit tests for the Δ-scaling round-trip. Two invariants:
+    //!
+    //! 1. `round_q_to_p(round_p_to_q(x)) == x` for every valid `x`.
+    //! 2. `round_q_to_p` rounds toward the nearest Δ-multiple (with
+    //!    ties going up).
+
     use super::*;
 
+    /// `round_p_to_q` then `round_q_to_p` is the identity on `Z_p` for
+    /// every supported `plaintext_bits` and boundary value.
     #[test]
     fn round_trip_identity() {
         for &bits in &[1u32, 8, 9, 10, 16, 31] {
@@ -41,6 +106,8 @@ mod tests {
         }
     }
 
+    /// `round_q_to_p` snaps to the nearest Δ-multiple: values just
+    /// below the midpoint round down, the midpoint itself rounds up.
     #[test]
     fn rounding_toward_nearest() {
         // plaintext_bits=8 → Δ = 2^24 = 16_777_216

@@ -22,6 +22,16 @@
 //!   - `row_width` = bucket_size × cells_per_slot
 //!   - `cells_per_slot` = (fingerprint_bits + value_bits).div_ceil(plaintext_bits)
 //!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--lwe-dim`, `--mode` (cold / warm-b / warm-bc),
+//! `--batch` (queue depth when `mode != cold`). See
+//! `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** Memory is a deployment constraint independent
+//! of CPU. The cold-vs-warm-bc spread shows how much RAM Phase-B and
+//! Phase-C amortisation cost — useful for sizing an edge or mobile
+//! client.
+//!
 //! **Output:** `results/ikpir_client_memory_footprint.csv`
 //! Columns: mode, arity, num_buckets, bucket_size, value_bits, lwe_dim,
 //! batch, stack_bytes, heap_bytes, total_bytes

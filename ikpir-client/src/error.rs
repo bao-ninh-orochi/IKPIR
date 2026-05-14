@@ -1,14 +1,43 @@
+//! Client-side error type [`IkpirClientError`].
+//!
+//! # Purpose
+//!
+//! Enumerates every failure mode reachable from `IkpirClient`'s public
+//! API plus a wrapper variant that forwards server errors for
+//! ergonomic `?` propagation in synchronous in-process composition.
+//!
+//! # Design / architecture
+//!
+//! Three categories:
+//!
+//! - **Epoch-coherence failures** ([`StaleDelta`](IkpirClientError::StaleDelta),
+//!   [`FutureDelta`](IkpirClientError::FutureDelta),
+//!   [`EpochMismatch`](IkpirClientError::EpochMismatch)) — caller chose
+//!   the wrong incremental shape.
+//! - **Bundle-shape failures**
+//!   ([`MalformedBundle`](IkpirClientError::MalformedBundle)) — bug or
+//!   protocol-version mismatch.
+//! - **Forwarded server errors** ([`Server`](IkpirClientError::Server))
+//!   — wraps `IkpirError` from the server crate.
+//!
+//! # Related files
+//!
+//! - `client.rs` — sole producer of these variants.
+//! - `ikpir-server::IkpirError` — wrapped by the `Server` variant.
+
 use ikpir_server::IkpirError;
 
 /// Errors returned by [`IkpirClient`](crate::IkpirClient) methods.
 ///
-/// Variants split into three categories:
+/// # Purpose
 ///
-/// - **Epoch-coherence failures** — [`StaleDelta`](Self::StaleDelta),
-///   [`FutureDelta`](Self::FutureDelta), [`EpochMismatch`](Self::EpochMismatch).
-/// - **Bundle-shape failures** — [`MalformedBundle`](Self::MalformedBundle).
-/// - **Forwarded server errors** — [`Server`](Self::Server), present so a
-///   single `?` operator works in synchronous in-process composition.
+/// Single error type the IKPIR client surfaces. See the module-level
+/// docs for the three categories of variants.
+///
+/// # Rationale
+///
+/// `IkpirClientError: From<IkpirError>` lets a chained client-server
+/// flow use a single `?` operator everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IkpirClientError {
     /// Returned by [`IkpirClient::apply_delta`](crate::IkpirClient::apply_delta)

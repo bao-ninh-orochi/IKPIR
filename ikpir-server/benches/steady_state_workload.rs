@@ -1,16 +1,26 @@
-//! **Intent:** Mixed insert/query workload measuring steady-state per-op
-//! latency under a configurable query-to-mutation interleaving. This is the
-//! metric that matters for a live IKPIR deployment — the other benches are
-//! single-operation microbenchmarks.
+//! **Intent:** Mixed insert/query workload measuring steady-state
+//! per-op latency under a configurable query-to-mutation interleaving.
+//! This is the metric that matters for a live IKPIR deployment — the
+//! other benches are single-operation microbenchmarks.
 //!
-//! **Method:** Populate to `--load-factor` (default 0.50), snapshot the cell
-//! array, then per trial clone via `from_cells` and run `n_inserts + n_queries`
-//! operations interleaved: every `query_ratio`-th op is a query, the rest are
-//! inserts. For inserts, `client.apply_delta` is also timed (client must stay
-//! in sync). For queries, `build_query → answer → decode` is timed end-to-end.
+//! **Method:** Populate to `--load-factor` (default `0.50`), snapshot
+//! the cell array, then per trial clone via `from_cells` and run
+//! `n_inserts + n_queries` operations interleaved: every
+//! `query_ratio`-th op is a query, the rest are inserts. For inserts,
+//! `client.apply_delta` is also timed (the client must stay in sync).
+//! For queries, `build_query → answer → decode` is timed end-to-end.
 //!
-//! On `IkpirError::TableFull` inserts stop gracefully; the row reflects the
-//! partial workload.
+//! On `IkpirError::TableFull` inserts stop gracefully; the row reflects
+//! the partial workload.
+//!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--lwe-dim`, `--load-factor`, `--n-inserts`,
+//! `--n-queries`, `--query-ratio`. See `helpers::parse_cli` for
+//! defaults.
+//!
+//! **Design rationale:** Single-op microbenches over-report — a
+//! production server interleaves work. This bench is the one a
+//! capacity-planning sweep should anchor on.
 //!
 //! **Output:** `results/ikpir_steady_state_workload.csv`
 //! Columns: arity, num_buckets, bucket_size, value_bits, lwe_dim,

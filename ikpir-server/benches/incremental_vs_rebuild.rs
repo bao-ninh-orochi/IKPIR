@@ -1,20 +1,32 @@
-//! **Intent:** Compare the wall-clock and wire cost of `N` incremental hint
-//! patches against a single `full_rebuild` for the same total mutation
-//! footprint, split by mutation kind (insert / update / delete).
+//! **Intent:** Compare the wall-clock and wire cost of `N` incremental
+//! hint patches against a single `full_rebuild` for the same total
+//! mutation footprint, split by mutation kind (insert / update /
+//! delete).
 //!
-//! **Method:** Populate once to `--load-factor` (default 0.80), snapshot the
-//! cell array, then for each (mutation_kind, path) clone via `from_cells`.
-//! This avoids re-populating for each path.
+//! **Method:** Populate once to `--load-factor` (default `0.80`),
+//! snapshot the cell array, then for each `(mutation_kind, path)`
+//! clone via `from_cells`. This avoids re-populating for each path.
 //!
-//! Insert path may fail at high load; tracks `n_attempted` and `n_succeeded`.
-//! At `--load-factor full`, insert row is emitted with `n_succeeded=0`,
-//! `incremental_ms=NaN`, `ratio_inc_over_rebuild=NaN`.
+//! Insert path may fail at high load; tracks `n_attempted` and
+//! `n_succeeded`. At `--load-factor full`, the insert row is emitted
+//! with `n_succeeded=0`, `incremental_ms=NaN`,
+//! `ratio_inc_over_rebuild=NaN`.
+//!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--lwe-dim`, `--load-factor` (`0.0..=1.0` or
+//! `"full"`), `--n-mutations`. See `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** Headline plot for the paper — the crossover
+//! point where `N · incremental_patch_ms` overtakes a single
+//! `full_rebuild_ms` is what determines when a deployment should drop
+//! the patch stream and force a resync. The `delta_to_hint_ratio`
+//! column quantifies the wire saving on the patch path.
 //!
 //! **Output:** `results/ikpir_server_incremental_vs_rebuild.csv`
 //! Columns: mutation_kind, arity, num_buckets, bucket_size, value_bits,
-//! n_mutations, n_attempted, n_succeeded, incremental_ms, incremental_per_op_ms,
-//! rebuild_ms, ratio_inc_over_rebuild, delta_bytes_total, rebuild_hint_bytes,
-//! delta_to_hint_ratio
+//! n_mutations, n_attempted, n_succeeded, incremental_ms,
+//! incremental_per_op_ms, rebuild_ms, ratio_inc_over_rebuild,
+//! delta_bytes_total, rebuild_hint_bytes, delta_to_hint_ratio
 
 mod helpers;
 

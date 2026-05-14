@@ -1,10 +1,22 @@
-//! **Intent:** Measure rejection-path latency for `StaleEpoch` and `TableFull`.
+//! **Intent:** Measure rejection-path latency for `StaleEpoch` and
+//! `TableFull`.
 //!
-//! `stale_epoch`: build a populated server, build a client query at epoch 0,
-//! mutate the server once (epoch → 1), then call `answer` with the stale
-//! query repeatedly. `table_full`: fill a tiny table to capacity, then
-//! repeatedly attempt to insert one more key (each attempt exhausts the kick
-//! budget deterministically).
+//! **Method:**
+//!
+//! - `stale_epoch`: build a populated server, build a client query at
+//!   epoch 0, mutate the server once (epoch → 1), then call `answer`
+//!   with the stale query repeatedly.
+//! - `table_full`: fill a tiny table to capacity, then repeatedly
+//!   attempt to insert one more key (each attempt exhausts the kick
+//!   budget deterministically).
+//!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--n-trials`. See `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** Both error paths are on the latency tail of a
+//! well-behaved deployment — a stale query during a mutation, a
+//! resize-needed warning at saturation. Microbenchmarking them tells
+//! the operator how much budget the rejection itself eats.
 //!
 //! **Output:** `results/ikpir_failure_modes.csv`
 //! Columns: failure_kind, arity, num_buckets, bucket_size, n_trials,

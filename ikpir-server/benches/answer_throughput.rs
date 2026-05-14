@@ -1,9 +1,21 @@
-//! **Intent:** Measure server-side `answer` throughput on the FrodoPIR backend.
+//! **Intent:** Measure server-side `answer` throughput on the FrodoPIR
+//! backend.
 //!
 //! **Method:** Populate to `TableFull`, build a same-process client,
-//! pre-build `batch` queries, then time individual `server.answer` calls via
-//! criterion (cycling through the pre-built queries). The criterion HTML/JSON
-//! report lands in `target/criterion/answer_throughput/`.
+//! pre-build `batch` queries, then time individual `server.answer` calls
+//! via criterion (cycling through the pre-built queries). The criterion
+//! HTML/JSON report lands in `target/criterion/answer_throughput/`.
+//!
+//! **Arguments (CLI):** `--arity` (2/3/4), `--num-buckets`,
+//! `--bucket-size`, `--value-bits`, `--batch` (pre-built query batch
+//! size). See `helpers::parse_cli` for defaults (academic-scale per
+//! arity).
+//!
+//! **Design rationale:** `answer` is the per-query server hot path —
+//! its matvec dominates IKPIR server CPU at steady state. Pre-building
+//! the query batch lets criterion's `iter_custom` exclude
+//! query-construction cost from the timed window, so we measure only
+//! the `B::server_answer` matvec.
 //!
 //! **Output:** `results/ikpir_server_answer_throughput.csv`
 //! Columns: arity, num_buckets, bucket_size, value_bits, batch,

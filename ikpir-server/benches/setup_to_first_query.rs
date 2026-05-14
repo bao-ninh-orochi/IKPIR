@@ -1,13 +1,23 @@
-//! **Intent:** Wall-clock latency from "no client state" to "first decoded
-//! answer", split into per-phase columns.
+//! **Intent:** Wall-clock latency from "no client state" to "first
+//! decoded answer", split into per-phase columns.
 //!
-//! **Method:** Populate to `TableFull`, snapshot the cell array, then per
-//! trial clone via `from_cells` and time each phase independently.
+//! **Method:** Populate to `TableFull`, snapshot the cell array, then
+//! per trial clone via `from_cells` and time each phase independently.
+//!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--lwe-dim`, `--mode` (cold / warm-b / warm-bc),
+//! `--trials`. See `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** First-query latency dominates the user-visible
+//! cost of an IKPIR cold start. Splitting it into `server_setup` →
+//! `client_from_setup` → `precompute_b` → `precompute_c` → `query` →
+//! `answer` → `decode` shows which phase dominates and which the
+//! application can hide via prefetching.
 //!
 //! **Output:** `results/ikpir_setup_to_first_query.csv`
 //! Columns: mode, arity, num_buckets, bucket_size, value_bits, lwe_dim,
-//! server_setup_ms, client_from_setup_ms, precompute_b_ms, precompute_c_ms,
-//! build_query_ms, answer_ms, decode_ms, total_ms
+//! server_setup_ms, client_from_setup_ms, precompute_b_ms,
+//! precompute_c_ms, build_query_ms, answer_ms, decode_ms, total_ms
 
 mod helpers;
 

@@ -30,8 +30,8 @@
 //!
 //! # Backend selection
 //!
-//! The shipped backend is [`FrodoPirBackend`] (LWE-based, post-quantum,
-//! incremental). New backends implement [`IndexPirBackend`] and optionally
+//! The shipped backend is [`FrodoPirBackend`] (LWE-based, post-quantum). 
+//! New backends implement [`IndexPirBackend`] and optionally
 //! [`IncrementalPirBackend`]; see the trait docs for the contract.
 //!
 //! # Quick start

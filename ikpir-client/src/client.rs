@@ -1,3 +1,35 @@
+//! `IkpirClient<B>` — the client-side state machine.
+//!
+//! # Purpose
+//!
+//! Translates user-level `(key, query)` operations into the per-segment
+//! Index-PIR `(Query, Response)` exchanges with the IKPIR server.
+//! Maintains the strict-monotone client epoch and patches its
+//! per-segment `B::ClientState` from `HintDeltaBundle`s.
+//!
+//! # Design / architecture
+//!
+//! - **State.** [`CuckooParams`] + one `B::ServerParams` and
+//!   `B::ClientState` per segment + the epoch counter. Never owns a
+//!   `CuckooKVStore` — that's server-side.
+//! - **Lookup geometry is public.** `candidate_buckets` is
+//!   re-derivable from `params` alone, so the client computes it on
+//!   every query without privacy cost.
+//! - **Side-channel hardening in `decode`.** Every candidate slot is
+//!   unpacked and merged into a fixed-size accumulator via a
+//!   branchless OR-masked select; a timing observer learns at most
+//!   `(arity, bucket_size)`.
+//! - **Two recovery paths.** `apply_delta` for the strict-monotone
+//!   steady state, `reset_from` for after a `full_rebuild` or a
+//!   `FutureDelta` gap.
+//!
+//! # Related files
+//!
+//! - `lib.rs` — re-exports `IkpirClient`, `DeltaApplyOutcome`, and the
+//!   ikpir-server wire/backend types.
+//! - `error.rs` — `IkpirClientError` variants.
+//! - `ikpir-server::IkpirServer` — counterpart on the server side.
+
 use ikpir_server::{
     HintDeltaBundle, IndexPirBackend, IncrementalPirBackend, PrecomputingPirBackend,
     PirQueryBundle, PirResponseBundle, ServerSetupBundle,
@@ -8,9 +40,18 @@ use crate::error::IkpirClientError;
 
 /// Client-side IKPIR engine, generic over the PIR backend `B`.
 ///
-/// Owns one [`B::ClientState`](IndexPirBackend::ClientState) per segment,
-/// the SCF [`CuckooParams`], and a strict-monotone epoch counter. Does not
-/// hold any `CuckooKVStore` cells — those live on the server.
+/// # Purpose
+///
+/// Holds the per-segment client state, the SCF [`CuckooParams`], and a
+/// strict-monotone epoch counter. Does **not** hold any `CuckooKVStore`
+/// cells — those live on the server.
+///
+/// # Rationale
+///
+/// Stateless w.r.t. the database content (the server is the
+/// authoritative store) but stateful w.r.t. the per-segment LWE
+/// preprocessing (`B::ClientState`); the latter is what
+/// `apply_delta` patches in lock-step with server mutations.
 ///
 /// # Threading
 ///
@@ -36,17 +77,34 @@ pub enum DeltaApplyOutcome {
 impl<B: IndexPirBackend> IkpirClient<B> {
     /// Build a fresh client from a server setup bundle.
     ///
-    /// Materialises one [`B::ClientState`](IndexPirBackend::ClientState) per
-    /// segment via [`B::client_setup`](IndexPirBackend::client_setup),
-    /// caches the SCF [`CuckooParams`], and adopts the server's epoch.
+    /// # Purpose
     ///
-    /// # Invariants
+    /// First-time client bootstrap; the inverse of
+    /// `IkpirServer::setup()`. Also used (via [`Self::reset_from`])
+    /// to recover from a `FutureDelta` gap.
     ///
-    /// `bundle.params.plaintext_bits` (and the rest of the SCF geometry) is
-    /// fixed for this client's lifetime; all subsequent
-    /// [`Self::apply_delta`] and [`Self::reset_from`] calls must come from
-    /// servers built with the same `plaintext_bits`. See `IkpirServer::new`
-    /// for the upgrade path that would be required to lift this invariant.
+    /// # Arguments
+    ///
+    /// - `bundle` — setup material from the server.
+    ///
+    /// # Constraints
+    ///
+    /// `bundle.params.plaintext_bits` (and the rest of the SCF geometry)
+    /// is fixed for this client's lifetime; every subsequent
+    /// [`Self::apply_delta`] or [`Self::reset_from`] call must come from
+    /// a server built with the same `plaintext_bits`. See
+    /// `IkpirServer::new` for the upgrade path that would be required
+    /// to lift this invariant.
+    ///
+    /// # Returns
+    ///
+    /// A ready-to-query client at `bundle.epoch`.
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity)` calls to
+    /// [`B::client_setup`](IndexPirBackend::client_setup), each of
+    /// which clones one `ServerParams` and one `Hint`.
     pub fn from_setup(bundle: ServerSetupBundle<B>) -> Self {
         let arity = bundle.params.arity();
         debug_assert_eq!(bundle.backend_params.len(), arity);
@@ -67,10 +125,22 @@ impl<B: IndexPirBackend> IkpirClient<B> {
 
     /// Replace all internal state from a fresh setup bundle.
     ///
-    /// Use after a server-side `full_rebuild`, or whenever
-    /// [`IkpirClient::apply_delta`] reports
+    /// # Purpose
+    ///
+    /// Resync entry point. Use after a server-side `full_rebuild`, or
+    /// whenever [`IkpirClient::apply_delta`] reports
     /// [`IkpirClientError::FutureDelta`] (the gap is unbridgeable
     /// incrementally).
+    ///
+    /// # Arguments
+    ///
+    /// - `bundle` — fresh setup material from the server, at any
+    ///   epoch ≥ the current client epoch.
+    ///
+    /// # Rationale
+    ///
+    /// Equivalent to `*self = Self::from_setup(bundle)` — implemented
+    /// as a swap so existing callers don't need to take ownership.
     pub fn reset_from(&mut self, bundle: ServerSetupBundle<B>) {
         *self = Self::from_setup(bundle);
     }
@@ -89,14 +159,31 @@ where
 {
     /// Build a per-segment PIR query for `key`.
     ///
-    /// Re-derives the SCF candidate buckets locally
+    /// # Purpose
+    ///
+    /// Client hot path. Re-derives the SCF candidate buckets locally
     /// ([`CuckooParams::candidate_buckets`]) and emits one
-    /// [`B::Query`](IndexPirBackend::Query) per segment, where the j-th
-    /// query targets row `indices[j] % segment_size` in segment `j`. The
-    /// returned [`PirQueryBundle`] carries the current client epoch; the
-    /// server rejects the query with
-    /// [`IkpirError::StaleEpoch`](ikpir_server::IkpirError::StaleEpoch) if
-    /// it has moved on.
+    /// [`B::Query`](IndexPirBackend::Query) per segment, where the
+    /// j-th query targets row `indices[j] % segment_size` in segment
+    /// `j`.
+    ///
+    /// # Arguments
+    ///
+    /// - `key` — lookup key bytes.
+    ///
+    /// # Returns
+    ///
+    /// A [`PirQueryBundle`] carrying the current client epoch. The
+    /// server rejects with
+    /// [`IkpirError::StaleEpoch`](ikpir_server::IkpirError::StaleEpoch)
+    /// if it has moved past this epoch.
+    ///
+    /// # Complexity
+    ///
+    /// One xxh3 hash of `key` + `arity` calls to
+    /// [`B::client_query`](IndexPirBackend::client_query). Each LWE
+    /// query is `O(n_rows · lwe_dim)` matvec on the cold path, `O(n_rows)`
+    /// (single vector add) on the precomputed cheap path.
     pub fn build_query(&mut self, key: &[u8]) -> PirQueryBundle<B> {
         let (_fp, indices) = self.params.candidate_buckets(key);
         let arity          = self.params.arity();
@@ -116,36 +203,58 @@ where
 {
     /// Decode a server response.
     ///
-    /// Re-derives the fingerprint and candidate buckets from `key`, runs
+    /// # Purpose
+    ///
+    /// Inverse of [`Self::build_query`]. Re-derives the fingerprint and
+    /// candidate buckets from `key`, runs
     /// [`B::client_decode`](IndexPirBackend::client_decode) on each
-    /// per-segment response, slices the recovered cell row into the SCF
-    /// `bucket_size` slot streams, and returns the matching value or
-    /// `Ok(None)` if no slot in the candidate buckets carries the matching
-    /// fingerprint.
+    /// per-segment response, slices the recovered cell row into the
+    /// SCF `bucket_size` slot streams, and returns the matching value
+    /// or `Ok(None)` if no slot in the candidate buckets carries the
+    /// matching fingerprint.
     ///
-    /// # Side-channel hardening
+    /// # Arguments
     ///
-    /// Every `arity × bucket_size` candidate slot is unpacked and merged
-    /// into a fixed-size accumulator via a branchless OR-masked select.
-    /// The probe path is independent of which slot (if any) holds the
-    /// match, so a co-located timing observer learns nothing beyond
+    /// - `key`  — the same key passed to the matching
+    ///   `build_query` call.
+    /// - `resp` — the response bundle returned by the server's
+    ///   `answer`.
+    ///
+    /// # Rationale
+    ///
+    /// **Side-channel hardening.** Every `arity × bucket_size`
+    /// candidate slot is unpacked and merged into a fixed-size
+    /// accumulator via a branchless OR-masked select. The probe path
+    /// is independent of which slot (if any) holds the match, so a
+    /// co-located timing observer learns nothing beyond
     /// `(arity, bucket_size)` from the decode call. The `if sk == 0`
-    /// shortcut in the underlying LWE decode is a separate concern; see
-    /// `ikpir-server/CLAUDE.md` for the server-side threat model.
+    /// shortcut in the underlying LWE decode is a separate concern;
+    /// see `ikpir-server/CLAUDE.md` for the server-side threat model.
     ///
-    /// # Fingerprint-collision behaviour
-    ///
-    /// If two candidate slots happen to share `fp` (rare false positive),
+    /// **Fingerprint-collision behaviour.** If two candidate slots
+    /// happen to share `fp` (rare false positive at the cuckoo layer),
     /// the returned `Vec<u8>` is the bitwise OR of their values. This
     /// matches the cuckoo-layer FPR bound; callers that need certainty
     /// should retry on a different fingerprint.
     ///
-    /// # Errors
+    /// # Returns
     ///
-    /// - [`IkpirClientError::EpochMismatch`] if `resp.epoch != self.epoch`
-    ///   (the server moved between query and answer).
-    /// - [`IkpirClientError::MalformedBundle`] if the response has the wrong
-    ///   number of segments or an inner row of the wrong width.
+    /// - `Ok(Some(value))` if a candidate slot carried the matching
+    ///   fingerprint.
+    /// - `Ok(None)` if no slot matched.
+    /// - `Err(IkpirClientError::EpochMismatch)` if
+    ///   `resp.epoch != self.epoch` (the server moved between query
+    ///   and answer).
+    /// - `Err(IkpirClientError::MalformedBundle)` if the response has
+    ///   the wrong number of segments or an inner row of the wrong
+    ///   width.
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity)` calls to `B::client_decode` (cold path:
+    /// `O(arity · lwe_dim · row_width)` matvec; cheap path with `c`
+    /// precomputed: `O(arity · row_width)` vector subtract) plus
+    /// `O(arity · bucket_size · cells_per_slot)` slot scan work.
     pub fn decode(
         &self,
         key:  &[u8],
@@ -245,18 +354,42 @@ impl<B: PrecomputingPirBackend> IkpirClient<B> {
 impl<B: IncrementalPirBackend> IkpirClient<B> {
     /// Apply a hint-delta bundle from the server.
     ///
+    /// # Purpose
+    ///
+    /// Steady-state synchronisation entry point. Patches the
+    /// per-segment hint copy in `B::ClientState` so subsequent queries
+    /// agree with the server's post-mutation database.
+    ///
+    /// # Arguments
+    ///
+    /// - `delta` — bundle emitted by the server's
+    ///   `insert` / `update` / `delete`.
+    ///
+    /// # Constraints
+    ///
     /// **Strict-monotone:** the only accepted shape is
     /// `delta.epoch == self.epoch + 1`. Older deltas are
     /// [`IkpirClientError::StaleDelta`]; gaps are
     /// [`IkpirClientError::FutureDelta`] — the caller must recover by
     /// calling [`IkpirClient::reset_from`] with a fresh server bundle.
+    /// `delta.per_segment_row_deltas.len()` must equal
+    /// `params.arity()`.
     ///
-    /// # Errors
+    /// # Returns
     ///
-    /// - [`IkpirClientError::StaleDelta`]
-    /// - [`IkpirClientError::FutureDelta`]
-    /// - [`IkpirClientError::MalformedBundle`] if `per_segment_row_deltas.len()`
-    ///   doesn't match arity.
+    /// - `Ok(())` and `self.epoch += 1` on success.
+    /// - `Err(IkpirClientError::StaleDelta { expected, got })` when
+    ///   `delta.epoch ≤ self.epoch`.
+    /// - `Err(IkpirClientError::FutureDelta { expected, got })` when
+    ///   `delta.epoch > self.epoch + 1`.
+    /// - `Err(IkpirClientError::MalformedBundle)` if
+    ///   `per_segment_row_deltas.len()` doesn't match arity.
+    ///
+    /// # Complexity
+    ///
+    /// `O(Σ row_deltas · lwe_dim)` per segment — see
+    /// `IncrementalPirBackend::client_patch_state`. Empty segments
+    /// short-circuit.
     pub fn apply_delta(
         &mut self,
         delta: HintDeltaBundle<B>,
@@ -288,17 +421,36 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     /// Apply a delta, falling back to a fresh server bundle on
     /// [`IkpirClientError::FutureDelta`].
     ///
-    /// In the common path (`delta.epoch == self.epoch + 1`) this delegates
-    /// to [`Self::apply_delta`] and returns [`DeltaApplyOutcome::Synced`].
-    /// If the delta epoch jumps past `self.epoch + 1`, the caller-supplied
-    /// `fetch_bundle` closure is invoked to obtain a fresh
-    /// [`ServerSetupBundle`], the client is rebuilt via
-    /// [`Self::reset_from`], and [`DeltaApplyOutcome::Resynced`] is returned.
+    /// # Purpose
     ///
-    /// All other errors from `apply_delta` are propagated as-is — in
-    /// particular [`IkpirClientError::StaleDelta`] (caller should drop the
-    /// delta) and [`IkpirClientError::MalformedBundle`] (bug or protocol
+    /// Sugar for the common gap-handling pattern: try the incremental
+    /// patch, fall back to a full resync only when the gap is too big.
+    ///
+    /// # Arguments
+    ///
+    /// - `delta`        — bundle emitted by the server.
+    /// - `fetch_bundle` — closure that obtains a fresh
+    ///   [`ServerSetupBundle`]; called only on `FutureDelta`.
+    ///
+    /// # Rationale
+    ///
+    /// In the common path (`delta.epoch == self.epoch + 1`) this
+    /// delegates to [`Self::apply_delta`] and returns
+    /// [`DeltaApplyOutcome::Synced`]. If the delta epoch jumps past
+    /// `self.epoch + 1`, `fetch_bundle` is invoked, the client is
+    /// rebuilt via [`Self::reset_from`], and
+    /// [`DeltaApplyOutcome::Resynced`] is returned. All other errors
+    /// from `apply_delta` are propagated as-is — in particular
+    /// [`IkpirClientError::StaleDelta`] (caller should drop the delta)
+    /// and [`IkpirClientError::MalformedBundle`] (bug or protocol
     /// mismatch — recovery is not automatic).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(DeltaApplyOutcome::Synced)` on the common path.
+    /// - `Ok(DeltaApplyOutcome::Resynced)` when the resync path fires.
+    /// - `Err(IkpirClientError::*)` for any error other than
+    ///   `FutureDelta`.
     ///
     /// # Example
     ///

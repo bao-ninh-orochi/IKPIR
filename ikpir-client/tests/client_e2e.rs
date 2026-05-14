@@ -1,3 +1,30 @@
+//! End-to-end integration tests for `IkpirClient` against a real
+//! `IkpirServer` and `FrodoPirBackend`.
+//!
+//! # Purpose
+//!
+//! Pins the client-side behaviours that span the server boundary and
+//! therefore cannot be unit-tested inside `src/`:
+//!
+//! 1. `decode_returns_value` — 50 keys round-trip through the full
+//!    `build_query` → `answer` → `decode` pipeline.
+//! 2. `decode_absent` — `decode` returns `Ok(None)` (no `Err`) for a
+//!    key that was never inserted.
+//! 3. `decode_after_apply_delta` — a client patched by `apply_delta`
+//!    produces the same decodes as a freshly-rebuilt client.
+//! 4. `precomputed_warm_path` — the cheap Phase-B / Phase-C path
+//!    produces the same decodes as the cold inline path, and the
+//!    `prepared_per_segment` counter decrements with each query.
+//! 5. `precomputed_survives_apply_delta` — warm queues stay coherent
+//!    across `apply_delta`.
+//! 6. `stale_delta_rejected` — `apply_delta` rejects a delta older
+//!    than the current client epoch.
+//!
+//! Behaviours 1–6 are parameterised by arity (2 / 3 / 4) so the
+//! diagnostic on failure pins which arity broke. Two extra
+//! single-arity tests pin the wire-byte accounting helpers
+//! (`wire_byte_size`) and the constant-time-decode last-slot probe.
+
 use ikpir_client::{FrodoConfig, FrodoPirBackend, IkpirClient, IkpirClientError};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
@@ -9,30 +36,38 @@ use segmented_cuckoo::{
 
 type Client = IkpirClient<FrodoPirBackend>;
 
+/// Build an empty 2-ary `IkpirServer` (64 buckets × 4 slots).
 fn build_server_2() -> IkpirServer<Segmented2aryScheme, FrodoPirBackend> {
     let store = Segmented2aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
+/// Build an empty 3-ary `IkpirServer` (`num_buckets = 3 · 32 = 96`,
+/// same per-segment row count as the 2-ary fixture).
 fn build_server_3() -> IkpirServer<Segmented3aryScheme, FrodoPirBackend> {
-    // 96 = 3 * 32 buckets: same per-segment row count as arity-2 with 64 buckets.
     let store = Segmented3aryCuckooKVStore::new(96, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
+/// Build an empty 4-ary `IkpirServer` (64 buckets × 4 slots).
 fn build_server_4() -> IkpirServer<Segmented4aryScheme, FrodoPirBackend> {
     let store = Segmented4aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
 
+/// `IkpirClient::from_setup(server.setup())` shortcut shared by every
+/// arity-generic body.
 fn fresh_client<S>(server: &IkpirServer<S, FrodoPirBackend>) -> Client
 where S: IndexScheme + SchemeMeta + 'static {
     IkpirClient::from_setup(server.setup())
 }
 
+/// `(key_bytes, value_bytes)` pair derived from `k` — keeps the test
+/// inputs compact and deterministic.
 fn pair(k: u32) -> ([u8; 4], [u8; 1]) {
     (k.to_le_bytes(), [(k as u8) ^ 0xA5])
 }
 
-// 1. End-to-end happy path: 50 keys round-trip through query/answer/decode.
+/// Arity-generic body of the "50 inserted keys round-trip through
+/// query / answer / decode" test.
 fn decode_returns_value_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where S: IndexScheme + SchemeMeta + 'static {
     let mut inserted = Vec::new();
@@ -51,7 +86,7 @@ where S: IndexScheme + SchemeMeta + 'static {
     }
 }
 
-// 2. Absent key → Ok(None).
+/// Arity-generic body of the "absent key returns `Ok(None)`" test.
 fn decode_absent_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where S: IndexScheme + SchemeMeta + 'static {
     for k in 0u32..20 {
@@ -66,7 +101,9 @@ where S: IndexScheme + SchemeMeta + 'static {
     assert_eq!(client.decode(&absent, &resp).expect("no error"), None);
 }
 
-// 3. Headline correctness: incremental client matches freshly-rebuilt client.
+/// Arity-generic body of the headline correctness test: a client
+/// patched by `apply_delta` decodes identically to a freshly-rebuilt
+/// client, across a mixed insert/update/delete trace.
 fn decode_after_apply_delta_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where S: IndexScheme + SchemeMeta + 'static {
     let mut inc: Client = fresh_client(&server);
@@ -113,8 +150,8 @@ where S: IndexScheme + SchemeMeta + 'static {
     }
 }
 
-// 4. Warm path — precompute_queries + precompute_decodes, then a batch of
-// lookups all hit the cheap query/decode paths and decode correctly.
+/// Arity-generic body of the "Phase-B + Phase-C warm path round-trips
+/// correctly and consumes one prepared slot per query" test.
 fn precomputed_warm_path_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where S: IndexScheme + SchemeMeta + 'static {
     let mut inserted = Vec::new();
@@ -148,7 +185,9 @@ where S: IndexScheme + SchemeMeta + 'static {
     }
 }
 
-// 5. Warm path stays correct across mutations: precompute → mutate → query.
+/// Arity-generic body of "warm queue survives a burst of mutations":
+/// precompute, apply a mixed mutation trace, then query — every
+/// decode must match a freshly-rebuilt oracle client.
 fn precomputed_survives_apply_delta_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where S: IndexScheme + SchemeMeta + 'static {
     for k in 0u32..15 {
@@ -190,7 +229,8 @@ where S: IndexScheme + SchemeMeta + 'static {
     }
 }
 
-// 6. Stale delta rejected.
+/// Arity-generic body of "applying a delta older than the current
+/// epoch returns `StaleDelta`".
 fn stale_delta_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where S: IndexScheme + SchemeMeta + 'static {
     let (k1, v1) = pair(1);
@@ -205,45 +245,68 @@ where S: IndexScheme + SchemeMeta + 'static {
     assert!(matches!(err, IkpirClientError::StaleDelta { .. }), "got {err:?}");
 }
 
+/// 50 inserted keys round-trip through query/answer/decode (2-ary).
 #[test]
 fn decode_returns_value_for_inserted_key()       { decode_returns_value_inner(build_server_2()); }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn decode_returns_value_for_inserted_key_3ary()  { decode_returns_value_inner(build_server_3()); }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn decode_returns_value_for_inserted_key_4ary()  { decode_returns_value_inner(build_server_4()); }
 
+/// Absent key returns `Ok(None)` (2-ary).
 #[test]
 fn decode_returns_none_for_absent_key()       { decode_absent_inner(build_server_2()); }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn decode_returns_none_for_absent_key_3ary()  { decode_absent_inner(build_server_3()); }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn decode_returns_none_for_absent_key_4ary()  { decode_absent_inner(build_server_4()); }
 
+/// Incrementally patched client matches a freshly-rebuilt client
+/// across a mixed mutation trace (2-ary). This is the headline
+/// correctness claim of the IKPIR scheme.
 #[test]
 fn decode_after_apply_delta_matches_freshly_setup_client()       { decode_after_apply_delta_inner(build_server_2()); }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn decode_after_apply_delta_matches_freshly_setup_client_3ary()  { decode_after_apply_delta_inner(build_server_3()); }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn decode_after_apply_delta_matches_freshly_setup_client_4ary()  { decode_after_apply_delta_inner(build_server_4()); }
 
+/// `apply_delta` with an older-than-current epoch returns
+/// `StaleDelta` (2-ary).
 #[test]
 fn stale_delta_rejected()       { stale_delta_inner(build_server_2()); }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn stale_delta_rejected_3ary()  { stale_delta_inner(build_server_3()); }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn stale_delta_rejected_4ary()  { stale_delta_inner(build_server_4()); }
 
+/// Phase-B + Phase-C warm queue round-trips and the prepared-slot
+/// counter decrements correctly with each query (2-ary).
 #[test]
 fn precomputed_warm_path()       { precomputed_warm_path_inner(build_server_2()); }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn precomputed_warm_path_3ary()  { precomputed_warm_path_inner(build_server_3()); }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn precomputed_warm_path_4ary()  { precomputed_warm_path_inner(build_server_4()); }
 
+/// Warm queue survives a burst of mutations: every probe still
+/// matches a freshly-rebuilt oracle client (2-ary).
 #[test]
 fn precomputed_survives_apply_delta()       { precomputed_survives_apply_delta_inner(build_server_2()); }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn precomputed_survives_apply_delta_3ary()  { precomputed_survives_apply_delta_inner(build_server_3()); }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn precomputed_survives_apply_delta_4ary()  { precomputed_survives_apply_delta_inner(build_server_4()); }
 

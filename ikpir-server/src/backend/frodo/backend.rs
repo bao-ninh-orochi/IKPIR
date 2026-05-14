@@ -1,5 +1,39 @@
-//! `FrodoPirBackend` — IndexPirBackend impl over Z_{2^32} with ternary errors.
-//! See `frodo/mod.rs` doc comment for the math; this file is mechanical.
+//! `FrodoPirBackend` — IndexPirBackend impl over `Z_{2^32}` with ternary
+//! errors.
+//!
+//! # Purpose
+//!
+//! The shipped IKPIR backend: implements
+//! [`IndexPirBackend`](crate::IndexPirBackend),
+//! [`IncrementalPirBackend`](crate::IncrementalPirBackend),
+//! [`PrecomputingPirBackend`](crate::PrecomputingPirBackend), and
+//! [`BackendWireSize`](crate::BackendWireSize) for FrodoPIR.
+//!
+//! # Design / architecture
+//!
+//! - **Witness type.** [`FrodoPirBackend`] is zero-sized; all behaviour
+//!   lives on the trait impls.
+//! - **Per-segment state.** Each segment has its own
+//!   [`FrodoServerParams`] / [`FrodoHint`] (server side) and
+//!   [`FrodoClientState`] (client side). The IKPIR server constructs
+//!   `arity` instances of each.
+//! - **Precomputation queue.** `FrodoClientState` holds a `VecDeque` of
+//!   [`PreparedSlot`]s and at most one in-flight slot. The math in
+//!   `frodo/mod.rs` corresponds 1:1 to the field names (`b = A·s + e`,
+//!   `c = sᵀ·H`).
+//! - **Hot loops.** `server_answer`'s matvec and `client_decode`'s
+//!   `residual − c` (or `residual − sᵀ·H` on the cold path) dominate
+//!   CPU time. Both are deliberately unconditional (no `sk == 0`
+//!   short-circuit) so timing does not leak the secret's Hamming
+//!   weight.
+//!
+//! # Related files
+//!
+//! - `mod.rs` — re-exports the public types here; carries the math
+//!   summary for the whole module.
+//! - `params.rs` — `FrodoConfig` / `FrodoParams`.
+//! - `arith.rs` — `round_p_to_q` / `round_q_to_p` (Δ-scaling).
+//! - `sampler.rs` — `sample_a` / `sample_ternary_into`.
 
 use std::collections::VecDeque;
 
@@ -9,15 +43,28 @@ use super::{FrodoConfig, FrodoParams, round_p_to_q, round_q_to_p, sample_a, samp
 use crate::backend::{BackendWireSize, IndexPirBackend, IncrementalPirBackend, PrecomputingPirBackend};
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
-/// [`IncrementalPirBackend`] impls for FrodoPIR.
+/// [`IncrementalPirBackend`] / [`PrecomputingPirBackend`] /
+/// [`BackendWireSize`] impls for FrodoPIR.
 ///
-/// Construct with `FrodoPirBackend` (the type itself is the value); all
+/// # Purpose
+///
+/// The IKPIR server / client are generic over the backend; this type
+/// names the FrodoPIR specialisation.
+///
+/// # Rationale
+///
+/// Zero-sized so the value is free to construct and pass by value; all
 /// methods are static — see the trait impls below.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrodoPirBackend;
 
-/// Per-segment public parameters: LWE dimensions, plaintext modulus, and
-/// the public matrix `A` (row-major shape `n_rows × lwe_dim`).
+/// Per-segment public parameters: LWE dimensions, plaintext modulus,
+/// and the public matrix `A` (row-major shape `n_rows × lwe_dim`).
+///
+/// # Purpose
+///
+/// One instance per segment; combined with [`FrodoHint`] it forms the
+/// `(ServerParams, Hint)` pair every IKPIR client receives at setup.
 #[derive(Clone, Debug)]
 pub struct FrodoServerParams {
     /// LWE dimension, plaintext bits, and 16-byte seed used to sample `a`.
@@ -30,9 +77,21 @@ pub struct FrodoServerParams {
     pub a:         Vec<u32>,
 }
 
-/// Server-held FrodoPIR hint matrix `H = Aᵀ · D mod 2³²` in row-major shape
-/// `lwe_dim × row_width`. Derived once at setup and patched in place
-/// thereafter via [`FrodoPirBackend::server_patch_hint`].
+/// FrodoPIR hint matrix `H = Aᵀ · D mod 2³²` in row-major shape
+/// `lwe_dim × row_width`.
+///
+/// # Purpose
+///
+/// Held by both server and (a copy at) client; the matvec
+/// `client_decode` performs against this matrix is the dominant CPU
+/// cost.
+///
+/// # Rationale
+///
+/// Derived once at setup and patched in place thereafter via
+/// [`FrodoPirBackend::server_patch_hint`] /
+/// [`FrodoPirBackend::client_patch_state`] — never recomputed unless
+/// the server triggers `full_rebuild`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrodoHint {
     /// Flat row-major buffer of length `lwe_dim × row_width`.
@@ -52,16 +111,22 @@ struct PreparedSlot {
 
 /// Per-segment client-held FrodoPIR state.
 ///
-/// Holds a copy of [`FrodoServerParams`], the patched [`FrodoHint`], a FIFO
-/// queue of slots prepared by [`FrodoPirBackend::client_precompute_queries`],
-/// and the slot consumed by the most recent
+/// # Purpose
+///
+/// Holds everything the client needs to build queries and decode
+/// responses for one segment: a copy of [`FrodoServerParams`], the
+/// patched [`FrodoHint`], a FIFO queue of slots prepared by
+/// [`FrodoPirBackend::client_precompute_queries`], and the slot
+/// consumed by the most recent
 /// [`FrodoPirBackend::client_query`].
 ///
-/// **Single in-flight query.** Each `client_query` overwrites the in-flight
-/// slot; issuing a second `client_query` before decoding the first discards
-/// the first's secret and that first decode will return garbage. This
-/// matches the protocol cadence in IkpirClient (one query → one answer →
-/// one decode per round).
+/// # Constraints
+///
+/// **Single in-flight query.** Each `client_query` overwrites the
+/// in-flight slot; issuing a second `client_query` before decoding the
+/// first discards the first's secret and that first decode will return
+/// garbage. This matches the protocol cadence in `IkpirClient` (one
+/// query → one answer → one decode per round per segment).
 pub struct FrodoClientState {
     /// Public parameters for this segment.
     pub params:    FrodoServerParams,
@@ -86,16 +151,25 @@ impl FrodoClientState {
 }
 
 /// Wire-level FrodoPIR query: `b = A·s + e + Δ·u_row` of length `n_rows`.
+///
+/// # Purpose
+///
+/// The client-side ciphertext shipped to the server. One per segment.
 #[derive(Clone, Debug)]
 pub struct FrodoQuery {
-    /// Encrypted query vector.
+    /// Encrypted query vector (`b = A·s + e + Δ·u_row`).
     pub b: Vec<u32>,
 }
 
 /// Wire-level FrodoPIR response: `a = bᵀ·D` of length `row_width`.
+///
+/// # Purpose
+///
+/// The server-side ciphertext shipped back to the client. One per
+/// segment.
 #[derive(Clone, Debug)]
 pub struct FrodoResponse {
-    /// Encrypted response vector.
+    /// Encrypted response vector (`a = bᵀ·D`).
     pub a: Vec<u32>,
 }
 
@@ -215,9 +289,19 @@ impl IndexPirBackend for FrodoPirBackend {
     }
 }
 
-/// Sample a fresh `(s, e)` and compute `b = A·s + e` for one query slot.
+/// Sample a fresh `(secret, error)` pair and compute the public-half
+/// query vector `b = A·s + e` for one query slot.
+///
+/// # Purpose
+///
 /// Centralises the LWE matvec used by both the inline `client_query`
-/// fallback path and the explicit `client_precompute_queries` path.
+/// fallback path and the explicit `client_precompute_queries` path so
+/// the two paths cannot diverge.
+///
+/// # Complexity
+///
+/// `O(n_rows · lwe_dim)` wrapping multiply-add — this is the per-query
+/// LWE cost amortised by `precompute_queries`.
 fn sample_slot(params: &FrodoServerParams) -> PreparedSlot {
     let lwe_dim = params.params.lwe_dim as usize;
     let n_rows  = params.n_rows  as usize;
@@ -242,12 +326,24 @@ fn sample_slot(params: &FrodoServerParams) -> PreparedSlot {
     PreparedSlot { secret, b, c: None }
 }
 
-/// Compute `c = sᵀ·H` for one slot. Used by `client_precompute_decodes`
-/// to materialise the decode-side material.
+/// Compute the decode-side material `c = sᵀ·H` for one slot.
 ///
-/// Inner loop is unconditional (no `sk == 0` short-circuit) so timing does
-/// not leak the secret's Hamming weight: `sk.wrapping_mul(0) = 0` is a
-/// no-op in the wrapping-add accumulator.
+/// # Purpose
+///
+/// Used by `client_precompute_decodes` to materialise Phase C; the
+/// matching `client_decode` then takes the cheap `residual − c` path.
+///
+/// # Rationale
+///
+/// Inner loop is unconditional (no `sk == 0` short-circuit) so timing
+/// does not leak the secret's Hamming weight: `sk.wrapping_mul(0) = 0`
+/// is a no-op in the wrapping-add accumulator.
+///
+/// # Complexity
+///
+/// `O(lwe_dim · row_width)` wrapping multiply-add — the most expensive
+/// per-slot operation; this is what `precompute_decodes` amortises
+/// across a batch.
 fn compute_c(secret: &[u32], hint: &[u32], lwe_dim: usize, row_width: usize) -> Vec<u32> {
     debug_assert_eq!(secret.len(), lwe_dim);
     debug_assert_eq!(hint.len(), lwe_dim * row_width);
@@ -295,8 +391,25 @@ impl PrecomputingPirBackend for FrodoPirBackend {
     }
 }
 
-/// H[k, j] = Σ_i A[i, k] · D[i, j] mod q. Row-major outputs.
-/// Loop nest is `i, k, j` to keep `A` and `D` accesses sequential per `i`.
+/// Compute the FrodoPIR hint `H = Aᵀ · D mod 2³²`.
+///
+/// # Purpose
+///
+/// Setup-time matvec that produces the per-segment server hint. Output
+/// is row-major shape `lwe_dim × row_width`:
+/// `H[k, j] = Σ_i A[i, k] · D[i, j] mod q`.
+///
+/// # Rationale
+///
+/// Loop nest is `i, k, j` to keep `A` and `D` row accesses sequential
+/// per `i` — the inner-loop pattern LLVM auto-vectorises. The
+/// `aik == 0` early-exit is a sparsity shortcut on the random ternary
+/// `A` (about 1/3 of cells); harmless to timing since `A` is public.
+///
+/// # Complexity
+///
+/// `O(n_rows · lwe_dim · row_width)` wrapping multiply-add — dominates
+/// the cost of `server_setup` and `full_rebuild`.
 fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32) -> Vec<u32> {
     let lwe_dim_us   = lwe_dim as usize;
     let row_width_us = row_width as usize;
@@ -383,16 +496,31 @@ impl IncrementalPirBackend for FrodoPirBackend {
     }
 }
 
-/// Apply the same hint-row deltas to every slot's precomputed `c` vector.
+/// Apply the same hint-row deltas to every slot's precomputed `c`
+/// vector.
 ///
-/// Math: from `H_new[k, off] = H_old[k, off] + A[row_idx, k] · Δ`,
+/// # Purpose
+///
+/// Keeps the Phase-C precomputation consistent with the patched hint —
+/// without it, `client_decode` on a precomputed slot would return
+/// garbage after any mutation.
+///
+/// # Rationale
+///
+/// From `H_new[k, off] = H_old[k, off] + A[row_idx, k] · Δ`,
 /// `c_new[off] = c_old[off] + (Σ_k secret[k] · A[row_idx, k]) · Δ
 ///             = c_old[off] + dot · Δ`.
 ///
-/// `dot = secret · A_row` is **independent of cell offset**, so we compute
-/// it once per `(slot, row_delta)` pair, then apply it to every
-/// `(off, Δ)` cell edit on that row. Cost per row-delta per slot is
-/// `O(lwe_dim + n_cells)`, not `O(lwe_dim · n_cells)`.
+/// `dot = secret · A_row` is **independent of cell offset**, so we
+/// compute it once per `(slot, row_delta)` pair, then apply it to every
+/// `(off, Δ)` cell edit on that row. This is the optimisation that
+/// makes patching asymptotically cheaper than recomputing `c`.
+///
+/// # Complexity
+///
+/// `O(slots · row_deltas · (lwe_dim + n_cells))` — versus
+/// `O(slots · row_deltas · lwe_dim · n_cells)` if `dot` were
+/// recomputed per cell.
 fn patch_slot_c<'a, I>(
     a: &[u32],
     lwe_dim: u32,
@@ -425,8 +553,27 @@ where
     }
 }
 
-/// Apply sparse cell deltas to a hint laid out as (lwe_dim × row_width) row-major.
-/// Math: H[k, cell] += A[row_idx, k] · Δ mod 2³².
+/// Apply sparse cell deltas to a hint laid out as
+/// `lwe_dim × row_width` row-major.
+///
+/// # Purpose
+///
+/// Core of incremental hint patching for both server
+/// (`server_patch_hint`) and client (`client_patch_state`); both
+/// delegate here so the two paths cannot diverge.
+///
+/// # Rationale
+///
+/// Math: `H[k, cell] += A[row_idx, k] · Δ mod 2³²`. Iterates touched
+/// `(row, cell, Δ)` triples and slides `A`'s `row_idx`-th column
+/// against the hint column at `cell`. The `aik == 0` early-exit
+/// captures sparsity in the random ternary `A`.
+///
+/// # Complexity
+///
+/// `O(Σ row_deltas · lwe_dim)` wrapping multiply-add — sparse in the
+/// mutation footprint, dense in `lwe_dim`. Vastly cheaper than a full
+/// `compute_hint` when the mutation count is small.
 fn apply_patch(
     a: &[u32],
     lwe_dim: u32,

@@ -7,6 +7,17 @@
 //! `precompute_queries(batch)` and `precompute_decodes()` as separate
 //! columns (Phase B / Phase C latency on a freshly-built client).
 //!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--lwe-dim`, `--trials`, `--with-precompute`,
+//! `--batch` (Phase-B queue depth when `--with-precompute` is set).
+//! See `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** Companion to `ikpir-server`'s `setup_latency`
+//! — together they pin the wall-clock cost of "no client state" to
+//! "client ready to query". `--with-precompute` exposes Phase-B and
+//! Phase-C cost separately so a deployment can budget warm-start
+//! latency against query throughput.
+//!
 //! **Output:** `results/ikpir_client_setup_latency.csv`
 //! Columns: arity, num_buckets, bucket_size, value_bits, lwe_dim,
 //! with_precompute, batch, mean_setup_ms, min_setup_ms, max_setup_ms,

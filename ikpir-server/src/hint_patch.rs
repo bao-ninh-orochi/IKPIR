@@ -1,14 +1,67 @@
+//! `fold_mutations_into_row_deltas` — slot mutations → sparse per-segment
+//! row deltas.
+//!
+//! # Purpose
+//!
+//! Bridge layer between the SCF-level mutation log
+//! ([`segmented_cuckoo::SlotMutation`]) and the backend-level hint
+//! patcher
+//! ([`crate::IncrementalPirBackend::server_patch_hint`]). Turns
+//! per-slot before/after cell snapshots into the sparse
+//! `(row, [(offset, Δ), …])` format every incremental backend consumes.
+//!
+//! # Design / architecture
+//!
+//! Two-pass algorithm:
+//!
+//! 1. **Accumulate.** Walk `muts` once, packing each `(fp, value)` pair
+//!    via [`pack_slot_cells`] and summing the cell deltas into a
+//!    per-segment `BTreeMap<row, BTreeMap<offset, i64>>` accumulator.
+//!    Multiple mutations on the same `(row, offset)` sum naturally.
+//! 2. **Filter and emit.** Materialise the accumulator into the wire
+//!    shape, dropping zero deltas and empty rows so the output stays
+//!    sparse.
+//!
+//! `BTreeMap` (rather than `HashMap`) so emitted rows and offsets are in
+//! sorted order — important for deterministic on-wire output and easier
+//! diffing in tests.
+//!
+//! # Related files
+//!
+//! - `server.rs::commit_mutations` — sole caller.
+//! - `wire.rs::SegmentRowDeltas` — output type alias.
+//! - `backend/mod.rs::IncrementalPirBackend::server_patch_hint` —
+//!   consumes the output.
+
 use std::collections::BTreeMap;
 
 use segmented_cuckoo::{pack_slot_cells, CuckooParams, SlotMutation};
 
 use crate::wire::SegmentRowDeltas;
 
-/// Fold a batch of slot-level mutations into per-segment, per-row sparse cell
-/// deltas suitable for `IncrementalPirBackend::server_patch_hint`.
+/// Fold a batch of slot-level mutations into per-segment, per-row sparse
+/// cell deltas suitable for
+/// [`IncrementalPirBackend::server_patch_hint`](crate::IncrementalPirBackend::server_patch_hint).
 ///
-/// Output: `out[seg_idx]` is `Vec<(row_idx_in_segment, Vec<(cell_offset_in_row, delta)>)>`.
-/// Multiple mutations on the same row are summed; zero deltas and empty rows are dropped.
+/// # Arguments
+///
+/// - `muts`   — slot mutations drained from the SCF mutation log.
+/// - `params` — current store geometry; supplies arity, segment size,
+///   `cells_per_slot`, and `pack_slot_cells` reuses its bit-layout
+///   constants.
+///
+/// # Returns
+///
+/// `Vec<SegmentRowDeltas>` of length `arity`. `out[seg]` is the sparse
+/// edit list `Vec<(row_in_segment, Vec<(cell_offset_in_row, delta)>)>`
+/// for segment `seg`. Multiple mutations on the same row are summed;
+/// zero deltas and empty rows are dropped before emission.
+///
+/// # Complexity
+///
+/// `O(|muts| · cells_per_slot)` for the accumulation pass plus
+/// `O(touched_rows · log + touched_cells · log)` for the BTreeMap
+/// operations (one batch per drain).
 pub(crate) fn fold_mutations_into_row_deltas(
     muts: &[SlotMutation],
     params: &CuckooParams,
@@ -60,26 +113,39 @@ pub(crate) fn fold_mutations_into_row_deltas(
 
 #[cfg(test)]
 mod tests {
+    //! Unit tests for [`fold_mutations_into_row_deltas`].
+    //!
+    //! Pins the four behaviours every incremental hint patcher relies on:
+    //! correct seg/row routing, insert/delete duality, mutation
+    //! summation, and aggressive zero-pruning.
+
     use super::*;
     use segmented_cuckoo::CuckooParams;
 
+    /// 2-ary fixture: 64 buckets (32 per segment), `bucket_size = 4`,
+    /// `fingerprint_bits = 12`, `value_bits = 8`, `plaintext_bits = 8`.
+    /// `cells_per_slot = ⌈(12+8)/8⌉ = 3`, `value_size_in_cells = 1`.
     fn params_2ary() -> CuckooParams {
-        // 64 buckets, arity 2 → 32 per segment, b=4, fp=12, vb=8, pb=8
-        // cells_per_slot = ceil((12+8)/8) = 3; value_size_in_cells = ceil(8/8) = 1
         let store = segmented_cuckoo::Segmented2aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
         store.params()
     }
 
+    /// Build a `value_size_in_cells()`-long zeroed cell vector.
     fn zero_value_cells(params: &CuckooParams) -> Box<[u32]> {
         vec![0u32; params.value_size_in_cells() as usize].into_boxed_slice()
     }
 
+    /// Build a `value_size_in_cells()`-long cell vector with `val` in
+    /// cell `0` and zeros elsewhere — keeps the test deltas easy to
+    /// reason about.
     fn nonzero_value_cells(params: &CuckooParams, val: u32) -> Box<[u32]> {
         let mut v = vec![0u32; params.value_size_in_cells() as usize];
         v[0] = val;
         v.into_boxed_slice()
     }
 
+    /// A mutation on bucket 33 (= segment 1, bucket-in-seg 1) must land
+    /// in `out[1]` only.
     #[test]
     fn single_insert_lands_in_correct_segment() {
         let p = params_2ary();
@@ -98,6 +164,8 @@ mod tests {
         assert_eq!(out[1][0].0, 1, "bucket_in_seg == 1");
     }
 
+    /// Delete must produce the exact negation of the corresponding
+    /// insert's deltas (cell-by-cell).
     #[test]
     fn single_delete_produces_negated_deltas() {
         let p = params_2ary();
@@ -131,6 +199,9 @@ mod tests {
         }
     }
 
+    /// Two mutations on the same slot must sum: insert(val=10) then
+    /// update(val=10 → val=20) must produce the same net delta as a
+    /// single insert(val=20) from empty.
     #[test]
     fn two_mutations_same_slot_sum_correctly() {
         let p = params_2ary();
@@ -165,6 +236,8 @@ mod tests {
         assert_eq!(chained, expected, "chained insert+update must equal single-step net delta");
     }
 
+    /// A no-op mutation (old == new) must emit nothing — the
+    /// zero-delta filter drops the row entirely.
     #[test]
     fn noop_mutation_emits_nothing() {
         let p = params_2ary();
@@ -181,6 +254,8 @@ mod tests {
         assert!(out.iter().all(|seg| seg.is_empty()), "no-op mutation must produce empty output");
     }
 
+    /// Mutations on different buckets within the same segment land in
+    /// distinct row entries, sorted by row index (BTreeMap ordering).
     #[test]
     fn multiple_buckets_same_segment_preserve_sparsity() {
         let p = params_2ary();

@@ -1,3 +1,25 @@
+//! Integration tests for IKPIR incremental-correctness invariants.
+//!
+//! # Purpose
+//!
+//! Pins three failure-mode behaviours that are too cross-cutting to
+//! live in a single src/ unit test:
+//!
+//! 1. **`mutation_log_drained_on_failure`** — a failed `insert`
+//!    (`TableFull`) must drain the SCF mutation log so the next
+//!    successful mutation emits a `HintDeltaBundle` containing only its
+//!    own deltas, not the leaked rolled-back ones.
+//! 2. **`sparse_delta_correct`** — the bundle of deltas a single
+//!    mutation emits must, when applied via `client.apply_delta`,
+//!    advance the client's hint to match a freshly-rebuilt client.
+//! 3. **`many_mutations_with_warm_queue`** — a long stream of
+//!    mutations against a client that has Phase-B/Phase-C warm queues
+//!    keeps every prepared slot's decode material consistent with the
+//!    patched hint.
+//!
+//! Each test is parameterised by arity (2 / 3 / 4) so the diagnostic on
+//! failure pins which arity broke.
+
 use ikpir_client::IkpirClient;
 use ikpir_server::{FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirError, IkpirServer};
 use segmented_cuckoo::{
@@ -7,35 +29,46 @@ use segmented_cuckoo::{
     Segmented4aryCuckooKVStore, Segmented4aryScheme,
 };
 
+/// Build an empty 2-ary `IkpirServer` (64 buckets × 4 slots = 256
+/// capacity).
 fn build_empty_2() -> IkpirServer<Segmented2aryScheme, FrodoPirBackend> {
     let store = Segmented2aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
+/// Build an empty 3-ary `IkpirServer` (`num_buckets = 3 · 32 = 96`,
+/// same per-segment row count as the 2-ary fixture).
 fn build_empty_3() -> IkpirServer<Segmented3aryScheme, FrodoPirBackend> {
-    // 96 = 3 * 32: same per-segment row count as arity-2 with 64 buckets.
     let store = Segmented3aryCuckooKVStore::new(96, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
+/// Build an empty 4-ary `IkpirServer` (64 buckets × 4 slots).
 fn build_empty_4() -> IkpirServer<Segmented4aryScheme, FrodoPirBackend> {
     let store = Segmented4aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
 
+/// Build a tiny 2-ary `IkpirServer` (16 buckets × 4 slots = 64
+/// capacity); easy to fill.
 fn build_tiny_2() -> IkpirServer<Segmented2aryScheme, FrodoPirBackend> {
-    // 16 buckets * 4 slots = 64 capacity. Easy to fill.
     let store = Segmented2aryCuckooKVStore::new(16, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
+/// Build a tiny 3-ary `IkpirServer` (12 buckets × 4 slots = 48
+/// capacity); easy to fill.
 fn build_tiny_3() -> IkpirServer<Segmented3aryScheme, FrodoPirBackend> {
-    // 12 = 3 * 4 buckets * 4 slots = 48 capacity.
     let store = Segmented3aryCuckooKVStore::new(12, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
+/// Build a tiny 4-ary `IkpirServer` (16 buckets × 4 slots = 64
+/// capacity); easy to fill.
 fn build_tiny_4() -> IkpirServer<Segmented4aryScheme, FrodoPirBackend> {
     let store = Segmented4aryCuckooKVStore::new(16, 4, 12, 8, 8).unwrap();
     IkpirServer::new(store, FrodoConfig::default())
 }
 
+/// Fill `server` to `TableFull`; then verify that a second failed
+/// `insert` does **not** advance the epoch and does **not** corrupt
+/// the hint. `fresh` is a second copy used to check the hint identity.
 fn mutation_log_drained_inner<S>(
     mut server: IkpirServer<S, FrodoPirBackend>,
     mut fresh:  IkpirServer<S, FrodoPirBackend>,
@@ -74,6 +107,9 @@ where S: IndexScheme + SchemeMeta + 'static {
         "failed insert must not corrupt hint (mutation log leaked)");
 }
 
+/// A single `insert` must produce a sparse delta bundle: exactly one
+/// segment touched (because each key lands in one bucket per scheme)
+/// and at most `cells_per_slot` cell deltas in that segment.
 fn sparse_delta_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where S: IndexScheme + SchemeMeta + 'static {
     let bundle: HintDeltaBundle<FrodoPirBackend> = server.insert(b"k", b"v").unwrap();
@@ -95,29 +131,37 @@ where S: IndexScheme + SchemeMeta + 'static {
         "a single insert lands in one bucket → one segment touched");
 }
 
+/// Failed `insert` on a 2-ary server leaves epoch and hint unchanged.
 #[test]
 fn mutation_log_drained_on_failure() {
     mutation_log_drained_inner(build_tiny_2(), build_tiny_2());
 }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn mutation_log_drained_on_failure_3ary() {
     mutation_log_drained_inner(build_tiny_3(), build_tiny_3());
 }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn mutation_log_drained_on_failure_4ary() {
     mutation_log_drained_inner(build_tiny_4(), build_tiny_4());
 }
 
+/// A single `insert` on a 2-ary server produces a sparse delta bundle
+/// touching exactly one segment.
 #[test]
 fn sparse_delta_correct()       { sparse_delta_inner(build_empty_2()); }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn sparse_delta_correct_3ary()  { sparse_delta_inner(build_empty_3()); }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn sparse_delta_correct_4ary()  { sparse_delta_inner(build_empty_4()); }
 
-// Stress test: many mutations × many precomputed slots. The c-patching loop
-// is the load-bearing piece — if its math is wrong, this surfaces a decode
-// divergence quickly across many distinct (slot, hint) pairs.
+/// Stress: many mutations against a client with warm Phase-B/Phase-C
+/// queues. The `c`-patching loop in `client_patch_state` is the
+/// load-bearing piece — if its math is wrong, this surfaces a decode
+/// divergence quickly across many distinct `(slot, hint)` pairs.
 fn many_mutations_with_warm_queue_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where S: IndexScheme + SchemeMeta + 'static {
     // Seed the database before snapshotting the client.
@@ -160,9 +204,13 @@ where S: IndexScheme + SchemeMeta + 'static {
     }
 }
 
+/// Many mutations with a warm precomputation queue still yield the
+/// same decodes as a freshly-rebuilt oracle client (2-ary).
 #[test]
 fn many_mutations_with_warm_queue()       { many_mutations_with_warm_queue_inner(build_empty_2()); }
+/// Same as 2-ary, on the 3-ary server.
 #[test]
 fn many_mutations_with_warm_queue_3ary()  { many_mutations_with_warm_queue_inner(build_empty_3()); }
+/// Same as 2-ary, on the 4-ary server.
 #[test]
 fn many_mutations_with_warm_queue_4ary()  { many_mutations_with_warm_queue_inner(build_empty_4()); }

@@ -14,10 +14,19 @@
 //! `client.build_query` via criterion's sampling loop. The criterion
 //! HTML/JSON report lands in `target/criterion/query_throughput/`.
 //!
-//! **Warm-mode caveat:** the prebuilt queue holds `QUEUE_HEADROOM` slots
-//! per segment. If criterion's measurement budget calls `build_query`
-//! more than `QUEUE_HEADROOM` times, the bench panics on queue exhaustion
-//! — bump `QUEUE_HEADROOM` if you raise criterion's budgets above default.
+//! **Warm-mode caveat:** the prebuilt queue holds `QUEUE_HEADROOM`
+//! slots per segment. If criterion's measurement budget calls
+//! `build_query` more than `QUEUE_HEADROOM` times, the bench panics on
+//! queue exhaustion — bump `QUEUE_HEADROOM` if you raise criterion's
+//! budgets above default.
+//!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--lwe-dim`, `--mode` (cold / warm-b / warm-bc),
+//! `--batch`. See `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** `build_query` is the first client hot path —
+//! its cold-vs-warm gap is the headline argument for FrodoPIR Fig. 1
+//! amortisation. `query_bytes` tracks the wire footprint per query.
 //!
 //! **Output:** `results/ikpir_client_query_throughput.csv`
 //! Columns: mode, arity, num_buckets, bucket_size, value_bits, batch,

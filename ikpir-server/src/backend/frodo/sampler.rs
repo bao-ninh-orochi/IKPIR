@@ -1,17 +1,67 @@
+//! Deterministic LWE sampling primitives for the FrodoPIR backend.
+//!
+//! # Purpose
+//!
+//! Two deterministic samplers shared by setup and query:
+//! [`sample_a`] expands the public LWE matrix `A` from a 16-byte seed,
+//! and [`sample_ternary_into`] fills a slice with uniform `{-1, 0, +1}`
+//! samples drawn from a caller-supplied RNG.
+//!
+//! # Design / architecture
+//!
+//! Both samplers use ChaCha20 as the underlying PRG:
+//! - `sample_a` is keyed by the per-segment public seed; same seed +
+//!   same `(n_rows, lwe_dim)` always produces byte-identical `A`. This
+//!   is what lets `server_answer` and `client_setup` recover `A`
+//!   without shipping it explicitly.
+//! - `sample_ternary_into` consumes the RNG in 32-bit words, taking
+//!   2-bit chunks and rejecting `0b11` to keep the distribution uniform
+//!   on `{0, 1, 2}` (mapped to `{0, +1, -1}`).
+//!
+//! # Related files
+//!
+//! - `params.rs` — `FrodoParams::seed` is the input to `sample_a`.
+//! - `backend.rs` — sole caller for both samplers.
+
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-/// Build a ChaCha20Rng from the 16-byte seed (zero-padded to 32 bytes).
+/// Build a ChaCha20Rng from a 16-byte seed (zero-padded to 32 bytes).
+///
+/// # Rationale
+///
+/// FrodoPIR specifies a `λ = 128`-bit public seed (16 bytes); ChaCha20
+/// takes a 32-byte seed. We zero-pad to bridge — equivalent to using
+/// the first 128 bits of a 256-bit seed and is documented in
+/// `frodo/mod.rs`'s math summary.
 fn rng_from_seed(seed: &[u8; 16]) -> ChaCha20Rng {
     let mut padded = [0u8; 32];
     padded[..16].copy_from_slice(seed);
     ChaCha20Rng::from_seed(padded)
 }
 
-/// Sample the public matrix A in row-major shape `(n_rows × lwe_dim)`.
-/// Each cell is a fresh `u32` from ChaCha20. Output length = `n_rows * lwe_dim`.
+/// Sample the public matrix `A` in row-major shape
+/// `(n_rows × lwe_dim)`.
 ///
-/// Determinism: same `seed` + same `(n_rows, lwe_dim)` → identical output.
+/// # Arguments
+///
+/// - `seed`     — 16-byte public seed (per-segment in FrodoPIR).
+/// - `n_rows`   — number of database rows per segment.
+/// - `lwe_dim`  — LWE dimension `n`.
+///
+/// # Constraints
+///
+/// `n_rows · lwe_dim` must fit in `usize`.
+///
+/// # Returns
+///
+/// `Vec<u32>` of length `n_rows · lwe_dim` filled with successive 32-bit
+/// outputs of `ChaCha20(seed)`. Determinism: same `(seed, n_rows,
+/// lwe_dim)` always produces byte-identical output.
+///
+/// # Complexity
+///
+/// `O(n_rows · lwe_dim)` ChaCha20 outputs.
 pub(crate) fn sample_a(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32> {
     let len = (n_rows as usize)
         .checked_mul(lwe_dim as usize)
@@ -24,9 +74,33 @@ pub(crate) fn sample_a(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32> {
     out
 }
 
-/// Fill `dst` with uniform ternary `{-1, 0, +1}` samples, using `u32`
-/// wraparound to encode `-1` as `u32::MAX`. Uses 2-bit chunks from the
-/// PRG with rejection sampling on `0b11` to avoid bias.
+/// Fill `dst` with uniform ternary `{-1, 0, +1}` samples.
+///
+/// # Purpose
+///
+/// LWE secret and error sampling per FrodoPIR §4.1 (Assumption 1).
+///
+/// # Arguments
+///
+/// - `rng` — any `RngCore`; the caller controls determinism by passing
+///   a seeded RNG.
+/// - `dst` — output buffer; entries are written as `0`, `1`, or
+///   `u32::MAX` (the latter encodes `-1` via `u32` wraparound, which
+///   makes the matvec accumulator's arithmetic work in `Z_{2^32}`
+///   without sign-extension).
+///
+/// # Rationale
+///
+/// Pulls 2 bits per sample and rejects `0b11` so the three remaining
+/// outcomes are equiprobable. Wastes ~25% of the PRG bandwidth in
+/// exchange for unbiased uniform sampling — cheap relative to the
+/// downstream matvec.
+///
+/// # Complexity
+///
+/// Expected `O(dst.len() · 8/3 bits)` PRG output; worst-case bounded
+/// loop because each `next_u32` always produces at least one accepted
+/// sample.
 pub(crate) fn sample_ternary_into<R: RngCore>(rng: &mut R, dst: &mut [u32]) {
     let mut idx = 0;
     while idx < dst.len() {

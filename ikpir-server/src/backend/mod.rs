@@ -1,14 +1,37 @@
 //! Pluggable Index-PIR backends for [`IkpirServer`](crate::IkpirServer).
 //!
-//! [`IndexPirBackend`] is the minimum contract a backend must satisfy
-//! ([`server_setup`] / [`client_setup`] / [`client_query`] / [`server_answer`] /
-//! [`client_decode`]). [`IncrementalPirBackend`] adds two extension methods
-//! ([`server_patch_hint`] / [`client_patch_state`]) that let the server keep
-//! its preprocessing matrix in sync with the database without a full
-//! recompute. [`PrecomputingPirBackend`] adds two further extension methods
-//! ([`client_precompute_queries`] / [`client_precompute_decodes`]) that let
-//! the client amortise per-query LWE work across a batch of upcoming queries
-//! (FrodoPIR Fig. 1 amortisation).
+//! # Purpose
+//!
+//! Defines the trait contract every PIR backend must satisfy and the two
+//! optional extensions (incremental hint, precomputation) that
+//! `IkpirServer` and `IkpirClient` opt into when available.
+//!
+//! # Design / architecture
+//!
+//! Three layered traits, from minimum to richest:
+//!
+//! - [`IndexPirBackend`] is the minimum contract
+//!   ([`server_setup`] / [`client_setup`] / [`client_query`] /
+//!   [`server_answer`] / [`client_decode`]).
+//! - [`IncrementalPirBackend`] adds two extension methods
+//!   ([`server_patch_hint`] / [`client_patch_state`]) that let the
+//!   server keep its preprocessing matrix in sync with the database
+//!   without a full recompute.
+//! - [`PrecomputingPirBackend`] adds two further extension methods
+//!   ([`client_precompute_queries`] / [`client_precompute_decodes`])
+//!   that let the client amortise per-query LWE work across a batch of
+//!   upcoming queries (FrodoPIR Fig. 1 amortisation).
+//!
+//! [`BackendWireSize`] is an orthogonal helper for backends that can
+//! report byte-level sizes; benches use it to compare wire footprints
+//! between incremental deltas and full hints.
+//!
+//! # Related files
+//!
+//! - `frodo/` — the sole shipped backend implementation.
+//! - `../server.rs` — sole consumer of `IndexPirBackend` /
+//!   `IncrementalPirBackend`.
+//! - `../wire.rs` — `wire_byte_size` helpers consume `BackendWireSize`.
 //!
 //! [`server_setup`]: IndexPirBackend::server_setup
 //! [`client_setup`]: IndexPirBackend::client_setup
@@ -142,11 +165,13 @@ pub trait IncrementalPirBackend: IndexPirBackend {
 /// Extension of [`IndexPirBackend`] for backends that can report the wire
 /// (byte) size of their associated types.
 ///
-/// Used by the wire-bundle `wire_byte_size()` helpers in [`crate::wire`]
-/// and by benches that compare incremental hint deltas against full-hint
-/// bytes. A backend that does not implement this trait can still be used
-/// with [`IkpirServer`](crate::IkpirServer); wire-size accounting is
-/// simply unavailable for that backend.
+/// Used by the wire-bundle `wire_byte_size()` helpers (see
+/// `ServerSetupBundle`, `PirQueryBundle`, `PirResponseBundle`,
+/// `HintDeltaBundle`) and by benches that compare incremental hint
+/// deltas against full-hint bytes. A backend that does not implement
+/// this trait can still be used with
+/// [`IkpirServer`](crate::IkpirServer); wire-size accounting is simply
+/// unavailable for that backend.
 ///
 /// **Encoding convention.** Sizes returned here are *minimum* on-wire
 /// representations assuming fixed-width little-endian encoding of every

@@ -1,12 +1,23 @@
 //! Wire-format bundles exchanged between [`IkpirServer`](crate::IkpirServer)
 //! and `IkpirClient`.
 //!
-//! These types are plain data: no I/O, no serialisation. The crate keeps the
-//! format unstable on purpose — bundles are passed by value within a process
-//! in tests and examples, and any production deployment is expected to layer
-//! its own serialisation strategy on top.
+//! # Purpose
 //!
-//! # Bundle taxonomy
+//! Names the four data shapes that cross the server/client boundary:
+//! setup, query, response, and incremental hint delta. Each carries the
+//! current `epoch` so the receiver can detect drift.
+//!
+//! # Design / architecture
+//!
+//! These types are **plain data**: no I/O, no serialisation. The crate
+//! keeps the wire format unstable on purpose — bundles are passed by
+//! value within a process in tests and examples, and any production
+//! deployment is expected to layer its own serialisation strategy on top.
+//! `wire_byte_size` reports the *minimum* on-wire footprint under a
+//! fixed-width little-endian encoding so deployments can compare
+//! parameter choices without committing to a specific serializer.
+//!
+//! ## Bundle taxonomy
 //!
 //! | Bundle | Direction | Carries |
 //! |---|---|---|
@@ -14,6 +25,14 @@
 //! | [`PirQueryBundle`]       | client → server | one [`B::Query`](crate::IndexPirBackend::Query) per segment + epoch |
 //! | [`PirResponseBundle`]    | server → client | one [`B::Response`](crate::IndexPirBackend::Response) per segment + epoch |
 //! | [`HintDeltaBundle`]      | server → client | sparse per-segment row deltas + epoch (after a single mutation) |
+//!
+//! # Related files
+//!
+//! - `server.rs` — emits all four bundles; consumes `PirQueryBundle` in
+//!   `answer`.
+//! - `hint_patch.rs` — `fold_mutations_into_row_deltas` produces the
+//!   `per_segment_row_deltas` inside `HintDeltaBundle`.
+//! - `ikpir-client::IkpirClient` — sole consumer on the client side.
 
 use std::marker::PhantomData;
 
@@ -35,21 +54,29 @@ pub(crate) type SegmentRowDeltas = Vec<(u32, Vec<(u16, i64)>)>;
 
 /// Snapshot of the server's full preprocessing state, sent to a fresh client.
 ///
-/// The client materialises one [`B::ClientState`](crate::IndexPirBackend::ClientState)
-/// per segment from `(backend_params[j], hints[j])`, caches the
-/// [`CuckooParams`], and adopts the server's `epoch`.
+/// # Purpose
 ///
-/// # Invariants
+/// Bootstraps `IkpirClient`: the client materialises one
+/// [`B::ClientState`](crate::IndexPirBackend::ClientState) per segment
+/// from `(backend_params[j], hints[j])`, caches the [`CuckooParams`],
+/// and adopts the server's `epoch`.
+///
+/// # Constraints
 ///
 /// Once a client has been initialised from a `ServerSetupBundle`, every
-/// subsequent bundle for that client instance — whether a full re-setup or a
-/// [`HintDeltaBundle`] — must carry identical
+/// subsequent bundle for that client instance — whether a full re-setup
+/// or a [`HintDeltaBundle`] — must carry identical
 /// `(scheme_kind, num_buckets, bucket_size, fingerprint_bits, value_bits,
-/// plaintext_bits)`. Mid-flight changes are undefined; the upgrade path is to
-/// rebuild a fresh client via `IkpirClient::reset_from(new_bundle)`.
-/// If support for changing these parameters mid-flight is ever needed, both
-/// this bundle and `HintDeltaBundle` would need to carry a parameter-identity
-/// fingerprint that the client asserts on every patch.
+/// plaintext_bits)`. Mid-flight changes are undefined; the upgrade path
+/// is to rebuild a fresh client via `IkpirClient::reset_from(new_bundle)`.
+///
+/// # Rationale
+///
+/// If support for changing these parameters mid-flight is ever needed,
+/// both this bundle and `HintDeltaBundle` would need to carry a
+/// parameter-identity fingerprint that the client asserts on every
+/// patch. Today the IKPIR design assumes static geometry across a client
+/// lifetime.
 #[derive(Clone)]
 pub struct ServerSetupBundle<B: IndexPirBackend> {
     /// Geometry of the underlying SCF KV store (arity, bucket size, fingerprint
@@ -67,10 +94,18 @@ pub struct ServerSetupBundle<B: IndexPirBackend> {
 }
 
 impl<B: BackendWireSize> ServerSetupBundle<B> {
-    /// Minimum on-wire byte size of this setup bundle. Sums
-    /// [`CuckooParams`] + epoch + per-segment
+    /// Minimum on-wire byte size of this setup bundle.
+    ///
+    /// # Returns
+    ///
+    /// Sum of [`CuckooParams`] (21 bytes) + epoch (8 bytes) + per-segment
     /// [`B::server_params_byte_size`](BackendWireSize::server_params_byte_size)
-    /// + per-segment [`B::hint_byte_size`](BackendWireSize::hint_byte_size).
+    /// + per-segment [`B::hint_byte_size`](BackendWireSize::hint_byte_size),
+    /// plus 4-byte length prefixes for each of the two `Vec`s.
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity)` (one pass over `backend_params` and `hints`).
     pub fn wire_byte_size(&self) -> usize {
         let mut bytes = CUCKOO_PARAMS_BYTES + 8; // params + epoch
         bytes += 4; // backend_params length prefix
@@ -83,7 +118,17 @@ impl<B: BackendWireSize> ServerSetupBundle<B> {
 
 /// One PIR query per segment, addressed to a specific server epoch.
 ///
-/// Reject by [`IkpirServer::answer`](crate::IkpirServer::answer) with
+/// # Purpose
+///
+/// Client → server message: carries the per-segment LWE-encrypted row
+/// requests plus the epoch they were built against, so the server can
+/// reject any query that targets a stale view of the database.
+///
+/// # Constraints
+///
+/// `queries.len()` must equal `params.arity()` of the
+/// [`ServerSetupBundle`] used to build the client.
+/// [`IkpirServer::answer`](crate::IkpirServer::answer) rejects with
 /// [`IkpirError::StaleEpoch`](crate::IkpirError::StaleEpoch) if `epoch`
 /// is not the server's current epoch.
 #[derive(Clone)]
@@ -103,8 +148,16 @@ impl<B: BackendWireSize> PirQueryBundle<B>
 where
     B::Query: Clone,
 {
-    /// Minimum on-wire byte size: 8 (epoch) + 4 (vec length prefix) +
-    /// Σ [`B::query_byte_size`](BackendWireSize::query_byte_size).
+    /// Minimum on-wire byte size of this query bundle.
+    ///
+    /// # Returns
+    ///
+    /// `8 (epoch) + 4 (vec length prefix) + Σ`
+    /// [`B::query_byte_size`](BackendWireSize::query_byte_size).
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity)`.
     pub fn wire_byte_size(&self) -> usize {
         let mut bytes = 8 + 4;
         for q in &self.queries { bytes += B::query_byte_size(q); }
@@ -114,9 +167,19 @@ where
 
 /// One PIR response per segment, paired with the epoch that produced it.
 ///
-/// Reject by `IkpirClient::decode` with `EpochMismatch` if `resp.epoch`
-/// differs from the client's cached epoch — the server moved between query
-/// and answer.
+/// # Purpose
+///
+/// Server → client message: carries one
+/// [`B::Response`](IndexPirBackend::Response) per segment plus the epoch
+/// the response was computed under. The client uses the epoch to detect
+/// races (a successful mutation between query and answer would shift
+/// the response's row vs. the client's view).
+///
+/// # Constraints
+///
+/// `responses.len()` equals `params.arity()`. `IkpirClient::decode`
+/// rejects with `EpochMismatch` if `resp.epoch` differs from the
+/// client's cached epoch.
 #[derive(Clone)]
 pub struct PirResponseBundle<B: IndexPirBackend>
 where
@@ -132,8 +195,16 @@ impl<B: BackendWireSize> PirResponseBundle<B>
 where
     B::Response: Clone,
 {
-    /// Minimum on-wire byte size: 8 (epoch) + 4 (vec length prefix) +
-    /// Σ [`B::response_byte_size`](BackendWireSize::response_byte_size).
+    /// Minimum on-wire byte size of this response bundle.
+    ///
+    /// # Returns
+    ///
+    /// `8 (epoch) + 4 (vec length prefix) + Σ`
+    /// [`B::response_byte_size`](BackendWireSize::response_byte_size).
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity)`.
     pub fn wire_byte_size(&self) -> usize {
         let mut bytes = 8 + 4;
         for r in &self.responses { bytes += B::response_byte_size(r); }
@@ -143,15 +214,21 @@ where
 
 /// Sparse hint patch produced by a single successful mutation.
 ///
-/// Wire size is proportional to the mutation footprint (one mutated row per
-/// touched bucket × `cells_per_slot` cells), not the database size. The
-/// client folds the delta into its per-segment state with `apply_delta`,
-/// which is strict-monotone: only `delta.epoch == client.epoch + 1` is
-/// accepted.
+/// # Purpose
 ///
+/// Lets the IKPIR server propagate the effect of one
+/// `insert` / `update` / `delete` to every client without re-sending the
+/// full hint. The client folds the delta with
+/// `IkpirClient::apply_delta`, which is strict-monotone (only
+/// `delta.epoch == client.epoch + 1` is accepted).
+///
+/// # Rationale
+///
+/// Wire size is proportional to the mutation footprint (one mutated row
+/// per touched bucket × `cells_per_slot` cells), not the database size.
 /// Per-mutation deltas inherit the cell-width geometry of the
-/// [`ServerSetupBundle`] they patch; `plaintext_bits` (and the rest of the
-/// SCF geometry) must remain constant across the bundle stream. See
+/// [`ServerSetupBundle`] they patch; `plaintext_bits` (and the rest of
+/// the SCF geometry) must remain constant across the bundle stream. See
 /// [`ServerSetupBundle`] for the invariant statement and upgrade path.
 pub struct HintDeltaBundle<B: IndexPirBackend> {
     /// Server epoch *after* the mutation that produced this delta. Strictly
@@ -165,17 +242,31 @@ pub struct HintDeltaBundle<B: IndexPirBackend> {
 }
 
 impl<B: IndexPirBackend> HintDeltaBundle<B> {
+    /// Crate-internal constructor used by
+    /// [`IkpirServer::commit_mutations`](crate::IkpirServer); end users
+    /// receive the bundle from `insert` / `update` / `delete` rather
+    /// than build it themselves.
     pub(crate) fn new(epoch: u64, per_segment_row_deltas: Vec<SegmentRowDeltas>) -> Self {
         Self { epoch, per_segment_row_deltas, _marker: PhantomData }
     }
 
-    /// Minimum on-wire byte size of this delta bundle under fixed-width
-    /// little-endian encoding (8-byte epoch, 4-byte length prefix per
-    /// segment, 4-byte row index + 4-byte length prefix per row, 2-byte
-    /// cell offset + 8-byte signed delta per cell).
+    /// Minimum on-wire byte size of this delta bundle.
+    ///
+    /// # Rationale
     ///
     /// Backend-agnostic: the delta contents are plain integers, no
     /// backend ciphertext involved.
+    ///
+    /// # Returns
+    ///
+    /// Bytes under fixed-width little-endian encoding: 8 (epoch) +
+    /// 4 (per-segment length prefix) + per segment: 4 (segment-internal
+    /// length prefix) + per row: 4 (row index) + 4 (cells length prefix)
+    /// + 10 bytes per cell (`u16` offset + `i64` signed delta).
+    ///
+    /// # Complexity
+    ///
+    /// `O(touched_rows + touched_cells)`.
     pub fn wire_byte_size(&self) -> usize {
         let mut bytes = 8; // epoch
         bytes += 4;        // per_segment_row_deltas length prefix

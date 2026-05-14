@@ -1,12 +1,24 @@
-//! **Intent:** Catalog on-wire byte sizes of every IKPIR bundle shape (no timing).
+//! **Intent:** Catalogue on-wire byte sizes of every IKPIR bundle shape
+//! (no timing).
 //!
-//! **Method:** Populate to `--load-factor` (default 0.50), snapshot setup
-//! bundle, sample one query + response, then issue one insert / update / delete.
+//! **Method:** Populate to `--load-factor` (default `0.50`), snapshot
+//! the setup bundle, sample one query + response, then issue one
+//! `insert` / `update` / `delete` and record their delta sizes.
+//!
+//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
+//! `--value-bits`, `--lwe-dim`, `--load-factor`. See
+//! `helpers::parse_cli` for defaults.
+//!
+//! **Design rationale:** Companion to `setup_latency` and
+//! `incremental_vs_rebuild` — the timing benches report cost, this one
+//! reports the wire footprint. Together they pin both halves of the
+//! deployment trade-off.
 //!
 //! **Output:** `results/ikpir_wire_sizes.csv`
 //! Columns: arity, num_buckets, bucket_size, value_bits, lwe_dim,
 //! setup_bundle_bytes, query_bytes, response_bytes,
-//! hint_delta_insert_bytes, hint_delta_update_bytes, hint_delta_delete_bytes
+//! hint_delta_insert_bytes, hint_delta_update_bytes,
+//! hint_delta_delete_bytes
 
 mod helpers;
 

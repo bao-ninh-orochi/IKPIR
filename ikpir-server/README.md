@@ -30,11 +30,12 @@ let _bundle = server.setup();
 
 ## Benches
 
-Eight `clap`-parsed CSV-emitting benches under `benches/`. Output lands in
-`results/`. Each invocation produces one CSV row (the writer is
-append-aware); a sweep is the orchestrator's job — `rm` the CSV, then
-loop `cargo bench` over the configs you care about. Pass arguments after
-`--`, e.g. `cargo bench --bench foo -- --num-buckets 32768`.
+Seven `clap`-parsed CSV-emitting benches under `benches/`. Output
+lands in `results/`. Each invocation produces one CSV row (the writer
+is append-aware); a sweep is the orchestrator's job — `rm` the CSV,
+then loop `cargo bench` over the configs you care about. Pass
+arguments after `--`, e.g. `cargo bench --bench foo -- --num-buckets
+32768`.
 
 `answer_throughput` is criterion-backed: it also emits a browsable
 HTML/JSON report under `target/criterion/answer_throughput/`. The other
