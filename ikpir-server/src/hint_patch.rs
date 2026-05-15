@@ -29,15 +29,15 @@
 //! # Related files
 //!
 //! - `server.rs::commit_mutations` — sole caller.
-//! - `wire.rs::SegmentRowDeltas` — output type alias.
-//! - `backend/mod.rs::IncrementalPirBackend::server_patch_hint` —
+//! - `ikpir_common::SegmentRowDeltas` — output type alias.
+//! - `ikpir_common::IncrementalPirBackend::server_patch_hint` —
 //!   consumes the output.
 
 use std::collections::BTreeMap;
 
 use segmented_cuckoo::{pack_slot_cells, CuckooParams, SlotMutation};
 
-use crate::wire::SegmentRowDeltas;
+use ikpir_common::SegmentRowDeltas;
 
 /// Fold a batch of slot-level mutations into per-segment, per-row sparse
 /// cell deltas suitable for

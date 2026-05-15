@@ -1,4 +1,4 @@
-//! Wire-format bundles exchanged between [`IkpirServer`](crate::IkpirServer)
+//! Wire-format bundles exchanged between `IkpirServer`
 //! and `IkpirClient`.
 //!
 //! # Purpose
@@ -22,17 +22,17 @@
 //! | Bundle | Direction | Carries |
 //! |---|---|---|
 //! | [`ServerSetupBundle`]    | server → client | full preprocessing material (`Hint`, `ServerParams`, `CuckooParams`, epoch) |
-//! | [`PirQueryBundle`]       | client → server | one [`B::Query`](crate::IndexPirBackend::Query) per segment + epoch |
-//! | [`PirResponseBundle`]    | server → client | one [`B::Response`](crate::IndexPirBackend::Response) per segment + epoch |
+//! | [`PirQueryBundle`]       | client → server | one `B::Query` per segment + epoch |
+//! | [`PirResponseBundle`]    | server → client | one `B::Response` per segment + epoch |
 //! | [`HintDeltaBundle`]      | server → client | sparse per-segment row deltas + epoch (after a single mutation) |
 //!
 //! # Related files
 //!
-//! - `server.rs` — emits all four bundles; consumes `PirQueryBundle` in
+//! - `server.rs` in `ikpir-server` — emits all four bundles; consumes `PirQueryBundle` in
 //!   `answer`.
-//! - `hint_patch.rs` — `fold_mutations_into_row_deltas` produces the
+//! - `hint_patch.rs` in `ikpir-server` — `fold_mutations_into_row_deltas` produces the
 //!   `per_segment_row_deltas` inside `HintDeltaBundle`.
-//! - `ikpir-client::IkpirClient` — sole consumer on the client side.
+//! - `IkpirClient` in `ikpir-client` — sole consumer on the client side.
 
 use std::marker::PhantomData;
 
@@ -50,14 +50,14 @@ const CUCKOO_PARAMS_BYTES: usize = 1 + 5 * 4;
 /// Each tuple is `(row_index_within_segment, edits)`. Each edit is
 /// `(cell_offset_within_row, signed_delta_mod_2^plaintext_bits)`. Empty
 /// segments and zero deltas are dropped at fold time.
-pub(crate) type SegmentRowDeltas = Vec<(u32, Vec<(u16, i64)>)>;
+pub type SegmentRowDeltas = Vec<(u32, Vec<(u16, i64)>)>;
 
 /// Snapshot of the server's full preprocessing state, sent to a fresh client.
 ///
 /// # Purpose
 ///
 /// Bootstraps `IkpirClient`: the client materialises one
-/// [`B::ClientState`](crate::IndexPirBackend::ClientState) per segment
+/// `B::ClientState` per segment
 /// from `(backend_params[j], hints[j])`, caches the [`CuckooParams`],
 /// and adopts the server's `epoch`.
 ///
@@ -98,9 +98,9 @@ impl<B: BackendWireSize> ServerSetupBundle<B> {
     ///
     /// # Returns
     ///
-    /// Sum of [`CuckooParams`] (21 bytes) + epoch (8 bytes) + per-segment
+    /// Sum of [`CuckooParams`] (21 bytes) plus epoch (8 bytes) plus per-segment
     /// [`B::server_params_byte_size`](BackendWireSize::server_params_byte_size)
-    /// + per-segment [`B::hint_byte_size`](BackendWireSize::hint_byte_size),
+    /// plus per-segment [`B::hint_byte_size`](BackendWireSize::hint_byte_size),
     /// plus 4-byte length prefixes for each of the two `Vec`s.
     ///
     /// # Complexity
@@ -128,8 +128,8 @@ impl<B: BackendWireSize> ServerSetupBundle<B> {
 ///
 /// `queries.len()` must equal `params.arity()` of the
 /// [`ServerSetupBundle`] used to build the client.
-/// [`IkpirServer::answer`](crate::IkpirServer::answer) rejects with
-/// [`IkpirError::StaleEpoch`](crate::IkpirError::StaleEpoch) if `epoch`
+/// `IkpirServer::answer` rejects with
+/// `IkpirError::StaleEpoch` if `epoch`
 /// is not the server's current epoch.
 #[derive(Clone)]
 pub struct PirQueryBundle<B: IndexPirBackend>
@@ -137,8 +137,7 @@ where
     B::Query: Clone,
 {
     /// Epoch at which the client built the queries. Must equal the server's
-    /// current epoch when [`IkpirServer::answer`](crate::IkpirServer::answer)
-    /// runs.
+    /// current epoch when `IkpirServer::answer` runs.
     pub epoch: u64,
     /// One [`B::Query`](IndexPirBackend::Query) per segment.
     pub queries: Vec<B::Query>,
@@ -242,11 +241,11 @@ pub struct HintDeltaBundle<B: IndexPirBackend> {
 }
 
 impl<B: IndexPirBackend> HintDeltaBundle<B> {
-    /// Crate-internal constructor used by
-    /// [`IkpirServer::commit_mutations`](crate::IkpirServer); end users
+    /// Internal constructor used by `IkpirServer::commit_mutations`; end users
     /// receive the bundle from `insert` / `update` / `delete` rather
     /// than build it themselves.
-    pub(crate) fn new(epoch: u64, per_segment_row_deltas: Vec<SegmentRowDeltas>) -> Self {
+    #[doc(hidden)]
+    pub fn new(epoch: u64, per_segment_row_deltas: Vec<SegmentRowDeltas>) -> Self {
         Self { epoch, per_segment_row_deltas, _marker: PhantomData }
     }
 

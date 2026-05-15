@@ -38,10 +38,9 @@ use segmented_cuckoo::{
     Segmented3aryScheme, Segmented4aryScheme,
 };
 
-use crate::backend::{IndexPirBackend, IncrementalPirBackend};
+use ikpir_common::{HintDeltaBundle, IkpirError, IndexPirBackend, IncrementalPirBackend,
+    PirQueryBundle, PirResponseBundle, ServerSetupBundle};
 use crate::hint_patch::fold_mutations_into_row_deltas;
-use crate::wire::{HintDeltaBundle, PirQueryBundle, PirResponseBundle, ServerSetupBundle};
-use crate::IkpirError;
 
 /// Server-side IKPIR engine, generic over the SCF scheme `S` and PIR
 /// backend `B`.

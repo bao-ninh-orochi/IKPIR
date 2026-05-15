@@ -25,7 +25,7 @@
 //! - `client.rs` — sole producer of these variants.
 //! - `ikpir-server::IkpirError` — wrapped by the `Server` variant.
 
-use ikpir_server::IkpirError;
+use ikpir_common::IkpirError;
 
 /// Errors returned by [`IkpirClient`](crate::IkpirClient) methods.
 ///

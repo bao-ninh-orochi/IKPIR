@@ -21,7 +21,7 @@
 //!
 //! - `backend.rs` — sole consumer; reads `FrodoParams` per call and
 //!   `FrodoConfig` once per setup.
-//! - `../../server.rs` — persists `FrodoConfig` for the server's
+//! - `ikpir-server::IkpirServer` — persists `FrodoConfig` for the server's
 //!   lifetime.
 
 /// FrodoPIR LWE parameters.
@@ -80,7 +80,7 @@ impl FrodoParams {
 /// # Purpose
 ///
 /// The small, stable backend surface persisted by
-/// [`IkpirServer`](crate::IkpirServer). Threaded into every
+/// `IkpirServer`. Threaded into every
 /// `B::server_setup` call (initial setup *and* every `full_rebuild`),
 /// so a single config controls the LWE dimension across the server's
 /// lifetime.

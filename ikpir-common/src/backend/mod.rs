@@ -1,4 +1,4 @@
-//! Pluggable Index-PIR backends for [`IkpirServer`](crate::IkpirServer).
+//! Pluggable Index-PIR backends for `IkpirServer`.
 //!
 //! # Purpose
 //!
@@ -29,9 +29,9 @@
 //! # Related files
 //!
 //! - `frodo/` — the sole shipped backend implementation.
-//! - `../server.rs` — sole consumer of `IndexPirBackend` /
+//! - `ikpir-server::IkpirServer` — sole consumer of `IndexPirBackend` /
 //!   `IncrementalPirBackend`.
-//! - `../wire.rs` — `wire_byte_size` helpers consume `BackendWireSize`.
+//! - `wire.rs` in `ikpir-common` — `wire_byte_size` helpers consume `BackendWireSize`.
 //!
 //! [`server_setup`]: IndexPirBackend::server_setup
 //! [`client_setup`]: IndexPirBackend::client_setup
@@ -75,7 +75,7 @@ pub use frodo::{FrodoConfig, FrodoPirBackend};
 pub trait IndexPirBackend {
     /// Backend-specific tunable knobs supplied at server construction time
     /// (e.g. LWE dimension, error distribution width). Persisted by
-    /// [`IkpirServer`](crate::IkpirServer) and re-used by `full_rebuild` so
+    /// `IkpirServer` and re-used by `full_rebuild` so
     /// every regenerated `Hint` has the same dimensions as the originals.
     type Config: Clone + Default;
     /// Public preprocessing parameters produced at setup time
@@ -170,7 +170,7 @@ pub trait IncrementalPirBackend: IndexPirBackend {
 /// `HintDeltaBundle`) and by benches that compare incremental hint
 /// deltas against full-hint bytes. A backend that does not implement
 /// this trait can still be used with
-/// [`IkpirServer`](crate::IkpirServer); wire-size accounting is simply
+/// `IkpirServer`; wire-size accounting is simply
 /// unavailable for that backend.
 ///
 /// **Encoding convention.** Sizes returned here are *minimum* on-wire

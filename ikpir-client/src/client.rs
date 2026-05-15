@@ -30,7 +30,7 @@
 //! - `error.rs` — `IkpirClientError` variants.
 //! - `ikpir-server::IkpirServer` — counterpart on the server side.
 
-use ikpir_server::{
+use ikpir_common::{
     HintDeltaBundle, IndexPirBackend, IncrementalPirBackend, PrecomputingPirBackend,
     PirQueryBundle, PirResponseBundle, ServerSetupBundle,
 };
@@ -175,7 +175,7 @@ where
     ///
     /// A [`PirQueryBundle`] carrying the current client epoch. The
     /// server rejects with
-    /// [`IkpirError::StaleEpoch`](ikpir_server::IkpirError::StaleEpoch)
+    /// [`IkpirError::StaleEpoch`](ikpir_common::IkpirError::StaleEpoch)
     /// if it has moved past this epoch.
     ///
     /// # Complexity

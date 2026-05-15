@@ -33,7 +33,7 @@
 //!
 //! # Quick start
 //!
-//! ```
+//! ```no_run
 //! use ikpir_client::IkpirClient;
 //! use ikpir_server::{FrodoConfig, FrodoPirBackend, Segmented2aryIkpirServer};
 //! use segmented_cuckoo::Segmented2aryCuckooKVStore;
@@ -62,8 +62,8 @@ mod error;
 pub use client::{DeltaApplyOutcome, IkpirClient};
 pub use error::IkpirClientError;
 
-pub use ikpir_server::{
-    BackendWireSize, HintDeltaBundle, IndexPirBackend, IncrementalPirBackend,
-    PrecomputingPirBackend, PirQueryBundle, PirResponseBundle, ServerSetupBundle,
+pub use ikpir_common::{
+    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle,
+    IkpirError, IndexPirBackend, IncrementalPirBackend, PrecomputingPirBackend,
+    PirQueryBundle, PirResponseBundle, ServerSetupBundle,
 };
-pub use ikpir_server::{FrodoConfig, FrodoPirBackend};

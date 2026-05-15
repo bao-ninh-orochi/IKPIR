@@ -12,12 +12,16 @@ without a full rebuild.
 
 | File | Role |
 |---|---|
-| `src/lib.rs` | Re-exports (incl. `FrodoConfig`) + `IkpirError` enum (5 variants) |
+| `src/lib.rs` | Declares `mod hint_patch; mod server;` and re-exports `IkpirServer`, the `Segmented{2,3,4}aryIkpirServer` aliases, and the full shared protocol surface (`IndexPirBackend`, `FrodoConfig`, wire bundles, `IkpirError`) from `ikpir-common` |
 | `src/server.rs` | `IkpirServer<S, B>` generic + 9 public methods + `Segmented{2,3,4}aryIkpirServer` type aliases |
-| `src/wire.rs` | `ServerSetupBundle / PirQueryBundle / PirResponseBundle / HintDeltaBundle` |
-| `src/backend/mod.rs` | `IndexPirBackend` trait (6 associated types incl. `Config` + 5 methods) and `IncrementalPirBackend` (2 extra methods) |
-| `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1774`) |
-| `src/hint_patch.rs` | `fold_mutations_into_row_deltas` — `SlotMutation` list → per-segment sparse row deltas |
+| `src/hint_patch.rs` | `fold_mutations_into_row_deltas` — `SlotMutation` list → per-segment sparse row deltas (consumes `ikpir_common::SegmentRowDeltas`) |
+| `tests/frodo_compose.rs` | Smoke test for the `FrodoPirBackend` × `IkpirServer` composition — was originally a unit test inside `backend/frodo/backend.rs` and relocated here when that file moved to `ikpir-common` |
+
+> **Trait family, wire bundles, FrodoPIR backend, and `IkpirError` now
+> live in [`ikpir-common`](../ikpir-common/CLAUDE.md).** This crate
+> re-exports them so existing call sites (`use ikpir_server::IndexPirBackend`,
+> `use ikpir_server::FrodoConfig`, `use ikpir_server::ServerSetupBundle`,
+> `use ikpir_server::IkpirError`, ...) keep resolving unchanged.
 
 ## 3. Key design decisions (the WHY)
 
@@ -91,9 +95,12 @@ without a full rebuild.
 |---|---|
 | Setup + answer flow | `server.rs::IkpirServer::{new, setup, answer}` |
 | Mutation + incremental hint | `server.rs::commit_mutations` → `hint_patch.rs::fold_mutations_into_row_deltas` |
-| Backend trait contract | `backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` |
-| FrodoPIR config knobs | `backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
-| Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs` |
+| Backend trait contract | `ikpir-common/src/backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` + `PrecomputingPirBackend` + `BackendWireSize` |
+| FrodoPIR config knobs | `ikpir-common/src/backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
+| FrodoPIR backend implementation | `ikpir-common/src/backend/frodo/backend.rs` |
+| Wire-bundle definitions | `ikpir-common/src/wire.rs` |
+| `IkpirError` variants | `ikpir-common/src/error.rs` |
+| Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs`, `tests/frodo_compose.rs` |
 | Benches | `benches/setup_latency.rs`, `benches/answer_throughput.rs`, `benches/incremental_vs_rebuild.rs` (+ `failure_modes`, `wire_sizes`, `setup_to_first_query`, `steady_state_workload`) |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:

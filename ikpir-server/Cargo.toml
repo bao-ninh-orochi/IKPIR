@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 segmented-cuckoo = { workspace = true }
+ikpir-common     = { workspace = true }
 rand             = { workspace = true }
 rand_chacha      = { workspace = true }
 

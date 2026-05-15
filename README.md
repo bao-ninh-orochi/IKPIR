@@ -71,9 +71,10 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 | Component | Status |
 |---|---|
 | Segmented Cuckoo Filter + KV store | Shipped (`segmented-cuckoo`) |
+| Backend trait family + wire bundles + shared error | Shipped (`ikpir-common`) |
 | Server protocol (setup / answer / insert / update / delete / full_rebuild) | Shipped (`ikpir-server`) |
 | Client protocol (from_setup / build_query / decode / apply_delta / reset_from) | Shipped (`ikpir-client`) |
-| FrodoPIR backend | Shipped |
+| FrodoPIR backend | Shipped (`ikpir-common`) |
 | SimplePIR backend | Planned |
 
 ## Repository tour
@@ -81,6 +82,8 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 | Resource | Purpose |
 |---|---|
 | [`segmented-cuckoo/CLAUDE.md`](segmented-cuckoo/CLAUDE.md) | Filter + KV store internals, file map, design decisions |
+| [`ikpir-common/CLAUDE.md`](ikpir-common/CLAUDE.md) | Shared crate internals: backend trait family, FrodoPIR, wire bundles, `IkpirError` |
+| [`ikpir-common/README.md`](ikpir-common/README.md) | Shared crate role in the workspace + backend-author quick reference |
 | [`ikpir-server/CLAUDE.md`](ikpir-server/CLAUDE.md) | Server crate internals, per-segment architecture, backend-author checklist |
 | [`ikpir-server/README.md`](ikpir-server/README.md) | Server quick start and backend implementation guide |
 | [`ikpir-client/CLAUDE.md`](ikpir-client/CLAUDE.md) | Client crate internals, epoch state machine, failure modes |

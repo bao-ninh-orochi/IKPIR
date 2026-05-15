@@ -1,0 +1,163 @@
+# CLAUDE.md — ikpir-common crate
+
+## 1. Crate purpose
+
+Shared building blocks of the IKPIR protocol that both server and client
+consume but neither owns: the **pluggable Index-PIR backend trait
+family**, the shipped **FrodoPIR backend**, the **wire-format bundles**
+exchanged across the server/client boundary, and the shared **`IkpirError`**
+enum.
+
+`ikpir-server` and `ikpir-client` both depend on this crate and re-export
+the items they expose in their own public signatures, so existing call
+sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
+`use ikpir_server::ServerSetupBundle`, ...) keep resolving unchanged.
+
+## 2. File map
+
+| File | Role |
+|---|---|
+| `src/lib.rs` | Top-level re-exports of `backend`, `wire`, and `error` |
+| `src/error.rs` | `IkpirError` enum (5 variants) — returned by server methods, wrapped by `IkpirClientError::Server` on the client side |
+| `src/wire.rs` | Wire-format bundles `ServerSetupBundle / PirQueryBundle / PirResponseBundle / HintDeltaBundle`, the `SegmentRowDeltas` type alias, and per-bundle `wire_byte_size` helpers |
+| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 5 methods), `IncrementalPirBackend` (+2 methods), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods) |
+| `src/backend/frodo/mod.rs` | Re-exports the FrodoPIR backend's public surface |
+| `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1774`) |
+| `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
+| `src/backend/frodo/arith.rs` | `round_p_to_q` / `round_q_to_p` — plaintext ↔ ciphertext modulus conversion |
+| `src/backend/frodo/sampler.rs` | `sample_a` (LWE public matrix) + `sample_ternary_into` (LWE secret / error sampling) |
+
+## 3. Key design decisions (the WHY)
+
+- **Sibling-crate placement** — backend traits, FrodoPIR, wire bundles,
+  and the shared error live here rather than in `ikpir-server` so that
+  `ikpir-client` is no longer a downstream consumer of the server crate.
+  The two protocol crates now consume `ikpir-common` as siblings;
+  `ikpir-client` depends on `ikpir-server` only via `[dev-dependencies]`
+  for end-to-end tests, benches, and the doctest in its quick-start.
+
+- **Re-export discipline** — `ikpir-server` and `ikpir-client` both
+  re-export the common items they expose in their own signatures
+  (`IndexPirBackend`, `FrodoConfig`, all four bundle types, `IkpirError`).
+  Every shared item resolves under all three crate paths; callers pick
+  whichever is most ergonomic for their import context.
+
+- **Three-layer trait hierarchy** — `IndexPirBackend` is mandatory and
+  defines the basic `setup/query/answer/decode` triple. `IncrementalPirBackend`
+  is optional and adds `server_patch_hint / client_patch_state` for
+  full-rebuild-free DB mutations. `PrecomputingPirBackend` is optional
+  and adds Phase B / Phase C precomputation for amortising per-query
+  LWE work (FrodoPIR Fig. 1). `BackendWireSize` is optional and reports
+  per-type byte sizes for wire-size benches. A backend that doesn't
+  implement an optional extension is simply unavailable on the
+  corresponding code path.
+
+- **No I/O, no serialisation in the wire types** — bundles are plain
+  data crossing process boundaries by value within tests and examples.
+  Production deployments layer their own serialiser on top;
+  `wire_byte_size()` reports the *minimum* on-wire footprint under
+  fixed-width little-endian encoding so configs can be compared without
+  committing to a specific format.
+
+- **`HintDeltaBundle::new` is `#[doc(hidden)] pub`** — the constructor
+  must be reachable from `ikpir-server` (sibling crate) but is hidden
+  from the public API. It skips the invariant checks that
+  `IkpirClient::apply_delta` then trusts (epoch monotonicity,
+  `per_segment_row_deltas.len() == arity`); only
+  `IkpirServer::commit_mutations` is permitted to call it.
+
+- **`SegmentRowDeltas` is `pub`** (was `pub(crate)` before the split) —
+  the type appears in the public `HintDeltaBundle` field, and
+  `ikpir-server::hint_patch::fold_mutations_into_row_deltas` (now in a
+  sibling crate) must produce values of this type.
+
+- **Threat model unchanged** — Index-PIR hides the queried row within
+  each segment. The SCF candidate-bucket set is public and
+  deterministic; an observer who sees many queries learns which SCF
+  buckets were touched, not the slot contents or fingerprint value.
+  Constant-time decode is out of scope.
+
+## 4. Trait family
+
+```text
+IndexPirBackend (mandatory)
+│   ServerParams / Hint / ClientState / Query / Response / Config (assoc types)
+│   server_setup(config, db, n_rows, row_width, plaintext_bits) -> (ServerParams, Hint)
+│   client_setup(params, hint) -> ClientState
+│   client_query(state, row) -> Query
+│   server_answer(params, db, n_rows, row_width, query) -> Response
+│   client_decode(state, response) -> Vec<u32>
+│
+├── IncrementalPirBackend
+│   server_patch_hint(params, hint, row_deltas)
+│   client_patch_state(state, params, row_deltas)
+│
+├── PrecomputingPirBackend
+│   client_precompute_queries(state, count)        — Phase B
+│   client_precompute_decodes(state)               — Phase C
+│   prepared_slot_count(state) -> usize
+│   in_flight_slot_count(state) -> usize
+│
+└── BackendWireSize
+    query_byte_size(q) / response_byte_size(r) / hint_byte_size(h) / server_params_byte_size(p)
+```
+
+`FrodoPirBackend` implements all four traits.
+
+## 5. Wire bundle taxonomy
+
+| Bundle | Direction | Carries |
+|---|---|---|
+| `ServerSetupBundle<B>` | server → client | full preprocessing material (`Hint`, `ServerParams`, `CuckooParams`, epoch) |
+| `PirQueryBundle<B>` | client → server | one `B::Query` per segment + epoch |
+| `PirResponseBundle<B>` | server → client | one `B::Response` per segment + epoch |
+| `HintDeltaBundle<B>` | server → client | sparse per-segment row deltas + epoch (after one mutation) |
+
+`SegmentRowDeltas = Vec<(u32, Vec<(u16, i64)>)>` — per-segment list of
+`(row_in_segment, [(cell_offset, signed_delta), …])`. Backend-agnostic:
+contents are plain integers, no backend ciphertext.
+
+## 6. Failure-mode table (`IkpirError`)
+
+| Variant | Source (server method) | Meaning |
+|---|---|---|
+| `StaleEpoch` | `answer` | client query against an older server epoch |
+| `MalformedQuery` | `answer` | wrong number of segments in `q.queries` |
+| `TableFull` | `insert` | SCF cuckoo kicks exhausted |
+| `NotFound` | `update` / `delete` | key absent |
+| `InvalidInput` | `insert` / `update` | bad value width |
+
+`ikpir-client` re-exports `IkpirError` and wraps it in
+`IkpirClientError::Server(IkpirError)` for synchronous in-process
+composition.
+
+## 7. Entry points
+
+| Task | Where to look |
+|---|---|
+| Backend trait contract | `backend/mod.rs::IndexPirBackend` + the three extension traits |
+| FrodoPIR config knobs | `backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
+| Implement a new backend | mirror `backend/frodo/backend.rs`; see backend-author checklist below |
+| Wire-bundle layout | `wire.rs` module docs + each bundle's labelled-section block |
+| Shared error variants | `error.rs::IkpirError` |
+| Round-trip cell-modulus conversion | `backend/frodo/arith.rs` |
+| LWE sampling | `backend/frodo/sampler.rs` (`sample_a`, `sample_ternary_into`) |
+| Cross-crate integration test | `ikpir-server/tests/frodo_compose.rs` exercises `FrodoPirBackend` end-to-end against `IkpirServer` |
+
+**Backend-author checklist** — a new `IndexPirBackend` impl must:
+
+1. Define `Config: Clone + Default` holding the backend's tunable knobs
+   (e.g. `FrodoConfig { lwe_dim }`, future `SimplePirConfig`).
+2. `server_setup(config, db, n_rows, row_width, plaintext_bits)` returns
+   `(ServerParams, Hint)` from the DB slice and the supplied config.
+3. `client_setup` returns `ClientState` from `(ServerParams, Hint)`.
+4. The triple `(client_query, server_answer, client_decode)` must satisfy:
+   `client_decode(server_answer(client_query(state, row))) == db[row*row_width..(row+1)*row_width]`.
+5. If implementing `IncrementalPirBackend`: `server_patch_hint` and
+   `client_patch_state` must keep `Hint` and `ClientState` consistent
+   with the updated DB for **all** future queries.
+6. If implementing `PrecomputingPirBackend`: prepared slots are consumed
+   FIFO segment-locally; `client_patch_state` must also update
+   already-prepared Phase-C material (see the trait's contract block).
+7. If implementing `BackendWireSize`: return the *minimum* fixed-width
+   little-endian byte size — no framing, no compression.

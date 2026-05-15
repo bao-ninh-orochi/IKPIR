@@ -3,18 +3,23 @@
 ## 1. Crate purpose
 
 Client-side IKPIR: holds `CuckooParams` and per-segment `B::ClientState`
-plus an epoch counter. Translates user-level `(key, query)` operations into
-wire-level Index-PIR query/response bundles from `ikpir-server`. The client
-**never** owns a `CuckooKVStore`; its only persistent material from the
-server is the setup bundle.
+plus an epoch counter. Translates user-level `(key, query)` operations
+into wire-level Index-PIR query/response bundles defined in
+[`ikpir-common`](../ikpir-common/CLAUDE.md). The client **never** owns a
+`CuckooKVStore`; its only persistent material from the server is the
+setup bundle.
 
 ## 2. File map
 
 | File | Role |
 |---|---|
-| `src/lib.rs` | Re-exports `IkpirClient`, `IkpirClientError`, and wire / backend types from `ikpir-server` |
+| `src/lib.rs` | Declares `mod client; mod error;` and re-exports `IkpirClient`, `DeltaApplyOutcome`, `IkpirClientError`, plus the shared protocol surface (`IndexPirBackend`, `FrodoConfig`, wire bundles, `IkpirError`) from `ikpir-common` |
 | `src/client.rs` | `IkpirClient<B>` generic + 7 public methods |
-| `src/error.rs` | `IkpirClientError` enum (4 protocol variants + `Server(IkpirError)` forward) |
+| `src/error.rs` | `IkpirClientError` enum (4 protocol variants + `Server(IkpirError)` forward; `IkpirError` is re-exported from `ikpir-common`) |
+
+> Production code in this crate depends only on `ikpir-common` and
+> `segmented-cuckoo`. `ikpir-server` is carried as a `[dev-dependency]`
+> for `tests/client_e2e.rs`, the six benches, and the quick-start doctest.
 
 ## 3. Key design decisions (the WHY)
 

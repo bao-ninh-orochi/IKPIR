@@ -19,12 +19,13 @@ workspace = true
 
 [dependencies]
 segmented-cuckoo = { workspace = true }
-ikpir-server     = { workspace = true }
+ikpir-common     = { workspace = true }
 
 [dev-dependencies]
-proptest  = { workspace = true }
-clap      = { workspace = true }
-criterion = { workspace = true }
+ikpir-server = { workspace = true }
+proptest     = { workspace = true }
+clap         = { workspace = true }
+criterion    = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

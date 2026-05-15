@@ -340,8 +340,18 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "criterion",
+ "ikpir-common",
  "ikpir-server",
  "proptest",
+ "segmented-cuckoo",
+]
+
+[[package]]
+name = "ikpir-common"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "rand_chacha",
  "segmented-cuckoo",
 ]
 
@@ -352,6 +362,7 @@ dependencies = [
  "clap",
  "criterion",
  "ikpir-client",
+ "ikpir-common",
  "proptest",
  "rand",
  "rand_chacha",

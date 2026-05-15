@@ -203,6 +203,11 @@ client.decode  → fp match → value
 
 ## Implementing a new backend
 
+The backend trait family and the shipped `FrodoPirBackend` live in
+[`ikpir-common`](../ikpir-common). This crate re-exports them, so
+implementations land in the workspace either inside `ikpir-common`
+itself or in a downstream crate that depends on `ikpir-common`.
+
 Implement `IndexPirBackend` (mandatory) and optionally
 `IncrementalPirBackend` (for incremental hint updates without a full
 rebuild).
