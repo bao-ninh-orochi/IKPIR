@@ -73,6 +73,43 @@ pub fn parse_cli_with_matches<C: clap::Parser>() -> (C, clap::ArgMatches) {
     (cli, m)
 }
 
+// ── Backend selection ───────────────────────────────────────────────────────
+
+/// Index-PIR backend selector for benches.
+///
+/// `frodo` → [`ikpir_common::FrodoPirBackend`] (default; FrodoPIR-style
+/// tall-skinny per-segment matrix, ternary errors, default `lwe_dim`
+/// 1774). `simple` → [`ikpir_common::SimplePirBackend`] (SimplePIR-style
+/// square reshape, discrete-Gaussian errors, default `lwe_dim` 1024).
+#[allow(dead_code)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// FrodoPIR backend (tall-skinny matrix, ternary LWE).
+    Frodo,
+    /// SimplePIR backend (square reshape, discrete-Gaussian LWE).
+    Simple,
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backend::Frodo  => write!(f, "frodo"),
+            Backend::Simple => write!(f, "simple"),
+        }
+    }
+}
+
+/// Backend-appropriate default LWE dimension. FrodoPIR → 1774 (Table 5
+/// 128-bit security). SimplePIR → 1024 (paper §4.2). Used by every
+/// bench's `Cli` when `--lwe-dim` is omitted.
+#[allow(dead_code)]
+pub fn backend_default_lwe_dim(b: Backend) -> u32 {
+    match b {
+        Backend::Frodo  => 1774,
+        Backend::Simple => 1024,
+    }
+}
+
 // ── Default num_buckets per arity ────────────────────────────────────────────
 
 /// Default `num_buckets` for academic-paper scale (≈2^16 total capacity).

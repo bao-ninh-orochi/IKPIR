@@ -476,22 +476,25 @@ impl IncrementalPirBackend for FrodoPirBackend {
 
     fn client_patch_state(
         state: &mut FrodoClientState,
-        params: &FrodoServerParams,
         row_deltas: &[(u32, Vec<(u16, i64)>)],
     ) {
+        // Pull the params snapshot out of the state — `client_setup`
+        // already stashed a copy, so no separate `params` argument is
+        // needed (and threading one would be redundant).
+        let FrodoClientState { params, hint, prepared, in_flight } = state;
         apply_patch(
             &params.a,
             params.params.lwe_dim,
             params.n_rows,
             params.row_width,
-            &mut state.hint.data,
+            &mut hint.data,
             row_deltas,
         );
         // Slots that already carry `c = sᵀ·H` need their `c` patched in
         // lock-step. Slots with `c == None` are skipped — they will lazily
         // pick up the post-patch hint on first use.
         patch_slot_c(&params.a, params.params.lwe_dim, params.row_width,
-                     state.prepared.iter_mut().chain(state.in_flight.as_mut()),
+                     prepared.iter_mut().chain(in_flight.as_mut()),
                      row_deltas);
     }
 }
@@ -919,7 +922,7 @@ mod tests {
 
         let mut server_hint = hint;
         FrodoPirBackend::server_patch_hint(&sp, &mut server_hint, &row_deltas);
-        FrodoPirBackend::client_patch_state(&mut state, &sp, &row_deltas);
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
 
         assert_eq!(state.hint.data, server_hint.data,
             "server and client patched hints must be identical");
@@ -959,7 +962,7 @@ mod tests {
 
         let mut server_hint = hint;
         FrodoPirBackend::server_patch_hint(&sp, &mut server_hint, &row_deltas);
-        FrodoPirBackend::client_patch_state(&mut state, &sp, &row_deltas);
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
 
         assert_eq!(state.hint.data, server_hint.data,
             "server and client patched hints must be identical");
@@ -1095,7 +1098,7 @@ mod tests {
 
         // Snapshot the secrets so we can recompute c against the patched hint.
         let secrets: Vec<Vec<u32>> = state.prepared.iter().map(|s| s.secret.clone()).collect();
-        FrodoPirBackend::client_patch_state(&mut state, &sp, &row_deltas);
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
 
         // Oracle: compute c = sᵀ · patched_hint directly from H.
         let lwe_dim = sp.params.lwe_dim;
@@ -1139,7 +1142,7 @@ mod tests {
             .collect();
 
         FrodoPirBackend::server_patch_hint(&sp, &mut server_hint, &row_deltas);
-        FrodoPirBackend::client_patch_state(&mut state, &sp, &row_deltas);
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
 
         for &(target_row, _) in raw {
             let q = FrodoPirBackend::client_query(&mut state, target_row);

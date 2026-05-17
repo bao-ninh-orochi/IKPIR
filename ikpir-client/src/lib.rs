@@ -63,7 +63,7 @@ pub use client::{DeltaApplyOutcome, IkpirClient};
 pub use error::IkpirClientError;
 
 pub use ikpir_common::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle,
-    IkpirError, IndexPirBackend, IncrementalPirBackend, PrecomputingPirBackend,
-    PirQueryBundle, PirResponseBundle, ServerSetupBundle,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, SimpleConfig, SimplePirBackend,
+    HintDeltaBundle, IkpirError, IndexPirBackend, IncrementalPirBackend,
+    PrecomputingPirBackend, PirQueryBundle, PirResponseBundle, ServerSetupBundle,
 };

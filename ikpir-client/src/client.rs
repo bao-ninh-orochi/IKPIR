@@ -59,7 +59,6 @@ use crate::error::IkpirClientError;
 /// `&mut self`. Wrap in `Mutex` if exposing across threads.
 pub struct IkpirClient<B: IndexPirBackend> {
     params:         CuckooParams,
-    backend_params: Vec<B::ServerParams>,
     states:         Vec<B::ClientState>,
     epoch:          u64,
 }
@@ -110,16 +109,19 @@ impl<B: IndexPirBackend> IkpirClient<B> {
         debug_assert_eq!(bundle.backend_params.len(), arity);
         debug_assert_eq!(bundle.hints.len(), arity);
 
+        // `client_setup` stashes a clone of each `ServerParams` inside the
+        // returned `ClientState`, so the client does not need to retain
+        // its own `Vec<B::ServerParams>` — the per-state copy is the
+        // sole source of truth on this side of the wire.
         let states: Vec<B::ClientState> = bundle.backend_params.iter()
             .zip(bundle.hints.iter())
             .map(|(p, h)| B::client_setup(p, h))
             .collect();
 
         Self {
-            params:         bundle.params,
-            backend_params: bundle.backend_params,
+            params: bundle.params,
             states,
-            epoch:          bundle.epoch,
+            epoch:  bundle.epoch,
         }
     }
 
@@ -407,11 +409,7 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
         }
         for (j, deltas) in delta.per_segment_row_deltas.iter().enumerate() {
             if !deltas.is_empty() {
-                B::client_patch_state(
-                    &mut self.states[j],
-                    &self.backend_params[j],
-                    deltas,
-                );
+                B::client_patch_state(&mut self.states[j], deltas);
             }
         }
         self.epoch = delta.epoch;

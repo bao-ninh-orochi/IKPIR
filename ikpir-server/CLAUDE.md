@@ -12,16 +12,21 @@ without a full rebuild.
 
 | File | Role |
 |---|---|
-| `src/lib.rs` | Declares `mod hint_patch; mod server;` and re-exports `IkpirServer`, the `Segmented{2,3,4}aryIkpirServer` aliases, and the full shared protocol surface (`IndexPirBackend`, `FrodoConfig`, wire bundles, `IkpirError`) from `ikpir-common` |
+| `src/lib.rs` | Declares `mod hint_patch; mod server;` and re-exports `IkpirServer`, the `Segmented{2,3,4}aryIkpirServer` aliases, and the full shared protocol surface (`IndexPirBackend`, `FrodoConfig`, `SimpleConfig`, wire bundles, `IkpirError`) from `ikpir-common` |
 | `src/server.rs` | `IkpirServer<S, B>` generic + 9 public methods + `Segmented{2,3,4}aryIkpirServer` type aliases |
 | `src/hint_patch.rs` | `fold_mutations_into_row_deltas` — `SlotMutation` list → per-segment sparse row deltas (consumes `ikpir_common::SegmentRowDeltas`) |
-| `tests/frodo_compose.rs` | Smoke test for the `FrodoPirBackend` × `IkpirServer` composition — was originally a unit test inside `backend/frodo/backend.rs` and relocated here when that file moved to `ikpir-common` |
+| `tests/frodo_compose.rs` | Smoke test for the `FrodoPirBackend` × `IkpirServer` composition |
+| `tests/simple_compose.rs` | Smoke test for the `SimplePirBackend` × `IkpirServer` composition (mirror of `frodo_compose.rs`) |
+| `tests/simple_setup_answer.rs` | SimplePIR mirror of `setup_answer.rs` — setup/answer/full_rebuild over arities 2/3/4 |
+| `tests/simple_incremental_correctness.rs` | SimplePIR mirror of `incremental_correctness.rs` — mutation log + delta + warm-queue stress |
 
-> **Trait family, wire bundles, FrodoPIR backend, and `IkpirError` now
-> live in [`ikpir-common`](../ikpir-common/CLAUDE.md).** This crate
-> re-exports them so existing call sites (`use ikpir_server::IndexPirBackend`,
-> `use ikpir_server::FrodoConfig`, `use ikpir_server::ServerSetupBundle`,
-> `use ikpir_server::IkpirError`, ...) keep resolving unchanged.
+> **Trait family, wire bundles, both shipped backends (FrodoPIR +
+> SimplePIR), and `IkpirError` live in
+> [`ikpir-common`](../ikpir-common/CLAUDE.md).** This crate re-exports
+> them so existing call sites (`use ikpir_server::IndexPirBackend`,
+> `use ikpir_server::FrodoConfig`, `use ikpir_server::SimplePirBackend`,
+> `use ikpir_server::ServerSetupBundle`, `use ikpir_server::IkpirError`,
+> ...) keep resolving unchanged.
 
 ## 3. Key design decisions (the WHY)
 
@@ -37,9 +42,10 @@ without a full rebuild.
 - **Backend tunables via `B::Config` associated type** — `IkpirServer::new`
   takes `(store, backend_config)` and persists the config so every
   `full_rebuild` re-emits hints with identical dimensions. For FrodoPIR,
-  `FrodoConfig { lwe_dim }` controls the LWE dimension; the previous
-  hardcoded `DEFAULT_LWE_DIM` constant became `FrodoConfig::default()`.
-  This is the extension seam SimplePIR will plug into.
+  `FrodoConfig { lwe_dim }` controls the LWE dimension (default 1774).
+  For SimplePIR, `SimpleConfig { lwe_dim, sigma }` controls both knobs
+  (default `{1024, 6.4}`). Both backends slot into this seam without
+  any change to `IkpirServer` itself.
 
 - **Mutation-log-driven incremental hint** — after each `insert` /
   `update` / `delete`, `drain_mutations` produces `SlotMutation` records.
@@ -51,7 +57,12 @@ without a full rebuild.
 - **Sync API; no async, no `Arc`** — all calls are synchronous and
   single-threaded. Concurrency wrapping is the caller's responsibility.
 
-- **`FrodoPirBackend` is the sole shipped backend** — LWE-based, post-quantum, with incremental hint patching. SimplePIR is a future track.
+- **Two shipped backends** — both LWE-based, post-quantum, with full incremental hint patching:
+  `FrodoPirBackend` (ternary errors, tall-skinny `n_rows × row_width`
+  matrix, default `lwe_dim = 1774`) and `SimplePirBackend`
+  (discrete-Gaussian errors with σ = 6.4, square-ish `√N × √N` internal
+  reshape, default `lwe_dim = 1024`). Selectable per-bench via the
+  `--backend frodo|simple` CLI flag (default `frodo`).
 
 - **Sparse row-delta encoding** — `HintDeltaBundle` carries
   `Vec<(row, Vec<(cell_offset, Δ)>)>` per segment. Wire cost is
@@ -98,10 +109,13 @@ without a full rebuild.
 | Backend trait contract | `ikpir-common/src/backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` + `PrecomputingPirBackend` + `BackendWireSize` |
 | FrodoPIR config knobs | `ikpir-common/src/backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
 | FrodoPIR backend implementation | `ikpir-common/src/backend/frodo/backend.rs` |
+| SimplePIR config knobs | `ikpir-common/src/backend/simple/params.rs::SimpleConfig` (`lwe_dim`, `sigma`) |
+| SimplePIR backend implementation | `ikpir-common/src/backend/simple/backend.rs` |
 | Wire-bundle definitions | `ikpir-common/src/wire.rs` |
 | `IkpirError` variants | `ikpir-common/src/error.rs` |
-| Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs`, `tests/frodo_compose.rs` |
-| Benches | `benches/setup_latency.rs`, `benches/answer_throughput.rs`, `benches/incremental_vs_rebuild.rs` (+ `failure_modes`, `wire_sizes`, `setup_to_first_query`, `steady_state_workload`) |
+| Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs`, `tests/frodo_compose.rs` + SimplePIR mirrors (`simple_*.rs`) |
+| Benches | `benches/setup_latency.rs`, `benches/answer_throughput.rs`, `benches/incremental_vs_rebuild.rs` (+ `failure_modes`, `wire_sizes`, `setup_to_first_query`, `steady_state_workload`). All accept `--backend frodo\|simple` |
+| Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-client/benches/helpers.rs` |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:
 
@@ -123,6 +137,15 @@ without a full rebuild.
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
   through `MakeStore` / `CloneStore`; the typed scheme is picked once in
   `main` based on `--arity`.
+- **Backend dispatch.** Every bench exposes `--backend frodo|simple`
+  (default `frodo`). A two-level match in `main` picks the typed
+  `<S, B>` pair; `run_one` is generic over both. `--lwe-dim` defaults
+  to the backend-appropriate value (1774 for Frodo, 1024 for Simple)
+  via `helpers::backend_default_lwe_dim`.
+- **Script-level sweep.** The orchestrator scripts read
+  `IKPIR_BENCH_BACKENDS` (default `frodo`) and re-run every bench once
+  per backend. Set `IKPIR_BENCH_BACKENDS=frodo,simple` to cover both
+  in one sweep (~2× runtime).
 - One invocation = one CSV row (append-mode writer); the orchestrator
   is responsible for `rm`-ing the CSV before sweeping.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across

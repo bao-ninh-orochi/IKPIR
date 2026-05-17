@@ -15,7 +15,7 @@ pub mod wire;
 mod error;
 
 pub use backend::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, SimpleConfig, SimplePirBackend,
     IndexPirBackend, IncrementalPirBackend, PrecomputingPirBackend,
 };
 pub use wire::{HintDeltaBundle, PirQueryBundle, PirResponseBundle, SegmentRowDeltas, ServerSetupBundle};

@@ -13,7 +13,7 @@ setup bundle.
 
 | File | Role |
 |---|---|
-| `src/lib.rs` | Declares `mod client; mod error;` and re-exports `IkpirClient`, `DeltaApplyOutcome`, `IkpirClientError`, plus the shared protocol surface (`IndexPirBackend`, `FrodoConfig`, wire bundles, `IkpirError`) from `ikpir-common` |
+| `src/lib.rs` | Declares `mod client; mod error;` and re-exports `IkpirClient`, `DeltaApplyOutcome`, `IkpirClientError`, plus the shared protocol surface (`IndexPirBackend`, `FrodoConfig`, `SimpleConfig`, wire bundles, `IkpirError`) from `ikpir-common` |
 | `src/client.rs` | `IkpirClient<B>` generic + 7 public methods |
 | `src/error.rs` | `IkpirClientError` enum (4 protocol variants + `Server(IkpirError)` forward; `IkpirError` is re-exported from `ikpir-common`) |
 
@@ -78,8 +78,9 @@ setup bundle.
 | Apply an incremental delta | `client.rs::IkpirClient::apply_delta` |
 | Recover from a gap | `client.rs::IkpirClient::reset_from` |
 | Debug a fingerprint mismatch | `client.rs::IkpirClient::decode` — check `candidate_buckets` + `unpack_slot_cells` |
-| Integration tests | `tests/client_e2e.rs` (4 tests) |
-| Benches | `benches/query_throughput.rs`, `benches/decode_throughput.rs`, `benches/apply_delta_throughput.rs`, `benches/preprocess_throughput.rs`, `benches/client_setup_latency.rs`, `benches/client_memory_footprint.rs` |
+| Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`) |
+| Benches | `benches/query_throughput.rs`, `benches/decode_throughput.rs`, `benches/apply_delta_throughput.rs`, `benches/preprocess_throughput.rs`, `benches/client_setup_latency.rs`, `benches/client_memory_footprint.rs`. All accept `--backend frodo\|simple` |
+| Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-server/benches/helpers.rs` |
 
 ### Bench layer (under `benches/`)
 
@@ -87,8 +88,15 @@ setup bundle.
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
   through `MakeStore` / `CloneStore`; the typed scheme is picked once in
   `main` based on `--arity`.
+- **Backend dispatch.** Every bench exposes `--backend frodo|simple`
+  (default `frodo`). A two-level match in `main` picks the typed
+  `<S, B>` pair; `run_one` is generic over both. `--lwe-dim` defaults
+  to the backend-appropriate value (1774 for Frodo, 1024 for Simple)
+  via `helpers::backend_default_lwe_dim`.
 - One invocation = one CSV row (append-mode writer); the orchestrator
-  is responsible for `rm`-ing the CSV before sweeping.
+  is responsible for `rm`-ing the CSV before sweeping. The orchestrator
+  also reads `IKPIR_BENCH_BACKENDS` (default `frodo`) and re-runs every
+  bench once per backend in that comma-separated list.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — same content lives in `ikpir-server/benches/helpers.rs`):
     - `default_num_buckets_for_arity(arity)` — academic-scale defaults

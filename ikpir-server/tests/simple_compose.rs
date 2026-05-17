@@ -1,22 +1,22 @@
-//! Integration test: `IkpirServer` composed with `FrodoPirBackend`.
+//! Integration test: `IkpirServer` composed with `SimplePirBackend`.
 //!
 //! Verifies that the client's per-segment hint state stays in lock-step
 //! with the server's after a sequence of insert / update / delete mutations.
 
-use ikpir_server::{FrodoConfig, FrodoPirBackend, IkpirServer, IndexPirBackend, IncrementalPirBackend};
-use ikpir_common::backend::frodo::FrodoClientState;
+use ikpir_server::{IkpirServer, IndexPirBackend, IncrementalPirBackend, SimpleConfig, SimplePirBackend};
+use ikpir_common::backend::simple::SimpleClientState;
 use segmented_cuckoo::{Segmented2aryCuckooKVStore, Segmented2aryScheme};
 
 #[test]
-fn smoke_ikpir_server_compose_with_frodo() {
+fn smoke_ikpir_server_compose_with_simple() {
     let store = Segmented2aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
-    let mut server: IkpirServer<Segmented2aryScheme, FrodoPirBackend> =
-        IkpirServer::new(store, FrodoConfig::default());
+    let mut server: IkpirServer<Segmented2aryScheme, SimplePirBackend> =
+        IkpirServer::new(store, SimpleConfig { lwe_dim: 256, sigma: 6.4 });
 
     let setup = server.setup();
-    let mut states: Vec<FrodoClientState> = setup.backend_params.iter()
+    let mut states: Vec<SimpleClientState> = setup.backend_params.iter()
         .zip(setup.hints.iter())
-        .map(|(p, h)| FrodoPirBackend::client_setup(p, h))
+        .map(|(p, h)| SimplePirBackend::client_setup(p, h))
         .collect();
 
     let bundles = vec![
@@ -29,7 +29,7 @@ fn smoke_ikpir_server_compose_with_frodo() {
     for bundle in &bundles {
         for (j, deltas) in bundle.per_segment_row_deltas.iter().enumerate() {
             if !deltas.is_empty() {
-                FrodoPirBackend::client_patch_state(&mut states[j], deltas);
+                SimplePirBackend::client_patch_state(&mut states[j], deltas);
             }
         }
     }

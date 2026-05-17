@@ -1,37 +1,34 @@
 //! **Intent:** Mixed insert/query workload measuring steady-state
-//! per-op latency under a configurable query-to-mutation interleaving.
-//! This is the metric that matters for a live IKPIR deployment — the
-//! other benches are single-operation microbenchmarks.
+//! per-op latency under a configurable query-to-mutation interleaving,
+//! across both shipped backends.
 //!
 //! **Method:** Populate to `--load-factor` (default `0.50`), snapshot
 //! the cell array, then per trial clone via `from_cells` and run
-//! `n_inserts + n_queries` operations interleaved: every
-//! `query_ratio`-th op is a query, the rest are inserts. For inserts,
-//! `client.apply_delta` is also timed (the client must stay in sync).
-//! For queries, `build_query → answer → decode` is timed end-to-end.
+//! `n_inserts + n_queries` operations interleaved.
 //!
-//! On `IkpirError::TableFull` inserts stop gracefully; the row reflects
-//! the partial workload.
-//!
-//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
-//! `--value-bits`, `--lwe-dim`, `--load-factor`, `--n-inserts`,
-//! `--n-queries`, `--query-ratio`. See `helpers::parse_cli` for
-//! defaults.
+//! **Arguments (CLI):** `--arity`, `--backend` (frodo|simple, default
+//! frodo), `--num-buckets`, `--bucket-size`, `--value-bits`, `--lwe-dim`
+//! (backend-dependent default), `--load-factor`, `--n-inserts`,
+//! `--n-queries`, `--query-ratio`. See `helpers::parse_cli` for the rest.
 //!
 //! **Design rationale:** Single-op microbenches over-report — a
-//! production server interleaves work. This bench is the one a
-//! capacity-planning sweep should anchor on.
+//! production server interleaves work. This is the bench a capacity-
+//! planning sweep should anchor on; backend selection lets us see
+//! end-to-end production-style cost differences.
 //!
 //! **Output:** `results/ikpir_steady_state_workload.csv`
-//! Columns: arity, num_buckets, bucket_size, value_bits, lwe_dim,
+//! Columns: backend, arity, num_buckets, bucket_size, value_bits, lwe_dim,
 //! n_inserts, n_queries, query_ratio, total_ms, mean_ms_per_op,
 //! mean_insert_ms, mean_query_ms
 
 mod helpers;
 
-use helpers::CloneStore;
+use helpers::{Backend, CloneStore};
 use ikpir_client::IkpirClient;
-use ikpir_server::{BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer};
+use ikpir_server::{
+    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer,
+    IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
+};
 use segmented_cuckoo::{
     CuckooParams,
     Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
@@ -39,9 +36,7 @@ use segmented_cuckoo::{
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-type Client = IkpirClient<FrodoPirBackend>;
-
-const HEADER: &str = "arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+const HEADER: &str = "backend,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
     n_inserts,n_queries,query_ratio,total_ms,mean_ms_per_op,mean_insert_ms,mean_query_ms";
 
 #[derive(Clone, clap::Parser)]
@@ -49,22 +44,25 @@ const HEADER: &str = "arity,num_buckets,bucket_size,value_bits,lwe_dim,\
 struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
     arity: u32,
+    #[arg(long, value_enum, default_value_t = Backend::Frodo)]
+    backend: Backend,
     #[arg(long, default_value_t = 16_384)] num_buckets: u32,
     #[arg(long, default_value_t = 4)]      bucket_size: u32,
     #[arg(long, default_value_t = 256)]    value_bits: u32,
     #[arg(long, default_value_t = 32)]     fingerprint_bits: u32,
     #[arg(long, default_value_t = 8)]      plaintext_bits: u32,
-    #[arg(long, default_value_t = 1774)]   lwe_dim: u32,
-    /// Inserts to attempt in the workload.
+    /// LWE dimension. Defaults to 1774 (Frodo) or 1024 (Simple) when omitted.
+    #[arg(long)]                           lwe_dim: Option<u32>,
     #[arg(long, default_value_t = 4096)]   n_inserts: u32,
-    /// Queries to attempt in the workload.
     #[arg(long, default_value_t = 410)]    n_queries: u32,
-    /// Operation interleaving: every `query_ratio`-th op is a query.
     #[arg(long, default_value_t = 10)]     query_ratio: u32,
     #[arg(long, default_value_t = 1)]      warmup: u32,
     #[arg(long, default_value_t = 3)]      trials: u32,
-    /// Load factor before the workload starts.
     #[arg(long, default_value_t = 0.50)]   load_factor: f64,
+}
+
+fn effective_lwe_dim(cli: &Cli) -> u32 {
+    cli.lwe_dim.unwrap_or_else(|| helpers::backend_default_lwe_dim(cli.backend))
 }
 
 struct TrialResult {
@@ -76,16 +74,21 @@ struct TrialResult {
     done_queries: u32,
 }
 
-fn run_trial<S: CloneStore>(
-    cli:      &Cli,
-    cells:    &[u32],
-    params:   CuckooParams,
-    n_seed:   u64,
-) -> TrialResult {
+fn run_trial<S, B>(
+    cli:         &Cli,
+    cells:       &[u32],
+    params:      CuckooParams,
+    n_seed:      u64,
+    make_config: &impl Fn() -> B::Config,
+) -> TrialResult
+where
+    S: CloneStore,
+    B: IndexPirBackend + IncrementalPirBackend,
+    B::Query: Clone, B::Response: Clone,
+{
     let store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
-    let mut server: IkpirServer<S, FrodoPirBackend> =
-        IkpirServer::new(store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
-    let mut client: Client = Client::from_setup(server.setup());
+    let mut server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
+    let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
 
     let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
@@ -138,14 +141,21 @@ fn run_trial<S: CloneStore>(
     TrialResult { total_ms, mean_per_op, mean_insert, mean_query, done_inserts: done_i, done_queries: done_q }
 }
 
-fn run_one<S: CloneStore>(
+fn run_one<S, B>(
     csv: &mut std::io::BufWriter<std::fs::File>,
     cli: &Cli,
     arity: u32,
     num_buckets: u32,
-) {
+    make_config: impl Fn() -> B::Config,
+)
+where
+    S: CloneStore,
+    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+    B::Query: Clone, B::Response: Clone,
+{
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
+    let lwe_dim_eff = effective_lwe_dim(cli);
 
     let (seed_store, n_seed) = helpers::populate_to_load::<S>(
         cli.load_factor, num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
@@ -155,11 +165,9 @@ fn run_one<S: CloneStore>(
     let cells  = seed_store.snapshot_cells();
     let params = seed_store.params();
 
-    // Geometry (build once for preamble).
     let cps = params.cells_per_slot();
     let tmp_store = S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
-    let tmp_server: IkpirServer<S, FrodoPirBackend> =
-        IkpirServer::new(tmp_store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
+    let tmp_server: IkpirServer<S, B> = IkpirServer::new(tmp_store, make_config());
     let bundle = tmp_server.setup();
     let store_state = helpers::StoreState {
         capacity:       (num_buckets as u64) * (cli.bucket_size as u64),
@@ -170,28 +178,29 @@ fn run_one<S: CloneStore>(
         segment_rows:   params.segment_size(),
     };
     let geom = helpers::Geometry {
-        hint_per_seg_bytes:       FrodoPirBackend::hint_byte_size(&bundle.hints[0]),
+        hint_per_seg_bytes:       B::hint_byte_size(&bundle.hints[0]),
         setup_bundle_bytes:       bundle.wire_byte_size(),
         query_bytes:              0,
         response_bytes:           0,
         hint_delta_typical_bytes: None,
     };
     let knobs = [
+        helpers::Knob { name: "backend",      value: cli.backend.to_string(),            is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "arity",        value: arity.to_string(),                  is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "num_buckets",   value: num_buckets.to_string(),            is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "bucket_size",   value: cli.bucket_size.to_string(),        is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "value_bits",    value: cli.value_bits.to_string(),         is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "lwe_dim",       value: cli.lwe_dim.to_string(),            is_default: matches.value_source("lwe_dim") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "load_factor",   value: format!("{:.2}", cli.load_factor),  is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "n_inserts",     value: cli.n_inserts.to_string(),          is_default: matches.value_source("n_inserts") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "n_queries",     value: cli.n_queries.to_string(),          is_default: matches.value_source("n_queries") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "query_ratio",   value: cli.query_ratio.to_string(),        is_default: matches.value_source("query_ratio") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "num_buckets",  value: num_buckets.to_string(),            is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",  value: cli.bucket_size.to_string(),        is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",   value: cli.value_bits.to_string(),         is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",      value: lwe_dim_eff.to_string(),            is_default: cli.lwe_dim.is_none() },
+        helpers::Knob { name: "load_factor",  value: format!("{:.2}", cli.load_factor),  is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "n_inserts",    value: cli.n_inserts.to_string(),          is_default: matches.value_source("n_inserts") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "n_queries",    value: cli.n_queries.to_string(),          is_default: matches.value_source("n_queries") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "query_ratio",  value: cli.query_ratio.to_string(),        is_default: matches.value_source("query_ratio") != Some(ValueSource::CommandLine) },
     ];
     helpers::print_preamble("steady_state_workload", &knobs, &store_state, &geom);
 
     let mut samples: Vec<TrialResult> = Vec::with_capacity(cli.trials as usize);
     for trial in 0..(cli.warmup + cli.trials) {
-        let r = run_trial::<S>(cli, &cells, params, n_seed);
+        let r = run_trial::<S, B>(cli, &cells, params, n_seed, &make_config);
         if trial >= cli.warmup { samples.push(r); }
     }
     let n = samples.len() as f64;
@@ -203,16 +212,29 @@ fn run_one<S: CloneStore>(
     let last = samples.last().unwrap();
     writeln!(
         csv,
-        "{arity},{num_buckets},{},{},{},{},{},{},{:.3},{:.6},{:.6},{:.6}",
-        cli.bucket_size, cli.value_bits, cli.lwe_dim,
+        "{},{arity},{num_buckets},{},{},{},{},{},{},{:.3},{:.6},{:.6},{:.6}",
+        cli.backend, cli.bucket_size, cli.value_bits, lwe_dim_eff,
         last.done_inserts, last.done_queries, cli.query_ratio,
         m_total, m_per_op, m_ins, m_q,
     ).unwrap();
     println!(
-        "  arity={arity} nb={num_buckets:<6} bs={} vb={:<4} | \
+        "  backend={} arity={arity} nb={num_buckets:<6} bs={} vb={:<4} | \
          {}I + {}Q in {m_total:.3}ms | per_op={m_per_op:.3}ms ins={m_ins:.3}ms q={m_q:.3}ms",
-        cli.bucket_size, cli.value_bits, last.done_inserts, last.done_queries,
+        cli.backend, cli.bucket_size, cli.value_bits, last.done_inserts, last.done_queries,
     );
+}
+
+fn dispatch_backend<S: CloneStore>(
+    csv: &mut std::io::BufWriter<std::fs::File>,
+    cli: &Cli,
+    arity: u32,
+    num_buckets: u32,
+) {
+    let lwe_dim = effective_lwe_dim(cli);
+    match cli.backend {
+        Backend::Frodo  => run_one::<S, FrodoPirBackend>(csv, cli, arity, num_buckets, || FrodoConfig::with_lwe_dim(lwe_dim)),
+        Backend::Simple => run_one::<S, SimplePirBackend>(csv, cli, arity, num_buckets, || SimpleConfig::with_lwe_dim(lwe_dim)),
+    }
 }
 
 fn main() {
@@ -226,9 +248,9 @@ fn main() {
     let mut csv = helpers::csv_writer("ikpir_steady_state_workload.csv", HEADER);
 
     match cli.arity {
-        2 => run_one::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
-        3 => run_one::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
-        4 => run_one::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
+        2 => dispatch_backend::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
+        3 => dispatch_backend::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
+        4 => dispatch_backend::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
         _ => unreachable!("clap value_parser bounds arity to 2..=4"),
     }
     println!("\nResults written to results/ikpir_steady_state_workload.csv");

@@ -199,5 +199,9 @@ from_setup(bundle)                  — initialise from server's setup bundle
 
 ## Status and wire-format stability
 
-`FrodoPirBackend` is the shipped backend. SimplePIR is a future track.
-Bundle types are not versioned; serialisation is out of scope.
+Two backends ship: `FrodoPirBackend` (default `lwe_dim = 1774`, ternary
+errors, tall-skinny matrix) and `SimplePirBackend` (default `lwe_dim =
+1024`, discrete-Gaussian errors with σ = 6.4, `√N × √N` internal
+reshape). Both are drop-in alternatives at the `B: IndexPirBackend`
+type parameter on `IkpirClient`. Bundle types are not versioned;
+serialisation is out of scope.

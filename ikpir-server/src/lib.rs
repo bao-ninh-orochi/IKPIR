@@ -30,9 +30,14 @@
 //!
 //! # Backend selection
 //!
-//! The shipped backend is [`FrodoPirBackend`] (LWE-based, post-quantum).
-//! New backends implement [`IndexPirBackend`] and optionally
-//! [`IncrementalPirBackend`]; see the trait docs for the contract.
+//! Two backends ship today, both LWE-based and post-quantum:
+//! [`FrodoPirBackend`] (ternary errors, tall-skinny per-segment matrix,
+//! default `lwe_dim = 1774`) and [`SimplePirBackend`] (discrete-Gaussian
+//! errors, square-ish reshape, default `lwe_dim = 1024`). They are
+//! drop-in alternatives at the `B: IndexPirBackend` type parameter on
+//! [`IkpirServer`]. New backends implement [`IndexPirBackend`] and
+//! optionally [`IncrementalPirBackend`]; see the trait docs for the
+//! contract.
 //!
 //! # Quick start
 //!
@@ -60,7 +65,7 @@ mod server;
 // `use ikpir_server::{IndexPirBackend, FrodoConfig, ServerSetupBundle, ...}`
 // call sites continue to resolve unchanged.
 pub use ikpir_common::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, SimpleConfig, SimplePirBackend,
     HintDeltaBundle, IkpirError, IndexPirBackend, IncrementalPirBackend,
     PirQueryBundle, PirResponseBundle, PrecomputingPirBackend, ServerSetupBundle,
 };

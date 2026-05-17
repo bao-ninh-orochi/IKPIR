@@ -1,7 +1,7 @@
 //! **Intent:** Compare the wall-clock and wire cost of `N` incremental
 //! hint patches against a single `full_rebuild` for the same total
 //! mutation footprint, split by mutation kind (insert / update /
-//! delete).
+//! delete). Generic over both shipped backends (FrodoPIR / SimplePIR).
 //!
 //! **Method:** Populate once to `--load-factor` (default `0.80`),
 //! snapshot the cell array, then for each `(mutation_kind, path)`
@@ -12,27 +12,31 @@
 //! with `n_succeeded=0`, `incremental_ms=NaN`,
 //! `ratio_inc_over_rebuild=NaN`.
 //!
-//! **Arguments (CLI):** `--arity`, `--num-buckets`, `--bucket-size`,
-//! `--value-bits`, `--lwe-dim`, `--load-factor` (`0.0..=1.0` or
-//! `"full"`), `--n-mutations`. See `helpers::parse_cli` for defaults.
+//! **Arguments (CLI):** `--arity`, `--backend` (frodo|simple, default
+//! frodo), `--num-buckets`, `--bucket-size`, `--value-bits`, `--lwe-dim`
+//! (defaults to backend recommendation), `--load-factor` (`0.0..=1.0`
+//! or `"full"`), `--n-mutations`. See `helpers::parse_cli` for the rest.
 //!
 //! **Design rationale:** Headline plot for the paper — the crossover
 //! point where `N · incremental_patch_ms` overtakes a single
 //! `full_rebuild_ms` is what determines when a deployment should drop
 //! the patch stream and force a resync. The `delta_to_hint_ratio`
-//! column quantifies the wire saving on the patch path.
+//! column quantifies the wire saving on the patch path. Backend
+//! parameterisation lets us compare both backends against the same
+//! mutation footprint.
 //!
 //! **Output:** `results/ikpir_server_incremental_vs_rebuild.csv`
-//! Columns: mutation_kind, arity, num_buckets, bucket_size, value_bits,
-//! n_mutations, n_attempted, n_succeeded, incremental_ms,
+//! Columns: backend, mutation_kind, arity, num_buckets, bucket_size,
+//! value_bits, n_mutations, n_attempted, n_succeeded, incremental_ms,
 //! incremental_per_op_ms, rebuild_ms, ratio_inc_over_rebuild,
 //! delta_bytes_total, rebuild_hint_bytes, delta_to_hint_ratio
 
 mod helpers;
 
-use helpers::CloneStore;
+use helpers::{Backend, CloneStore};
 use ikpir_server::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer,
+    IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
 };
 use segmented_cuckoo::{
     CuckooParams,
@@ -41,7 +45,7 @@ use segmented_cuckoo::{
 use std::io::Write;
 use std::time::Instant;
 
-const HEADER: &str = "mutation_kind,arity,num_buckets,bucket_size,value_bits,\
+const HEADER: &str = "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,\
     n_mutations,n_attempted,n_succeeded,incremental_ms,incremental_per_op_ms,\
     rebuild_ms,ratio_inc_over_rebuild,delta_bytes_total,rebuild_hint_bytes,delta_to_hint_ratio";
 
@@ -67,17 +71,22 @@ impl MutationKind {
 struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
     arity: u32,
+    #[arg(long, value_enum, default_value_t = Backend::Frodo)]
+    backend: Backend,
     #[arg(long, default_value_t = 16_384)] num_buckets: u32,
     #[arg(long, default_value_t = 4)]      bucket_size: u32,
     #[arg(long, default_value_t = 256)]    value_bits: u32,
     #[arg(long, default_value_t = 32)]     fingerprint_bits: u32,
     #[arg(long, default_value_t = 8)]      plaintext_bits: u32,
-    #[arg(long, default_value_t = 1774)]   lwe_dim: u32,
+    /// LWE dimension. Defaults to 1774 (Frodo) or 1024 (Simple) when omitted.
+    #[arg(long)]                           lwe_dim: Option<u32>,
     #[arg(long, default_value_t = 1024)]   n_mutations: u32,
-    /// Load factor before mutations. Float in (0,1) or "full" to populate
-    /// to TableFull (insert mutations will always fail at full).
     #[arg(long, value_parser = parse_lf, default_value = "0.80")]
     load_factor: LoadFactor,
+}
+
+fn effective_lwe_dim(cli: &Cli) -> u32 {
+    cli.lwe_dim.unwrap_or_else(|| helpers::backend_default_lwe_dim(cli.backend))
 }
 
 fn fill_value(value: &mut [u8], key: u32, salt: u32) {
@@ -95,21 +104,24 @@ struct KindResult {
     rebuild_hint_bytes: usize,
 }
 
-fn run_kind<S: CloneStore>(
-    cli:        &Cli,
-    cells:      &[u32],
-    params:     CuckooParams,
-    n_seed:     u64,
-    n_mut:      u32,
-    kind:       MutationKind,
-) -> KindResult {
+fn run_kind<S, B>(
+    cli:          &Cli,
+    cells:        &[u32],
+    params:       CuckooParams,
+    n_seed:       u64,
+    n_mut:        u32,
+    kind:         MutationKind,
+    make_config:  &impl Fn() -> B::Config,
+) -> KindResult
+where
+    S: CloneStore,
+    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+{
     let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
 
-    // ── Incremental path ───────────────────────────────────────────────────
     let store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
-    let mut server: IkpirServer<S, FrodoPirBackend> =
-        IkpirServer::new(store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
+    let mut server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
 
     let mut delta_bytes_total = 0usize;
     let mut n_succeeded = 0u32;
@@ -141,19 +153,14 @@ fn run_kind<S: CloneStore>(
             Err(e) => panic!("incremental path: {e:?}"),
         }
     }
-    // Total elapsed across all mutation attempts. Per-op latency is recovered
-    // by dividing by `n_succeeded` for the insert kind (the failure path is
-    // cheap and rolls back), or by `n_mut` for update/delete (always succeed).
     let incremental_ms = if n_succeeded > 0 {
         inc_start.elapsed().as_secs_f64() * 1e3
     } else {
         f64::NAN
     };
 
-    // ── Rebuild path ───────────────────────────────────────────────────────
     let store2 = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
-    let mut server2: IkpirServer<S, FrodoPirBackend> =
-        IkpirServer::new(store2, FrodoConfig::with_lwe_dim(cli.lwe_dim));
+    let mut server2: IkpirServer<S, B> = IkpirServer::new(store2, make_config());
     for i in 0..n_mut {
         let _ = match kind {
             MutationKind::Insert => {
@@ -176,22 +183,27 @@ fn run_kind<S: CloneStore>(
     let rebuild_bundle = server2.full_rebuild();
     let rebuild_ms = reb_start.elapsed().as_secs_f64() * 1e3;
     let rebuild_hint_bytes: usize = rebuild_bundle.hints.iter()
-        .map(FrodoPirBackend::hint_byte_size).sum();
+        .map(B::hint_byte_size).sum();
 
     KindResult { n_attempted, n_succeeded, incremental_ms, rebuild_ms,
                  delta_bytes_total, rebuild_hint_bytes }
 }
 
-fn run_one<S: CloneStore>(
+fn run_one<S, B>(
     csv: &mut std::io::BufWriter<std::fs::File>,
     cli: &Cli,
     arity: u32,
     num_buckets: u32,
-) {
+    make_config: impl Fn() -> B::Config,
+)
+where
+    S: CloneStore,
+    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+{
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
+    let lwe_dim_eff = effective_lwe_dim(cli);
 
-    // Populate once and snapshot.
     let (seed_store, n_seed) = match &cli.load_factor {
         LoadFactor::Full => helpers::populate_until_full::<S>(
             num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
@@ -221,23 +233,24 @@ fn run_one<S: CloneStore>(
         query_bytes: 0, response_bytes: 0, hint_delta_typical_bytes: None,
     };
     let knobs = [
+        helpers::Knob { name: "backend",      value: cli.backend.to_string(),     is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "arity",        value: arity.to_string(),           is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "num_buckets",   value: num_buckets.to_string(),     is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "bucket_size",   value: cli.bucket_size.to_string(), is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "value_bits",    value: cli.value_bits.to_string(),  is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "n_mutations",   value: cli.n_mutations.to_string(), is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "load_factor",   value: lf_str,                      is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "num_buckets",  value: num_buckets.to_string(),     is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",  value: cli.bucket_size.to_string(), is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",   value: cli.value_bits.to_string(),  is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",      value: lwe_dim_eff.to_string(),     is_default: cli.lwe_dim.is_none() },
+        helpers::Knob { name: "n_mutations",  value: cli.n_mutations.to_string(), is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "load_factor",  value: lf_str,                      is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
     ];
     helpers::print_preamble("incremental_vs_rebuild", &knobs, &store_state, &geom);
 
-    // Ensure n_seed is sufficient for update/delete targets.
     if n_seed < cli.n_mutations as u64 {
         eprintln!("  Skip: n_seed={n_seed} < n_mutations={}", cli.n_mutations);
         return;
     }
 
     for &kind in MutationKind::all() {
-        let r = run_kind::<S>(cli, &cells, params, n_seed, cli.n_mutations, kind);
+        let r = run_kind::<S, B>(cli, &cells, params, n_seed, cli.n_mutations, kind, &make_config);
         let ratio_time = if r.rebuild_ms > 0.0 { r.incremental_ms / r.rebuild_ms } else { f64::NAN };
         let inc_per_op = if r.n_succeeded > 0 {
             r.incremental_ms / r.n_succeeded as f64
@@ -247,20 +260,33 @@ fn run_one<S: CloneStore>(
         } else { f64::NAN };
         writeln!(
             csv,
-            "{},{arity},{num_buckets},{},{},{},{},{},{:.3},{:.6},{:.3},{:.4},{},{},{:.6}",
-            kind.as_csv(), cli.bucket_size, cli.value_bits, cli.n_mutations,
+            "{},{},{arity},{num_buckets},{},{},{},{},{},{:.3},{:.6},{:.3},{:.4},{},{},{:.6}",
+            cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.n_mutations,
             r.n_attempted, r.n_succeeded,
             r.incremental_ms, inc_per_op, r.rebuild_ms, ratio_time,
             r.delta_bytes_total, r.rebuild_hint_bytes, ratio_bytes,
         ).unwrap();
         println!(
-            "  kind={:<6} arity={arity} num_buckets={num_buckets:<6} N={} | \
+            "  backend={} kind={:<6} arity={arity} num_buckets={num_buckets:<6} N={} | \
              inc={:.3}ms ({:.4}ms/op)  rebuild={:.3}ms  ratio={:.3}  succ={}/{}  delta={}B  hint={}B",
-            kind.as_csv(), cli.n_mutations,
+            cli.backend, kind.as_csv(), cli.n_mutations,
             r.incremental_ms, inc_per_op, r.rebuild_ms, ratio_time,
             r.n_succeeded, r.n_attempted,
             r.delta_bytes_total, r.rebuild_hint_bytes,
         );
+    }
+}
+
+fn dispatch_backend<S: CloneStore>(
+    csv: &mut std::io::BufWriter<std::fs::File>,
+    cli: &Cli,
+    arity: u32,
+    num_buckets: u32,
+) {
+    let lwe_dim = effective_lwe_dim(cli);
+    match cli.backend {
+        Backend::Frodo  => run_one::<S, FrodoPirBackend>(csv, cli, arity, num_buckets, || FrodoConfig::with_lwe_dim(lwe_dim)),
+        Backend::Simple => run_one::<S, SimplePirBackend>(csv, cli, arity, num_buckets, || SimpleConfig::with_lwe_dim(lwe_dim)),
     }
 }
 
@@ -275,9 +301,9 @@ fn main() {
     let mut csv = helpers::csv_writer("ikpir_server_incremental_vs_rebuild.csv", HEADER);
 
     match cli.arity {
-        2 => run_one::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
-        3 => run_one::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
-        4 => run_one::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
+        2 => dispatch_backend::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
+        3 => dispatch_backend::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
+        4 => dispatch_backend::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
         _ => unreachable!("clap value_parser bounds arity to 2..=4"),
     }
     println!("\nResults written to results/ikpir_server_incremental_vs_rebuild.csv");

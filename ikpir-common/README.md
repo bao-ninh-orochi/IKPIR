@@ -1,9 +1,9 @@
 # ikpir-common
 
 Shared primitives for [Incremental Keyword PIR](../README.md). Holds the
-Index-PIR backend trait family, the shipped FrodoPIR backend, the
-wire-format bundles exchanged between server and client, and the shared
-`IkpirError` enum.
+Index-PIR backend trait family, the two shipped LWE backends (FrodoPIR
+and SimplePIR), the wire-format bundles exchanged between server and
+client, and the shared `IkpirError` enum.
 
 ## Role in the workspace
 
@@ -25,7 +25,8 @@ under all three paths.
 | Module | Items |
 |---|---|
 | `backend` | `IndexPirBackend`, `IncrementalPirBackend`, `PrecomputingPirBackend`, `BackendWireSize` traits |
-| `backend::frodo` | `FrodoPirBackend`, `FrodoConfig`, `FrodoParams`, plus the associated `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` types |
+| `backend::frodo` | `FrodoPirBackend`, `FrodoConfig`, `FrodoParams`, plus the associated `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` types (ternary LWE, tall-skinny `n_rows × row_width` matrix; default `lwe_dim = 1774`) |
+| `backend::simple` | `SimplePirBackend`, `SimpleConfig`, `SimpleParams`, plus the associated `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` types (discrete-Gaussian LWE with σ = 6.4, internal `√N × √N` reshape; default `lwe_dim = 1024`) |
 | `wire` | `ServerSetupBundle`, `PirQueryBundle`, `PirResponseBundle`, `HintDeltaBundle`, `SegmentRowDeltas` type alias |
 | `error` | `IkpirError` enum (`StaleEpoch`, `MalformedQuery`, `TableFull`, `NotFound`, `InvalidInput`) |
 
@@ -47,7 +48,7 @@ IndexPirBackend (mandatory)
     query_byte_size / response_byte_size / hint_byte_size / server_params_byte_size
 ```
 
-`FrodoPirBackend` implements all four traits.
+Both `FrodoPirBackend` and `SimplePirBackend` implement all four traits.
 
 ## Implementing a new backend
 
@@ -66,4 +67,8 @@ key design decisions behind the trait split.
 ## Status
 
 Bundle types are not versioned; serialisation is out of scope.
-`FrodoPirBackend` is the shipped backend. SimplePIR is a future track.
+Two backends ship: `FrodoPirBackend` (ternary errors, tall-skinny matrix,
+default `lwe_dim = 1774`) and `SimplePirBackend` (discrete-Gaussian
+errors with σ = 6.4, `√N × √N` internal reshape, default `lwe_dim = 1024`).
+Both implement all four traits and are drop-in alternatives at the
+`B: IndexPirBackend` type parameter on the server / client.

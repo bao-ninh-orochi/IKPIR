@@ -7,6 +7,10 @@
 #   IKPIR_BENCH_PROFILE=quick ./scripts/run_all.sh # smaller config matrix
 #   IKPIR_BENCH_PROFILE=full  ./scripts/run_all.sh # include m=2^22 row
 #
+#   IKPIR_BENCH_BACKENDS=frodo ./scripts/run_all.sh         # default: FrodoPIR only
+#   IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh        # SimplePIR only
+#   IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh  # both (~2× runtime)
+#
 #   ./scripts/run_all.sh --no-plot                 # skip the plot step
 #   ./scripts/run_all.sh --plot-only               # only run plot.py (assume CSVs already populated)
 #   ./scripts/run_all.sh --server-only             # ikpir-server benches only
@@ -46,7 +50,7 @@ else
     BOLD=''; RESET=''
 fi
 
-echo -e "${BOLD}IKPIR bench orchestrator${RESET} (profile=${IKPIR_BENCH_PROFILE:-default})"
+echo -e "${BOLD}IKPIR bench orchestrator${RESET} (profile=${IKPIR_BENCH_PROFILE:-default}, backends=${IKPIR_BENCH_BACKENDS:-frodo})"
 
 if (( DO_SERVER )); then
     echo -e "${BOLD}▶ ikpir-server${RESET}"

@@ -203,10 +203,11 @@ client.decode  → fp match → value
 
 ## Implementing a new backend
 
-The backend trait family and the shipped `FrodoPirBackend` live in
-[`ikpir-common`](../ikpir-common). This crate re-exports them, so
-implementations land in the workspace either inside `ikpir-common`
-itself or in a downstream crate that depends on `ikpir-common`.
+The backend trait family and the two shipped backends (`FrodoPirBackend`
+and `SimplePirBackend`) live in [`ikpir-common`](../ikpir-common). This
+crate re-exports them, so implementations land in the workspace either
+inside `ikpir-common` itself or in a downstream crate that depends on
+`ikpir-common`.
 
 Implement `IndexPirBackend` (mandatory) and optionally
 `IncrementalPirBackend` (for incremental hint updates without a full
@@ -223,8 +224,13 @@ See [`CLAUDE.md §6`](CLAUDE.md) for the full backend-author checklist.
 
 ## Status
 
-`FrodoPirBackend` is the shipped backend. SimplePIR is a future track.
-Bundle types are not versioned; serialisation is out of scope.
+Two backends ship: `FrodoPirBackend` (ternary errors, tall-skinny matrix,
+default `lwe_dim = 1774`) and `SimplePirBackend` (discrete-Gaussian
+errors with σ = 6.4, `√N × √N` internal reshape, default `lwe_dim = 1024`).
+Both implement all four traits (`IndexPirBackend` + the three optional
+extensions) and are drop-in alternatives at the `B: IndexPirBackend`
+type parameter on `IkpirServer`. Bundle types are not versioned;
+serialisation is out of scope.
 
 ## Usage
 

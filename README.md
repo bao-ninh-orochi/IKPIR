@@ -74,8 +74,8 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 | Backend trait family + wire bundles + shared error | Shipped (`ikpir-common`) |
 | Server protocol (setup / answer / insert / update / delete / full_rebuild) | Shipped (`ikpir-server`) |
 | Client protocol (from_setup / build_query / decode / apply_delta / reset_from) | Shipped (`ikpir-client`) |
-| FrodoPIR backend | Shipped (`ikpir-common`) |
-| SimplePIR backend | Planned |
+| FrodoPIR backend | Shipped (`ikpir-common`) — ternary errors, tall-skinny matrix, default `lwe_dim = 1774` |
+| SimplePIR backend | Shipped (`ikpir-common`) — discrete-Gaussian errors (σ = 6.4), √N×√N reshape, default `lwe_dim = 1024` |
 
 ## Repository tour
 
@@ -101,9 +101,12 @@ bench over a paper-derived config matrix (see `scripts/configs.sh`) and
 then renders all plots:
 
 ```bash
-./scripts/run_all.sh                                 # default profile, ~30–45 min
+./scripts/run_all.sh                                 # default profile, ~30–45 min (FrodoPIR only)
 IKPIR_BENCH_PROFILE=quick ./scripts/run_all.sh       # smaller matrix, ~5–10 min
 IKPIR_BENCH_PROFILE=full  ./scripts/run_all.sh       # adds m=2^22, ~1+ hour
+
+IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh   # both backends in one sweep (~2× runtime)
+IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh         # SimplePIR only
 
 ./scripts/run_all.sh --plot-only                     # re-plot from existing CSVs
 ./scripts/run_all.sh --server-only                   # skip client benches
@@ -118,6 +121,10 @@ crate. For one-off measurements, invoke `cargo bench` directly:
 cargo bench -p ikpir-server --bench setup_latency
 cargo bench -p ikpir-server --bench answer_throughput
 cargo bench -p ikpir-server --bench incremental_vs_rebuild -- --n-mutations 1024
+
+# Backend selection: every bench accepts `--backend frodo|simple` (default frodo).
+cargo bench -p ikpir-server --bench answer_throughput -- --backend simple
+cargo bench -p ikpir-client --bench query_throughput  -- --backend simple --mode warm-bc
 
 # Client: query construction, decode, and apply_delta.
 cargo bench -p ikpir-client --bench query_throughput

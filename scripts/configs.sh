@@ -148,6 +148,36 @@ MATRIX_G_VALUE_BITS=2048
 MATRIX_G_LWE_DIM=1774
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Backend selector — per-bench `--backend frodo|simple` dispatch.
+# Set IKPIR_BENCH_BACKENDS=frodo (default) or IKPIR_BENCH_BACKENDS=frodo,simple
+# (or just simple) to control which backend(s) each sweep covers.
+# ─────────────────────────────────────────────────────────────────────────────
+
+IKPIR_BENCH_BACKENDS=${IKPIR_BENCH_BACKENDS:-frodo}
+IFS=',' read -ra BACKENDS_ARR <<< "$IKPIR_BENCH_BACKENDS"
+
+# Sanity-check selected backends.
+for _b in "${BACKENDS_ARR[@]}"; do
+    case "$_b" in
+        frodo|simple) ;;
+        *) echo "[configs.sh] ERROR: unknown backend '$_b' (valid: frodo, simple)" >&2; exit 1 ;;
+    esac
+done
+unset _b
+
+# Backend-appropriate LWE dimension. FrodoPIR uses 1774 (Table 5; 128-bit
+# security), SimplePIR uses 1024 (paper §4.2; 128-bit security at q=2^32,
+# σ=6.4). Both are the paper-recommended choices; bench sweeps that want a
+# different dim should call the bench with --lwe-dim directly.
+backend_lwe_dim() {
+    case "$1" in
+        frodo)  echo 1774 ;;
+        simple) echo 1024 ;;
+        *) echo "[configs.sh] backend_lwe_dim: unknown backend '$1'" >&2; return 1 ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Profile selector — pick a smaller subset for quick iteration.
 # Set IKPIR_BENCH_PROFILE=quick | default | full before sourcing this file
 # (or pass IKPIR_BENCH_PROFILE=quick to any run_*.sh script).
@@ -182,4 +212,4 @@ case "$IKPIR_BENCH_PROFILE" in
         ;;
 esac
 
-echo "[configs.sh] profile=$IKPIR_BENCH_PROFILE"
+echo "[configs.sh] profile=$IKPIR_BENCH_PROFILE backends=${IKPIR_BENCH_BACKENDS}"

@@ -1,36 +1,40 @@
-//! **Intent:** Measure server-side setup cost on the FrodoPIR backend.
+//! **Intent:** Measure server-side setup cost across the two shipped
+//! backends (FrodoPIR and SimplePIR).
 //!
 //! **Method:** Populate a store to `TableFull`, wrap it in
 //! `IkpirServer::new`, and time the wall-clock cost of that call.
 //! Repeats for `trials` trials.
 //!
-//! **Arguments (CLI):** `--arity` (2/3/4), `--num-buckets`,
-//! `--bucket-size`, `--value-bits`, `--lwe-dim` (FrodoConfig override),
-//! `--trials`. See `helpers::parse_cli` for defaults.
+//! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
+//! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
+//! `--lwe-dim` (defaults to backend recommendation), `--trials`. See
+//! `helpers::parse_cli` for the rest.
 //!
 //! **Design rationale:** Setup is `O(arity · n_rows · lwe_dim ·
 //! row_width)` — the cold-start cost a deployment pays once on boot or
-//! whenever `full_rebuild` is triggered. The bundle-byte columns let
-//! us cross-reference the wire footprint against
-//! `incremental_vs_rebuild`.
+//! whenever `full_rebuild` is triggered. The bench is generic over `B`
+//! so both backends are measured under identical inputs.
 //!
 //! **Output:** `results/ikpir_server_setup_latency.csv`
-//! Columns: arity, num_buckets, bucket_size, value_bits, lwe_dim,
+//! Columns: backend, arity, num_buckets, bucket_size, value_bits, lwe_dim,
 //! mean_setup_ms, min_setup_ms, max_setup_ms, stddev_setup_ms,
 //! setup_bundle_bytes, hint_bytes_per_segment,
 //! server_params_bytes_per_segment
 
 mod helpers;
 
-use helpers::CloneStore;
-use ikpir_server::{BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirServer};
+use helpers::{Backend, CloneStore};
+use ikpir_server::{
+    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirServer, IncrementalPirBackend,
+    IndexPirBackend, SimpleConfig, SimplePirBackend,
+};
 use segmented_cuckoo::{
     Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
 };
 use std::io::Write;
 use std::time::Instant;
 
-const HEADER: &str = "arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+const HEADER: &str = "backend,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
     mean_setup_ms,min_setup_ms,max_setup_ms,stddev_setup_ms,\
     setup_bundle_bytes,hint_bytes_per_segment,server_params_bytes_per_segment";
 
@@ -39,27 +43,38 @@ const HEADER: &str = "arity,num_buckets,bucket_size,value_bits,lwe_dim,\
 struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
     arity: u32,
+    #[arg(long, value_enum, default_value_t = Backend::Frodo)]
+    backend: Backend,
     #[arg(long, default_value_t = 16_384)] num_buckets: u32,
     #[arg(long, default_value_t = 4)]      bucket_size: u32,
     #[arg(long, default_value_t = 256)]    value_bits: u32,
     #[arg(long, default_value_t = 32)]     fingerprint_bits: u32,
     #[arg(long, default_value_t = 8)]      plaintext_bits: u32,
-    #[arg(long, default_value_t = 1774)]   lwe_dim: u32,
+    /// LWE dimension. Defaults to 1774 (Frodo) or 1024 (Simple) when omitted.
+    #[arg(long)]                           lwe_dim: Option<u32>,
     #[arg(long, default_value_t = 2)]      warmup: u32,
     #[arg(long, default_value_t = 5)]      trials: u32,
 }
 
-fn run_one<S: CloneStore>(
+fn effective_lwe_dim(cli: &Cli) -> u32 {
+    cli.lwe_dim.unwrap_or_else(|| helpers::backend_default_lwe_dim(cli.backend))
+}
+
+fn run_one<S, B>(
     csv: &mut std::io::BufWriter<std::fs::File>,
     cli: &Cli,
     arity: u32,
     num_buckets: u32,
-) {
+    make_config: impl Fn() -> B::Config,
+)
+where
+    S: CloneStore,
+    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+{
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
     let nb_is_default = matches.value_source("num_buckets") != Some(ValueSource::CommandLine);
 
-    // Populate once, snapshot, clone per trial to avoid re-populating.
     let (seed_store, n_inserted) = helpers::populate_until_full::<S>(
         num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
     );
@@ -67,21 +82,20 @@ fn run_one<S: CloneStore>(
     let params = seed_store.params();
     drop(seed_store);
 
-    // Sample wire sizes from first trial.
     let (mut bundle_bytes, mut hint_bytes, mut sp_bytes) = (0usize, 0usize, 0usize);
+    let lwe_dim_eff = effective_lwe_dim(cli);
 
     let mut samples = Vec::with_capacity((cli.warmup + cli.trials) as usize);
     for trial in 0..(cli.warmup + cli.trials) {
         let store = S::clone_from_cells(cells.clone(), params, n_inserted).expect("from_cells");
         let t = Instant::now();
-        let server: IkpirServer<S, FrodoPirBackend> =
-            IkpirServer::new(store, FrodoConfig::with_lwe_dim(cli.lwe_dim));
+        let server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
         let ms = t.elapsed().as_secs_f64() * 1e3;
         if trial == cli.warmup {
             let bundle  = server.setup();
             bundle_bytes = bundle.wire_byte_size();
-            hint_bytes   = FrodoPirBackend::hint_byte_size(&bundle.hints[0]);
-            sp_bytes     = FrodoPirBackend::server_params_byte_size(&bundle.backend_params[0]);
+            hint_bytes   = B::hint_byte_size(&bundle.hints[0]);
+            sp_bytes     = B::server_params_byte_size(&bundle.backend_params[0]);
         }
         if trial >= cli.warmup { samples.push(ms); }
     }
@@ -89,11 +103,11 @@ fn run_one<S: CloneStore>(
     let s = helpers::compute_stats(&samples);
     writeln!(
         csv,
-        "{arity},{num_buckets},{},{},{},{:.3},{:.3},{:.3},{:.3},{bundle_bytes},{hint_bytes},{sp_bytes}",
-        cli.bucket_size, cli.value_bits, cli.lwe_dim, s.mean, s.min, s.max, s.stddev,
+        "{},{arity},{num_buckets},{},{},{},{:.3},{:.3},{:.3},{:.3},{bundle_bytes},{hint_bytes},{sp_bytes}",
+        cli.backend, cli.bucket_size, cli.value_bits, lwe_dim_eff,
+        s.mean, s.min, s.max, s.stddev,
     ).unwrap();
 
-    // Preamble (printed after first run so geometry is populated).
     let cps  = params.cells_per_slot();
     let store_state = helpers::StoreState {
         capacity:     (num_buckets as u64) * (cli.bucket_size as u64),
@@ -111,20 +125,34 @@ fn run_one<S: CloneStore>(
         hint_delta_typical_bytes: None,
     };
     let knobs = [
-        helpers::Knob { name: "arity",            value: arity.to_string(),            is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "num_buckets",       value: num_buckets.to_string(),      is_default: nb_is_default },
-        helpers::Knob { name: "bucket_size",       value: cli.bucket_size.to_string(),  is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "fingerprint_bits",  value: cli.fingerprint_bits.to_string(), is_default: matches.value_source("fingerprint_bits") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "value_bits",        value: cli.value_bits.to_string(),   is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "lwe_dim",           value: cli.lwe_dim.to_string(),      is_default: matches.value_source("lwe_dim") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "backend",           value: cli.backend.to_string(),         is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "arity",             value: arity.to_string(),               is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "num_buckets",       value: num_buckets.to_string(),         is_default: nb_is_default },
+        helpers::Knob { name: "bucket_size",       value: cli.bucket_size.to_string(),     is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "fingerprint_bits",  value: cli.fingerprint_bits.to_string(),is_default: matches.value_source("fingerprint_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",        value: cli.value_bits.to_string(),      is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",           value: lwe_dim_eff.to_string(),         is_default: cli.lwe_dim.is_none() },
     ];
     helpers::print_preamble("setup_latency", &knobs, &store_state, &geom);
 
     println!(
-        "  arity={arity} num_buckets={num_buckets:<6} bs={} vb={:<4} | \
+        "  backend={} arity={arity} num_buckets={num_buckets:<6} bs={} vb={:<4} | \
          mean={:.3} ms (±{:.3}) | bundle={bundle_bytes}B hint/seg={hint_bytes}B sp/seg={sp_bytes}B",
-        cli.bucket_size, cli.value_bits, s.mean, s.stddev,
+        cli.backend, cli.bucket_size, cli.value_bits, s.mean, s.stddev,
     );
+}
+
+fn dispatch_backend<S: CloneStore>(
+    csv: &mut std::io::BufWriter<std::fs::File>,
+    cli: &Cli,
+    arity: u32,
+    num_buckets: u32,
+) {
+    let lwe_dim = effective_lwe_dim(cli);
+    match cli.backend {
+        Backend::Frodo  => run_one::<S, FrodoPirBackend>(csv, cli, arity, num_buckets, || FrodoConfig::with_lwe_dim(lwe_dim)),
+        Backend::Simple => run_one::<S, SimplePirBackend>(csv, cli, arity, num_buckets, || SimpleConfig::with_lwe_dim(lwe_dim)),
+    }
 }
 
 fn main() {
@@ -138,9 +166,9 @@ fn main() {
     let mut csv = helpers::csv_writer("ikpir_server_setup_latency.csv", HEADER);
 
     match cli.arity {
-        2 => run_one::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
-        3 => run_one::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
-        4 => run_one::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
+        2 => dispatch_backend::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
+        3 => dispatch_backend::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
+        4 => dispatch_backend::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
         _ => unreachable!("clap value_parser bounds arity to 2..=4"),
     }
     println!("\nResults written to results/ikpir_server_setup_latency.csv");

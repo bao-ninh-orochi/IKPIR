@@ -4,9 +4,9 @@
 
 Shared building blocks of the IKPIR protocol that both server and client
 consume but neither owns: the **pluggable Index-PIR backend trait
-family**, the shipped **FrodoPIR backend**, the **wire-format bundles**
-exchanged across the server/client boundary, and the shared **`IkpirError`**
-enum.
+family**, the two shipped **LWE backends (FrodoPIR and SimplePIR)**, the
+**wire-format bundles** exchanged across the server/client boundary, and
+the shared **`IkpirError`** enum.
 
 `ikpir-server` and `ikpir-client` both depend on this crate and re-export
 the items they expose in their own public signatures, so existing call
@@ -26,6 +26,11 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
 | `src/backend/frodo/arith.rs` | `round_p_to_q` / `round_q_to_p` — plaintext ↔ ciphertext modulus conversion |
 | `src/backend/frodo/sampler.rs` | `sample_a` (LWE public matrix) + `sample_ternary_into` (LWE secret / error sampling) |
+| `src/backend/simple/mod.rs` | Re-exports the SimplePIR backend's public surface + math summary |
+| `src/backend/simple/params.rs` | `SimpleParams` + `SimpleConfig` (user-facing knobs, default `lwe_dim = 1024`, `sigma = 6.4`) |
+| `src/backend/simple/backend.rs` | `SimplePirBackend` impl of all four traits + `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` + internal `reshape_dims` / `translate` helpers |
+| `src/backend/simple/arith.rs` | Δ-scaling (duplicated from frodo per project rule) |
+| `src/backend/simple/sampler.rs` | `sample_a` + `sample_uniform_zq_into` (secret) + `sample_discrete_gaussian_into` (Box–Muller error) |
 
 ## 3. Key design decisions (the WHY)
 
@@ -102,7 +107,13 @@ IndexPirBackend (mandatory)
     query_byte_size(q) / response_byte_size(r) / hint_byte_size(h) / server_params_byte_size(p)
 ```
 
-`FrodoPirBackend` implements all four traits.
+Both `FrodoPirBackend` and `SimplePirBackend` implement all four traits.
+They are drop-in alternatives at the `B: IndexPirBackend` type parameter
+on `IkpirServer<S, B>` / `IkpirClient<B>`. The per-bench `--backend
+frodo|simple` flag (default `frodo`) selects between them at runtime;
+the `B::Config` associated type (`FrodoConfig` vs `SimpleConfig`)
+carries the backend-specific tunables (`lwe_dim`, plus `sigma` for
+SimplePIR).
 
 ## 5. Wire bundle taxonomy
 
@@ -137,12 +148,14 @@ composition.
 |---|---|
 | Backend trait contract | `backend/mod.rs::IndexPirBackend` + the three extension traits |
 | FrodoPIR config knobs | `backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
-| Implement a new backend | mirror `backend/frodo/backend.rs`; see backend-author checklist below |
+| SimplePIR config knobs | `backend/simple/params.rs::SimpleConfig` (`lwe_dim`, `sigma`) |
+| Implement a new backend | mirror `backend/frodo/backend.rs` (tall-skinny) or `backend/simple/backend.rs` (square reshape); see backend-author checklist below |
 | Wire-bundle layout | `wire.rs` module docs + each bundle's labelled-section block |
 | Shared error variants | `error.rs::IkpirError` |
-| Round-trip cell-modulus conversion | `backend/frodo/arith.rs` |
-| LWE sampling | `backend/frodo/sampler.rs` (`sample_a`, `sample_ternary_into`) |
-| Cross-crate integration test | `ikpir-server/tests/frodo_compose.rs` exercises `FrodoPirBackend` end-to-end against `IkpirServer` |
+| Round-trip cell-modulus conversion | `backend/frodo/arith.rs` (also duplicated in `backend/simple/arith.rs`) |
+| LWE sampling (FrodoPIR) | `backend/frodo/sampler.rs` (`sample_a`, `sample_ternary_into`) |
+| LWE sampling (SimplePIR) | `backend/simple/sampler.rs` (`sample_a`, `sample_uniform_zq_into`, `sample_discrete_gaussian_into`) |
+| Cross-crate integration tests | `ikpir-server/tests/frodo_compose.rs` + `simple_compose.rs` exercise each backend end-to-end against `IkpirServer` |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:
 

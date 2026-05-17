@@ -62,7 +62,9 @@
 //!    with the updated DB for **all** future queries.
 
 pub mod frodo;
+pub mod simple;
 pub use frodo::{FrodoConfig, FrodoPirBackend};
+pub use simple::{SimpleConfig, SimplePirBackend};
 
 /// A single-server Index-PIR backend, expressed as five operations over
 /// associated types.
@@ -155,9 +157,15 @@ pub trait IncrementalPirBackend: IndexPirBackend {
     /// hint. (Queue contents preserved by precomputation are *not*
     /// considered part of the equivalence — a fresh setup always yields an
     /// empty queue.)
+    ///
+    /// Implementations should read the backend's
+    /// [`ServerParams`](IndexPirBackend::ServerParams) from the
+    /// `ClientState` itself; the caller does **not** thread a separate
+    /// `params` argument through, since
+    /// [`client_setup`](IndexPirBackend::client_setup) already stashes a
+    /// copy.
     fn client_patch_state(
         state: &mut Self::ClientState,
-        params: &Self::ServerParams,
         row_deltas: &[(u32, Vec<(u16, i64)>)],
     );
 }
