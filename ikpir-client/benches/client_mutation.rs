@@ -1,12 +1,15 @@
 //! **Intent:** Measure client-side `apply_delta` throughput for N mutations
-//! per kind (insert / update / delete), always in warm-bc mode
-//! (precompute_queries + precompute_decodes), across both backends.
+//! per kind (insert / update / delete), in **empty-queue mode** (no
+//! precomputed slots), across both backends. The measurement isolates the
+//! cost of patching the hint `H` from any warm-bc queue-maintenance work,
+//! giving a clean number for the "compute new hint" cost reported in the
+//! paper.
 //!
-//! **Method:** Populate to `--load-factor`, build client in warm-bc mode,
-//! collect N deltas per kind from a fresh server clone, then time the full
-//! sequence of N apply_delta calls with wall-clock Instant. The timed loop
-//! runs exactly once (state advances with each mutation, so criterion cycling
-//! is not meaningful).
+//! **Method:** Populate to `--load-factor`, build a fresh client with no
+//! precompute (empty prepared-query queue), collect N deltas per kind from
+//! a fresh server clone, then time the full sequence of N apply_delta calls
+//! with wall-clock Instant. The timed loop runs exactly once (state
+//! advances with each mutation, so criterion cycling is not meaningful).
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
 //! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
@@ -23,7 +26,7 @@ mod helpers;
 use helpers::{Backend, CloneStore};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient,
-    IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
 use segmented_cuckoo::{
@@ -36,11 +39,6 @@ const HEADER: &str = "backend,mutation_kind,arity,num_buckets,bucket_size,value_
     n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
     cells_per_slot,row_width,segment_rows";
 
-// Precomputed-query queue size for warm-bc state.
-// apply_delta patches c = s^T*H for every slot in this queue;
-// keep it small enough to avoid excessive memory at large configs.
-const QUEUE_HEADROOM: u32 = 1 << 10;
-
 #[derive(Clone, Copy, Debug)]
 enum MutationKind { Insert, Update, Delete }
 impl MutationKind {
@@ -51,7 +49,7 @@ impl MutationKind {
 }
 
 #[derive(Clone, clap::Parser)]
-#[command(about = "Measure client apply_delta throughput for N mutations per kind (warm-bc).")]
+#[command(about = "Measure client apply_delta throughput for N mutations per kind (empty queue, hint-patch only).")]
 struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
     arity: u32,
@@ -132,7 +130,7 @@ fn run_one<S, B>(
 )
 where
     S: CloneStore,
-    B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize + Clone,
     B::Query: Clone, B::Response: Clone,
 {
     use clap::parser::ValueSource;
@@ -186,10 +184,12 @@ where
             continue;
         }
 
-        // Build client in warm-bc state once.
+        // Build a fresh client with an empty prepared-query queue. No
+        // precompute_queries / precompute_decodes — every apply_delta
+        // patches only the hint H (the queue iteration in
+        // `client_patch_state` is a no-op when the queue is empty), so
+        // the timing reflects the "compute new hint" cost in isolation.
         let mut client = IkpirClient::<B>::from_setup(bundle.clone());
-        client.precompute_queries(QUEUE_HEADROOM);
-        client.precompute_decodes();
 
         // Wall-clock time the full N apply_delta sequence.
         let t = Instant::now();

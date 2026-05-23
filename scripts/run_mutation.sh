@@ -12,22 +12,22 @@
 #   IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_mutation.sh  # both backends
 #   MAX_MEM_GB=20.0 ./scripts/run_mutation.sh   # raise OOM guard (default 12 GB)
 #
-# Memory: two coexisting large allocations during apply_delta timing:
-#   1. The per-segment LWE public matrix A (in B::HintMaterial). After the
-#      HintMaterial refactor setup() no longer ships A and the server drops
-#      its copy immediately; run_server_kind returns before the client is
-#      built, so peak coexisting A copies = 1 (server during the mutation
-#      loop, then the warm-bc client during apply_delta).
-#   2. The warm-bc prepared-query queue (QUEUE_HEADROOM=1024 slots × arity,
-#      each holding secret + b + c). For paper-scale Frodo this rivals A
-#      itself (~16 GB at num_buckets=4M).
+# Memory: dominant allocation is the per-segment LWE public matrix A (in
+# B::HintMaterial). After the HintMaterial refactor setup() no longer ships
+# A over the wire. run_server_kind keeps A resident throughout its mutation
+# loop (no drop_hint_material — that would re-expand A on the first
+# mutation and bias the timing) and the server drops at function return,
+# before the client is built. The client runs in empty-queue mode (no
+# precompute_queries / precompute_decodes), so no prepared-query queue
+# coexists with A. Peak coexisting A copies = 1 (server during mutations,
+# then the client during apply_delta).
 #
 # Per-segment A shape is backend-aware:
 #   FrodoPIR:  (n_rows, lwe_dim)
 #   SimplePIR: (reshape_rows, lwe_dim) — ~100× smaller via the √N reshape.
 #
-# The in-bench estimator (mutation_throughput.rs) accounts for table + A +
-# queue and skips any config whose estimated peak exceeds MAX_MEM_GB
+# The in-bench estimator (mutation_throughput.rs) accounts for table + A
+# and skips any config whose estimated peak exceeds MAX_MEM_GB
 # (default 12.0). Raise it on 32 GB+ machines.
 #
 # Config matrix (scripts/configs.sh):

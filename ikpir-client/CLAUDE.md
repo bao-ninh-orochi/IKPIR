@@ -101,11 +101,18 @@ Three focused benches covering classical and incremental client criteria for the
 |---|---|---|---|
 | `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
 | `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
-| `client_mutation` | `--load-factor` (0.80) | `apply_delta` throughput per kind (insert/update/delete), wall-clock, warm-bc | `ikpir_client_mutation.csv` |
+| `client_mutation` | `--load-factor` (0.80) | `apply_delta` throughput per kind (insert/update/delete), wall-clock, empty queue (isolates hint-patch cost) | `ikpir_client_mutation.csv` |
 
-All client benches always use **warm-bc** mode: `precompute_queries` +
-`precompute_decodes` are called before the timed loop. There is no `--mode`
-flag.
+`client_query` and `client_decode` use **warm-bc** mode (precompute the
+prepared-query queue + decode material before the timed loop), so the
+timed call hits the cheap amortised path.
+
+`client_mutation` (and the fused `mutation_throughput` bench) runs the
+client in **empty-queue** mode (no `precompute_queries` /
+`precompute_decodes`). Each `apply_delta` then patches only the hint
+`H` — the queue-iteration inside `client_patch_state` is a no-op when
+the queue is empty — so the timing reports the "compute new hint" cost
+in isolation, without warm-bc queue-maintenance overhead mixed in.
 
 - Each bench is `harness = false` and parses CLI via `clap` (see helpers
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
@@ -130,8 +137,7 @@ flag.
       criterion wrapper used by `client_query` and `client_decode`.
 - `client_mutation` uses wall-clock `Instant` batch timing (not criterion)
   because apply_delta advances the client epoch with each call; criterion's
-  cycling approach would require expensive re-precomputes every n_mutations
-  iterations, making it impractical.
+  cycling pattern is not meaningful when state changes between calls.
 
 **Per-segment data flow (client annotations):**
 

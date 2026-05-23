@@ -11,9 +11,9 @@
 //! that fires inside `new` dominates wall-clock cost (30–120 s per
 //! call). This bench fuses both measurements: for each kind we
 //! construct *one* fresh server, time the mutation loop while
-//! collecting the deltas, then build a warm-bc client from a captured
-//! setup bundle and time `apply_delta` over the very same deltas. Total
-//! expensive setups per config drops 7 → 3.
+//! collecting the deltas, then build a fresh empty-queue client from a
+//! captured setup bundle and time `apply_delta` over the very same
+//! deltas. Total expensive setups per config drops 7 → 3.
 //!
 //! **Method:** Populate to `--load-factor` once and snapshot the cells.
 //! For each kind (insert / update / delete):
@@ -28,22 +28,26 @@
 //!      post-mutation hint bit-for-bit.
 //!   3. Wall-clock time the N-mutation loop on the server, collecting
 //!      each returned `HintDeltaBundle`.
-//!   4. Build a fresh warm-bc client from the captured bundle,
-//!      `precompute_queries` + `precompute_decodes`.
+//!   4. Build a fresh client from the captured bundle, with an **empty
+//!      prepared-query queue** (no `precompute_queries` / `precompute_decodes`).
+//!      Each `apply_delta` then patches only the hint `H`; the
+//!      queue-iteration inside `client_patch_state` is a no-op. This
+//!      isolates the "compute new hint" cost from any warm-bc
+//!      queue-maintenance overhead.
 //!   5. Wall-clock time the N `apply_delta` calls on those collected
 //!      deltas.
 //!   6. Drop client + server before the next kind so peak live
 //!      A-matrix copies stay at the 1-copy budget the memory guard
-//!      accounts for. Each `run_server_kind` calls
-//!      `server.drop_hint_material()` immediately after `setup()`, so
-//!      the first `commit_mutations` re-expands `A` from the seed
-//!      (a one-time cost; subsequent mutations reuse the materialised
-//!      copy).
+//!      accounts for. `run_server_kind` keeps `A` resident throughout
+//!      the mutation loop (no `drop_hint_material` call), so all N
+//!      mutations reuse the original allocation and no re-expansion
+//!      bias creeps into `server_total_ms`. The server is dropped at
+//!      function return — before the client is built — so peak
+//!      coexisting `A` copies is 1.
 //!
 //! Wall-clock batch timing is used (not Criterion) for both sides,
 //! because each mutation advances the server epoch / mutates state, so
-//! Criterion's cycling pattern would either be meaningless or require
-//! expensive re-precomputes per sample.
+//! Criterion's cycling pattern is not meaningful.
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
 //! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
@@ -68,7 +72,7 @@ mod helpers;
 use helpers::{Backend, CloneStore};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient,
-    IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
 use segmented_cuckoo::{
@@ -86,11 +90,6 @@ const HEADER_CLIENT: &str =
     "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
      n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
      cells_per_slot,row_width,segment_rows";
-
-// Precomputed-query queue size for the warm-bc client.
-// Each apply_delta patches c = s^T·H for every slot still in this queue,
-// so keep it modest at large configs.
-const QUEUE_HEADROOM: u32 = 1 << 10;
 
 #[derive(Clone, Copy, Debug)]
 enum MutationKind { Insert, Update, Delete }
@@ -121,11 +120,14 @@ struct Cli {
     /// dominant term is the LWE public matrix `A` (segment_rows × lwe_dim
     /// × 4 B per segment), held by `B::HintMaterial`. After the
     /// HintMaterial refactor the captured setup bundle no longer carries
-    /// `A` and the server drops its copy immediately after `setup()`, so
-    /// the peak coexisting `A` count is 1 (only the active client's
-    /// copy, since each `run_server_kind` is followed by a client phase
-    /// with the server already dropped). Same formula and rationale as
-    /// `classical_throughput`. Raise on machines with ≥ 32 GB RAM.
+    /// `A`. `run_server_kind` keeps `A` resident throughout its mutation
+    /// loop (no `drop_hint_material` — that would re-expand `A` on the
+    /// first mutation and bias the timing) and the server drops at
+    /// function return, before the client is built. The client runs in
+    /// empty-queue mode (no `precompute_queries` / `precompute_decodes`),
+    /// so no large prepared-query queue coexists with `A`. Peak coexisting
+    /// `A` copies is therefore 1 (server during mutations, then the
+    /// client during apply_delta). Raise on machines with ≥ 32 GB RAM.
     #[arg(long, default_value_t = 12.0)]   max_mem_gb: f64,
 }
 
@@ -183,12 +185,12 @@ where
     // bundle, so the client tracks this kind's server step-for-step.
     let bundle = server.setup();
 
-    // Free the server's seed-derived `A` matrix now. The first
-    // `commit_mutations` call below will silently re-expand it from the
-    // seed (one-time cost), then subsequent calls reuse the materialised
-    // copy. Brings peak live A copies inside this function to 1.
-    server.drop_hint_material();
-
+    // NOTE: do NOT call `server.drop_hint_material()` here. Dropping the
+    // matrix forces `commit_mutations` to re-expand it from the seed on
+    // the first mutation, which biases `server_total_ms` (especially at
+    // small N). The server is dropped at function return anyway, before
+    // the client is built — peak coexisting `A` copies stays at 1 either
+    // way (see the Memory guard below).
     let mut deltas: Vec<HintDeltaBundle<B>> = Vec::with_capacity(cli.n_mutations as usize);
     let mut delta_bytes_total = 0usize;
     let mut n_succeeded = 0u32;
@@ -239,7 +241,7 @@ fn run_one<S, B>(
 )
 where
     S: CloneStore,
-    B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize + Clone,
     B::Query:    Clone,
     B::Response: Clone,
 {
@@ -248,51 +250,43 @@ where
     let lwe_dim_eff = effective_lwe_dim(cli);
 
     // ── 0. Memory guard ─────────────────────────────────────────────────────────
-    // Two coexisting large allocations during `measure_and_write`:
+    // Dominant allocation is the per-segment LWE public matrix `A` (in
+    // `B::HintMaterial`). After the HintMaterial refactor `setup()` no
+    // longer ships `A` over the wire. `run_server_kind` keeps `A`
+    // resident for the whole mutation loop (no `drop_hint_material` call
+    // — otherwise the first `commit_mutations` would silently re-expand
+    // `A` and bias the timing). The server drops at function return, so
+    // the client built inside `measure_and_write` is the only `A` holder
+    // during apply_delta: peak coexisting `A` copies = 1. The client
+    // runs in empty-queue mode (no `precompute_queries` /
+    // `precompute_decodes`), so no large prepared-query queue coexists
+    // with `A`.
     //
-    //   1. The per-segment LWE public matrix `A` (in `B::HintMaterial`).
-    //      After the HintMaterial refactor `setup()` no longer ships `A`
-    //      and the server drops its copy immediately. Each
-    //      `run_server_kind` returns before the client is built, so peak
-    //      coexisting `A` copies = 1 (server during the timed mutation
-    //      loop, then the warm-bc client during apply_delta). The first
-    //      mutation per kind pays a one-time re-expansion cost.
-    //
-    //   2. The warm-bc prepared-query queue (filled by
-    //      `precompute_queries(QUEUE_HEADROOM)` + `precompute_decodes`):
-    //      `arity × QUEUE_HEADROOM` slots, each carrying `secret`
-    //      (lwe_dim u32) + `b` (a_rows_per_seg u32) + `c` (c_len_per_seg
-    //      u32). For paper-scale Frodo (n_rows ≈ 2M) this rivals `A`
-    //      itself (~16 GB at QUEUE_HEADROOM=1024).
-    //
-    // Per-segment shapes depend on the backend (same dispatch as
+    // Per-segment `A` shape depends on the backend (same dispatch as
     // `classical_throughput`):
-    //   FrodoPIR:  a_rows_per_seg = n_rows,        c_len_per_seg = row_width
-    //   SimplePIR: a_rows_per_seg = reshape_rows,  c_len_per_seg = reshape_row_width
+    //   FrodoPIR:  a_rows_per_seg = n_rows
+    //   SimplePIR: a_rows_per_seg = reshape_rows
     //
     // The collected `Vec<HintDeltaBundle>` is sparse (~100 MB at paper
-    // scale) and sits well below the noise of `A` and the queue.
+    // scale) and sits well below the noise of `A`.
     let lwe_dim_est        = lwe_dim_eff as u64;
     let cells_per_slot_est = (cli.fingerprint_bits + cli.value_bits).div_ceil(cli.plaintext_bits) as u64;
     let row_width_est      = cli.bucket_size as u64 * cells_per_slot_est;
     let n_rows_per_seg     = num_buckets as u64 / arity as u64;
     let table_bytes        = num_buckets as u64 * cli.bucket_size as u64 * cells_per_slot_est * 4;
-    let (a_rows_per_seg, c_len_per_seg) =
+    let (a_rows_per_seg, _c_len_per_seg) =
         helpers::backend_shape_estimate(cli.backend, n_rows_per_seg, row_width_est);
     let a_bytes_per_copy   = arity as u64 * a_rows_per_seg * lwe_dim_est * 4;
-    let queue_bytes        = arity as u64 * QUEUE_HEADROOM as u64
-                             * (lwe_dim_est + a_rows_per_seg + c_len_per_seg) * 4;
-    let estimated_bytes    = table_bytes + a_bytes_per_copy + queue_bytes;
+    let estimated_bytes    = table_bytes + a_bytes_per_copy;
     let estimated_gb       = estimated_bytes as f64 / 1e9;
     if estimated_gb > cli.max_mem_gb {
         eprintln!(
             "  Skip (OOM guard): estimated peak {:.1} GB > --max-mem-gb {:.1} \
              (nb={num_buckets} bs={} vb={} lwe_dim={lwe_dim_est} backend={}, \
-             A={:.2} GB, queue={:.2} GB, table={:.2} GB). \
+             A={:.2} GB, table={:.2} GB). \
              Raise --max-mem-gb on machines with more RAM.",
             estimated_gb, cli.max_mem_gb, cli.bucket_size, cli.value_bits, cli.backend,
             a_bytes_per_copy as f64 / 1e9,
-            queue_bytes     as f64 / 1e9,
             table_bytes     as f64 / 1e9,
         );
         return;
@@ -380,7 +374,7 @@ fn measure_and_write<B>(
     bundle:      &ikpir_client::ServerSetupBundle<B>,
 )
 where
-    B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize + Clone,
     B::Query:    Clone,
     B::Response: Clone,
 {
@@ -415,10 +409,12 @@ where
         return;
     }
 
-    // Build a fresh warm-bc client from the captured bundle.
+    // Build a fresh client from the captured bundle, with an empty
+    // prepared-query queue (no precompute_queries / precompute_decodes).
+    // Each apply_delta then patches only the hint H; the queue iteration
+    // inside `client_patch_state` is a no-op when the queue is empty, so
+    // the timing reflects the "compute new hint" cost in isolation.
     let mut client = IkpirClient::<B>::from_setup(bundle.clone());
-    client.precompute_queries(QUEUE_HEADROOM);
-    client.precompute_decodes();
 
     let t = Instant::now();
     for d in deltas {

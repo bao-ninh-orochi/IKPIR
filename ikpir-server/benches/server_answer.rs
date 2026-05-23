@@ -115,7 +115,7 @@ where
     helpers::print_preamble("server_answer", &knobs, &store_state, &geom);
 
     let mut idx = 0usize;
-    let crit = helpers::run_criterion_throughput("server_answer", cli.batch as u64, || {
+    let crit = helpers::run_criterion_throughput("server_answer", 1, || {
         let _ = server.answer(&queries[idx]).expect("answer ok");
         idx = (idx + 1) % queries.len();
     });

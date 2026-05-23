@@ -83,8 +83,9 @@ where
     let mut samples = Vec::with_capacity((cli.warmup + cli.trials) as usize);
     for trial in 0..(cli.warmup + cli.trials) {
         let store = S::clone_from_cells(cells.clone(), params, n_inserted).expect("from_cells");
+        let cfg = make_config();
         let t = Instant::now();
-        let server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
+        let server: IkpirServer<S, B> = IkpirServer::new(store, cfg);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         if trial == cli.warmup {
             let bundle  = server.setup();

@@ -325,7 +325,12 @@ pub struct CriterionThroughputStats {
 ///
 /// Uses `iter_custom` so the body can cycle over pre-built data.
 /// Criterion's native HTML/JSON report lands in `target/criterion/<bench_label>/`.
-/// `elements_per_iter` sets `Throughput::Elements` for criterion's display.
+///
+/// `elements_per_iter` only labels criterion's `Throughput::Elements` for its
+/// HTML/JSON report. It does **not** scale the returned
+/// `CriterionThroughputStats`, which always counts one body call per sample
+/// (`mean_ops_per_s = 1e9 / mean_ns_per_body_call`). Pass `1` when each body
+/// call executes one operation.
 #[allow(dead_code)]
 pub fn run_criterion_throughput<F>(
     bench_label: &str,
@@ -376,8 +381,10 @@ where
 /// bracket (the per-call `Instant` brackets only `routine`).
 ///
 /// `setup` runs once per `routine` call; both are reused across criterion's
-/// sampling loop. `elements_per_iter` feeds `Throughput::Elements` for
-/// criterion's native HTML/JSON report.
+/// sampling loop. `elements_per_iter` only labels criterion's
+/// `Throughput::Elements` for its HTML/JSON report; it does **not** scale the
+/// returned `CriterionThroughputStats` (always `1e9 / mean_ns_per_routine_call`).
+/// Pass `1` when each `routine` call executes one operation.
 #[allow(dead_code)]
 pub fn run_criterion_throughput_batched<S, I, R>(
     bench_label: &str,
