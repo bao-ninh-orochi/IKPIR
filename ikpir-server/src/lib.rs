@@ -32,8 +32,8 @@
 //!
 //! Two backends ship today, both LWE-based and post-quantum:
 //! [`FrodoPirBackend`] (ternary errors, tall-skinny per-segment matrix,
-//! default `lwe_dim = 1774`) and [`SimplePirBackend`] (discrete-Gaussian
-//! errors, square-ish reshape, default `lwe_dim = 1024`). They are
+//! default `lwe_dim = 1566`) and [`SimplePirBackend`] (discrete-Gaussian
+//! errors, square-ish reshape, default `lwe_dim = 1275`). They are
 //! drop-in alternatives at the `B: IndexPirBackend` type parameter on
 //! [`IkpirServer`]. New backends implement [`IndexPirBackend`] and
 //! optionally [`IncrementalPirBackend`]; see the trait docs for the

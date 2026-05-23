@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
-# Run every IKPIR bench (server + client) across the paper-derived configs,
-# then render plots.
+# Run every IKPIR bench (server + client) across the full config matrix.
 #
 # Usage:
-#   ./scripts/run_all.sh                           # default profile
-#   IKPIR_BENCH_PROFILE=quick ./scripts/run_all.sh # smaller config matrix
-#   IKPIR_BENCH_PROFILE=full  ./scripts/run_all.sh # include m=2^22 row
-#
-#   IKPIR_BENCH_BACKENDS=frodo ./scripts/run_all.sh         # default: FrodoPIR only
-#   IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh        # SimplePIR only
+#   ./scripts/run_all.sh                                    # FrodoPIR only
+#   IKPIR_BENCH_BACKENDS=simple       ./scripts/run_all.sh  # SimplePIR only
 #   IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh  # both (~2× runtime)
 #
-#   ./scripts/run_all.sh --no-plot                 # skip the plot step
-#   ./scripts/run_all.sh --plot-only               # only run plot.py (assume CSVs already populated)
-#   ./scripts/run_all.sh --server-only             # ikpir-server benches only
-#   ./scripts/run_all.sh --client-only             # ikpir-client benches only
+#   ./scripts/run_all.sh --server-only   # ikpir-server benches only
+#   ./scripts/run_all.sh --client-only   # ikpir-client benches only
 #
-# Total runtime (default profile, M1/M2 Mac):
-#   ikpir-server: ~20-30 min
-#   ikpir-client: ~10-15 min
-#   plots:        seconds
+# Config matrix: 20 (arity, bucket_size, num_buckets) tuples × 3 value_bits
+# = 60 classical runs per bench per backend.
+# Mutation sweep: × 7 N_MUTATIONS = 420 mutation runs per bench per backend.
+# See scripts/configs.sh for the full matrix.
+#
+# Faster alternatives:
+#   * scripts/run_classical.sh — runs server_answer + client_query +
+#     client_decode from one shared fill + setup per config (~3× faster
+#     than running the individual scripts for those three benches).
+#   * scripts/run_mutation.sh — runs server_mutation + client_mutation
+#     from one shared populate + setup per kind (cuts 7 expensive
+#     IkpirServer::new calls per config to 3).
+# server_setup still requires the individual script.
 
 set -euo pipefail
 
@@ -27,12 +29,9 @@ WORKSPACE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 DO_SERVER=1
 DO_CLIENT=1
-DO_PLOT=1
 
 while (( $# > 0 )); do
     case "$1" in
-        --no-plot)     DO_PLOT=0 ;;
-        --plot-only)   DO_SERVER=0; DO_CLIENT=0 ;;
         --server-only) DO_CLIENT=0 ;;
         --client-only) DO_SERVER=0 ;;
         -h|--help)
@@ -50,7 +49,7 @@ else
     BOLD=''; RESET=''
 fi
 
-echo -e "${BOLD}IKPIR bench orchestrator${RESET} (profile=${IKPIR_BENCH_PROFILE:-default}, backends=${IKPIR_BENCH_BACKENDS:-frodo})"
+echo -e "${BOLD}IKPIR bench orchestrator${RESET} (backends=${IKPIR_BENCH_BACKENDS:-frodo})"
 
 if (( DO_SERVER )); then
     echo -e "${BOLD}▶ ikpir-server${RESET}"
@@ -62,18 +61,6 @@ if (( DO_CLIENT )); then
     bash "$WORKSPACE_DIR/ikpir-client/scripts/run_benches.sh"
 fi
 
-if (( DO_PLOT )); then
-    echo -e "${BOLD}▶ plotting${RESET}"
-    if ! python3 -c 'import pandas, matplotlib' 2>/dev/null; then
-        echo "  Missing python deps. Installing..."
-        pip install -r "$WORKSPACE_DIR/ikpir-server/scripts/requirements.txt"
-    fi
-    ( cd "$WORKSPACE_DIR/ikpir-server" && python3 scripts/plot.py )
-    ( cd "$WORKSPACE_DIR/ikpir-client" && python3 scripts/plot.py )
-fi
-
 echo -e "${BOLD}Done.${RESET}"
 echo "  Server CSVs: $WORKSPACE_DIR/ikpir-server/results/"
 echo "  Client CSVs: $WORKSPACE_DIR/ikpir-client/results/"
-echo "  Server PNGs: $WORKSPACE_DIR/ikpir-server/results/plots/"
-echo "  Client PNGs: $WORKSPACE_DIR/ikpir-client/results/plots/"

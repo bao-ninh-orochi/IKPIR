@@ -34,7 +34,7 @@
 //! |---|---|---|
 //! | LWE secret `s` | uniform ternary `{-1, 0, +1}` | uniform `Z_q` (`u32`) |
 //! | LWE error  `e` | uniform ternary `{-1, 0, +1}` | discrete Gaussian, σ = 6.4 |
-//! | Default `lwe_dim` | 1774 (FrodoPIR Table 5) | 1024 (SimplePIR §4.2) |
+//! | Default `lwe_dim` | 1566 (lattice estimator, ADPS16) | 1275 (lattice estimator, ADPS16) |
 //!
 //! Both choices give 128-bit security on `q = 2³²` per the respective
 //! parameter analyses. SimplePIR's LWE assumption (§3.1 / Fig. 2) samples
@@ -81,8 +81,8 @@ mod params;
 mod sampler;
 
 pub use backend::{
-    SimplePirBackend, SimpleServerParams, SimpleHint, SimpleClientState, SimpleQuery,
-    SimpleResponse,
+    SimplePirBackend, SimpleServerParams, SimpleHintMaterial, SimpleHint, SimpleClientState,
+    SimpleQuery, SimpleResponse,
 };
 pub use params::{SimpleConfig, SimpleParams};
 

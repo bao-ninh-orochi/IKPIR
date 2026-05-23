@@ -28,6 +28,17 @@ setup bundle.
   Lookup geometry (`candidate_buckets`) is public, not secret; the client
   re-derives it on every query without any privacy cost.
 
+- **Client re-expands `A` locally from the wire-shipped seed** — the
+  `ServerSetupBundle` does **not** carry the LWE public matrix `A`.
+  During `from_setup`, the backend's `client_setup` calls
+  `B::expand_hint_material(&params)`, which deterministically reproduces
+  `A` from the 16-byte seed inside `B::ServerParams`. This is invisible
+  to callers (no extra round trips, no protocol-visible difference); it
+  just keeps the wire bundle small and centralises `A` ownership at the
+  client. The materialised matrix lives inside `B::ClientState` and is
+  used by both `client_query` (LWE matvec) and `client_patch_state`
+  (sparse hint patch).
+
 - **Parallel per-segment queries** — `build_query` emits one `B::Query`
   per segment (j-th query targets row `indices[j] % segment_size` in
   segment j). The server processes each segment independently in `answer`.
@@ -79,10 +90,22 @@ setup bundle.
 | Recover from a gap | `client.rs::IkpirClient::reset_from` |
 | Debug a fingerprint mismatch | `client.rs::IkpirClient::decode` — check `candidate_buckets` + `unpack_slot_cells` |
 | Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`) |
-| Benches | `benches/query_throughput.rs`, `benches/decode_throughput.rs`, `benches/apply_delta_throughput.rs`, `benches/preprocess_throughput.rs`, `benches/client_setup_latency.rs`, `benches/client_memory_footprint.rs`. All accept `--backend frodo\|simple` |
+| Benches | `benches/client_query.rs`, `benches/client_decode.rs`, `benches/client_mutation.rs`. All accept `--backend frodo\|simple` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-server/benches/helpers.rs` |
 
 ### Bench layer (under `benches/`)
+
+Three focused benches covering classical and incremental client criteria for the paper:
+
+| Bench | Populate to | What it measures | CSV |
+|---|---|---|---|
+| `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
+| `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
+| `client_mutation` | `--load-factor` (0.80) | `apply_delta` throughput per kind (insert/update/delete), wall-clock, warm-bc | `ikpir_client_mutation.csv` |
+
+All client benches always use **warm-bc** mode: `precompute_queries` +
+`precompute_decodes` are called before the timed loop. There is no `--mode`
+flag.
 
 - Each bench is `harness = false` and parses CLI via `clap` (see helpers
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
@@ -91,7 +114,7 @@ setup bundle.
 - **Backend dispatch.** Every bench exposes `--backend frodo|simple`
   (default `frodo`). A two-level match in `main` picks the typed
   `<S, B>` pair; `run_one` is generic over both. `--lwe-dim` defaults
-  to the backend-appropriate value (1774 for Frodo, 1024 for Simple)
+  to the backend-appropriate value (1566 for Frodo, 1275 for Simple)
   via `helpers::backend_default_lwe_dim`.
 - One invocation = one CSV row (append-mode writer); the orchestrator
   is responsible for `rm`-ing the CSV before sweeping. The orchestrator
@@ -99,22 +122,16 @@ setup bundle.
   bench once per backend in that comma-separated list.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — same content lives in `ikpir-server/benches/helpers.rs`):
-    - `default_num_buckets_for_arity(arity)` — academic-scale defaults
-      (2-ary → 16384, 3-ary → 24576, 4-ary → 16384).
     - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard
       `=== <bench> ===` / Parameters / KV store / Geometry banner.
-    - `run_criterion_throughput(label, elems, body)` and
-      `run_criterion_throughput_batched(label, elems, setup, routine)` —
-      criterion wrappers. The batched form uses `iter_custom` with an
-      inner per-call `Instant` so per-iteration setup is excluded from
-      the timing bracket; used by `query_throughput`, `decode_throughput`,
-      `apply_delta_throughput`, `preprocess_throughput`.
-- The four criterion microbenches also emit
-  `target/criterion/{query_throughput,decode_throughput,apply_delta_throughput,preprocess_phase_b,preprocess_phase_c}/`
-  for browsable HTML/JSON. `client_setup_latency` and
-  `client_memory_footprint` stay on manual timing / closed-form math.
+    - `run_criterion_throughput_batched(label, elems, setup, routine)` —
+      criterion wrapper used by `client_query` and `client_decode`.
+- `client_mutation` uses wall-clock `Instant` batch timing (not criterion)
+  because apply_delta advances the client epoch with each call; criterion's
+  cycling approach would require expensive re-precomputes every n_mutations
+  iterations, making it impractical.
 
 **Per-segment data flow (client annotations):**
 

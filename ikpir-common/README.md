@@ -25,8 +25,8 @@ under all three paths.
 | Module | Items |
 |---|---|
 | `backend` | `IndexPirBackend`, `IncrementalPirBackend`, `PrecomputingPirBackend`, `BackendWireSize` traits |
-| `backend::frodo` | `FrodoPirBackend`, `FrodoConfig`, `FrodoParams`, plus the associated `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` types (ternary LWE, tall-skinny `n_rows × row_width` matrix; default `lwe_dim = 1774`) |
-| `backend::simple` | `SimplePirBackend`, `SimpleConfig`, `SimpleParams`, plus the associated `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` types (discrete-Gaussian LWE with σ = 6.4, internal `√N × √N` reshape; default `lwe_dim = 1024`) |
+| `backend::frodo` | `FrodoPirBackend`, `FrodoConfig`, `FrodoParams`, plus the associated `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` types (ternary LWE, tall-skinny `n_rows × row_width` matrix; default `lwe_dim = 1566`) |
+| `backend::simple` | `SimplePirBackend`, `SimpleConfig`, `SimpleParams`, plus the associated `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` types (discrete-Gaussian LWE with σ = 6.4, internal `√N × √N` reshape; default `lwe_dim = 1275`) |
 | `wire` | `ServerSetupBundle`, `PirQueryBundle`, `PirResponseBundle`, `HintDeltaBundle`, `SegmentRowDeltas` type alias |
 | `error` | `IkpirError` enum (`StaleEpoch`, `MalformedQuery`, `TableFull`, `NotFound`, `InvalidInput`) |
 
@@ -68,7 +68,9 @@ key design decisions behind the trait split.
 
 Bundle types are not versioned; serialisation is out of scope.
 Two backends ship: `FrodoPirBackend` (ternary errors, tall-skinny matrix,
-default `lwe_dim = 1774`) and `SimplePirBackend` (discrete-Gaussian
-errors with σ = 6.4, `√N × √N` internal reshape, default `lwe_dim = 1024`).
-Both implement all four traits and are drop-in alternatives at the
-`B: IndexPirBackend` type parameter on the server / client.
+default `lwe_dim = 1566`) and `SimplePirBackend` (discrete-Gaussian
+errors with σ = 6.4, `√N × √N` internal reshape, default `lwe_dim = 1275`).
+Both defaults target 128-bit security, estimated via the lattice
+estimator under the ADPS16 cost model. Both implement all four traits
+and are drop-in alternatives at the `B: IndexPirBackend` type parameter
+on the server / client.

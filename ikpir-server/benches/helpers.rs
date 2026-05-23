@@ -79,8 +79,8 @@ pub fn parse_cli_with_matches<C: clap::Parser>() -> (C, clap::ArgMatches) {
 ///
 /// `frodo` → [`ikpir_common::FrodoPirBackend`] (default; FrodoPIR-style
 /// tall-skinny per-segment matrix, ternary errors, default `lwe_dim`
-/// 1774). `simple` → [`ikpir_common::SimplePirBackend`] (SimplePIR-style
-/// square reshape, discrete-Gaussian errors, default `lwe_dim` 1024).
+/// 1566). `simple` → [`ikpir_common::SimplePirBackend`] (SimplePIR-style
+/// square reshape, discrete-Gaussian errors, default `lwe_dim` 1275).
 #[allow(dead_code)]
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -99,14 +99,50 @@ impl std::fmt::Display for Backend {
     }
 }
 
-/// Backend-appropriate default LWE dimension. FrodoPIR → 1774 (Table 5
-/// 128-bit security). SimplePIR → 1024 (paper §4.2). Used by every
-/// bench's `Cli` when `--lwe-dim` is omitted.
+/// Backend-appropriate default LWE dimension for 128-bit security,
+/// estimated via the lattice estimator under the ADPS16 cost model.
+/// FrodoPIR → 1566. SimplePIR → 1275. Used by every bench's `Cli` when
+/// `--lwe-dim` is omitted.
 #[allow(dead_code)]
 pub fn backend_default_lwe_dim(b: Backend) -> u32 {
     match b {
-        Backend::Frodo  => 1774,
-        Backend::Simple => 1024,
+        Backend::Frodo  => 1566,
+        Backend::Simple => 1275,
+    }
+}
+
+/// Per-segment `A`-matrix rows and `c` precomputed-decode vector length
+/// for the given backend, given the original `(n_rows_per_seg, row_width)`.
+///
+/// # Rationale
+///
+/// Memory estimators in `classical_throughput` and `mutation_throughput`
+/// need the per-segment `A`-matrix shape (drives both the `A` allocation
+/// and the per-slot `b` vector size) and the prepared-slot `c`-vector
+/// length to estimate peak RAM. FrodoPIR keeps the original layout;
+/// SimplePIR reshapes into a near-square `(reshape_rows × reshape_row_width)`
+/// matrix with `k = max(1, round(√(n_rows_per_seg / row_width)))`. The
+/// formula mirrors `reshape_dims` in `ikpir-common/src/backend/simple/backend.rs`.
+///
+/// # Returns
+///
+/// `(a_rows_per_seg, c_len_per_seg)`:
+/// - FrodoPIR:  `(n_rows_per_seg, row_width)`
+/// - SimplePIR: `(⌈n_rows_per_seg / k⌉, k · row_width)`
+#[allow(dead_code)]
+pub fn backend_shape_estimate(
+    backend: Backend,
+    n_rows_per_seg: u64,
+    row_width: u64,
+) -> (u64, u64) {
+    match backend {
+        Backend::Frodo => (n_rows_per_seg, row_width),
+        Backend::Simple => {
+            let k = ((n_rows_per_seg as f64 / row_width as f64).sqrt().round().max(1.0)) as u64;
+            let reshape_rows      = n_rows_per_seg.div_ceil(k);
+            let reshape_row_width = k * row_width;
+            (reshape_rows, reshape_row_width)
+        }
     }
 }
 

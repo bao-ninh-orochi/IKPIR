@@ -74,8 +74,8 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 | Backend trait family + wire bundles + shared error | Shipped (`ikpir-common`) |
 | Server protocol (setup / answer / insert / update / delete / full_rebuild) | Shipped (`ikpir-server`) |
 | Client protocol (from_setup / build_query / decode / apply_delta / reset_from) | Shipped (`ikpir-client`) |
-| FrodoPIR backend | Shipped (`ikpir-common`) — ternary errors, tall-skinny matrix, default `lwe_dim = 1774` |
-| SimplePIR backend | Shipped (`ikpir-common`) — discrete-Gaussian errors (σ = 6.4), √N×√N reshape, default `lwe_dim = 1024` |
+| FrodoPIR backend | Shipped (`ikpir-common`) — ternary errors, tall-skinny matrix, default `lwe_dim = 1566` |
+| SimplePIR backend | Shipped (`ikpir-common`) — discrete-Gaussian errors (σ = 6.4), √N×√N reshape, default `lwe_dim = 1275` |
 
 ## Repository tour
 
@@ -89,58 +89,46 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 | [`ikpir-client/CLAUDE.md`](ikpir-client/CLAUDE.md) | Client crate internals, epoch state machine, failure modes |
 | [`ikpir-client/README.md`](ikpir-client/README.md) | Client quick start and lifecycle overview |
 
-## Benches and visualization
+## Benches
 
-Each crate ships `clap`-parsed benches that emit CSV under `results/`.
-Each invocation runs a single config and appends one row to its CSV
-(`csv_writer` is append-aware); sweeping across configs is the
-orchestrator's job — `rm` the CSV first, then loop.
+Six focused `clap`-parsed CSV-emitting benches (3 server + 3 client) cover
+the classical and incremental PIR criteria needed for the paper. Each
+invocation runs one config and appends one row; sweeping across configs is
+the orchestrator's job.
 
 The canonical sweep is **`./scripts/run_all.sh`**, which iterates every
-bench over a paper-derived config matrix (see `scripts/configs.sh`) and
-then renders all plots:
+bench over the full paper config matrix (20 configs × 3 value\_bits = 60
+runs per bench; mutation benches × 7 N\_mutations = 420 runs):
 
 ```bash
-./scripts/run_all.sh                                 # default profile, ~30–45 min (FrodoPIR only)
-IKPIR_BENCH_PROFILE=quick ./scripts/run_all.sh       # smaller matrix, ~5–10 min
-IKPIR_BENCH_PROFILE=full  ./scripts/run_all.sh       # adds m=2^22, ~1+ hour
+./scripts/run_all.sh                                  # FrodoPIR only (default)
+IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh  # both backends (~2× runtime)
+IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh      # SimplePIR only
 
-IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh   # both backends in one sweep (~2× runtime)
-IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh         # SimplePIR only
-
-./scripts/run_all.sh --plot-only                     # re-plot from existing CSVs
-./scripts/run_all.sh --server-only                   # skip client benches
-./ikpir-server/scripts/run_benches.sh answer_throughput
+./scripts/run_all.sh --server-only                    # server benches only
+./scripts/run_all.sh --client-only                    # client benches only
+./ikpir-server/scripts/run_benches.sh server_answer   # one bench only
 ```
 
-Per-crate orchestrators (`<crate>/scripts/run_benches.sh`) run just that
-crate. For one-off measurements, invoke `cargo bench` directly:
+For one-off measurements, invoke `cargo bench` directly:
 
 ```bash
-# Server: setup latency, answer rate, and the headline incremental crossover.
-cargo bench -p ikpir-server --bench setup_latency
-cargo bench -p ikpir-server --bench answer_throughput
-cargo bench -p ikpir-server --bench incremental_vs_rebuild -- --n-mutations 1024
+# Server: setup time, answer throughput, mutation throughput.
+cargo bench -p ikpir-server --bench server_setup
+cargo bench -p ikpir-server --bench server_answer
+cargo bench -p ikpir-server --bench server_mutation -- --n-mutations 1024
 
-# Backend selection: every bench accepts `--backend frodo|simple` (default frodo).
-cargo bench -p ikpir-server --bench answer_throughput -- --backend simple
-cargo bench -p ikpir-client --bench query_throughput  -- --backend simple --mode warm-bc
+# Client: query, decode, and apply_delta (all warm-bc).
+cargo bench -p ikpir-client --bench client_query
+cargo bench -p ikpir-client --bench client_decode
+cargo bench -p ikpir-client --bench client_mutation -- --n-mutations 64
 
-# Client: query construction, decode, and apply_delta.
-cargo bench -p ikpir-client --bench query_throughput
-cargo bench -p ikpir-client --bench decode_throughput
-cargo bench -p ikpir-client --bench apply_delta_throughput
+# Backend selection: every bench accepts --backend frodo|simple (default frodo).
+cargo bench -p ikpir-server --bench server_answer  -- --backend simple
+cargo bench -p ikpir-client --bench client_query   -- --backend simple
 
 # Filter / KV-store baselines (load_factor, fpr, throughputs).
 cargo bench -p segmented-cuckoo
 ```
 
-Each crate also ships a `scripts/plot.py` (matplotlib + pandas) that
-turns the CSV outputs into PNG charts under `results/plots/`:
-
-```bash
-cd ikpir-server && pip install -r scripts/requirements.txt && \
-    python scripts/plot.py        # all plots
-cd ikpir-client && pip install -r scripts/requirements.txt && \
-    python scripts/plot.py --list # list individual functions
-```
+CSVs land under `ikpir-server/results/` and `ikpir-client/results/`.

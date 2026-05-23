@@ -34,29 +34,13 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [[bench]]
-name    = "setup_latency"
+name    = "server_setup"
 harness = false
 
 [[bench]]
-name    = "answer_throughput"
+name    = "server_answer"
 harness = false
 
 [[bench]]
-name    = "incremental_vs_rebuild"
-harness = false
-
-[[bench]]
-name    = "failure_modes"
-harness = false
-
-[[bench]]
-name    = "wire_sizes"
-harness = false
-
-[[bench]]
-name    = "setup_to_first_query"
-harness = false
-
-[[bench]]
-name    = "steady_state_workload"
+name    = "server_mutation"
 harness = false

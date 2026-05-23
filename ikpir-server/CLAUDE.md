@@ -42,10 +42,12 @@ without a full rebuild.
 - **Backend tunables via `B::Config` associated type** — `IkpirServer::new`
   takes `(store, backend_config)` and persists the config so every
   `full_rebuild` re-emits hints with identical dimensions. For FrodoPIR,
-  `FrodoConfig { lwe_dim }` controls the LWE dimension (default 1774).
+  `FrodoConfig { lwe_dim }` controls the LWE dimension (default 1566).
   For SimplePIR, `SimpleConfig { lwe_dim, sigma }` controls both knobs
-  (default `{1024, 6.4}`). Both backends slot into this seam without
-  any change to `IkpirServer` itself.
+  (default `{1275, 6.4}`). Both `lwe_dim` defaults target 128-bit
+  security, estimated via the lattice estimator under the ADPS16 cost
+  model. Both backends slot into this seam without any change to
+  `IkpirServer` itself.
 
 - **Mutation-log-driven incremental hint** — after each `insert` /
   `update` / `delete`, `drain_mutations` produces `SlotMutation` records.
@@ -54,15 +56,29 @@ without a full rebuild.
   `client_patch_state`. No full-matrix recompute; bandwidth scales with
   the mutation footprint, not DB size.
 
+- **Droppable `HintMaterial`** — the per-segment LWE matrix `A` (or any
+  analogous backend-local material) lives in `B::HintMaterial`, **not**
+  in `ServerParams`. `IkpirServer` carries a
+  `Vec<Option<B::HintMaterial>>` alongside `Vec<B::ServerParams>`.
+  Read-only deployments and benches that finish setup before sampling
+  queries can call [`IkpirServer::drop_hint_material`] to free `A`;
+  `server.answer` does not touch it, so the read path is unaffected.
+  The next `commit_mutations` call silently re-expands the affected
+  segments from the seed inside `ServerParams` via
+  `B::expand_hint_material`. Callers observe nothing different other
+  than a one-time first-mutation re-expansion cost.
+
 - **Sync API; no async, no `Arc`** — all calls are synchronous and
   single-threaded. Concurrency wrapping is the caller's responsibility.
 
 - **Two shipped backends** — both LWE-based, post-quantum, with full incremental hint patching:
   `FrodoPirBackend` (ternary errors, tall-skinny `n_rows × row_width`
-  matrix, default `lwe_dim = 1774`) and `SimplePirBackend`
+  matrix, default `lwe_dim = 1566`) and `SimplePirBackend`
   (discrete-Gaussian errors with σ = 6.4, square-ish `√N × √N` internal
-  reshape, default `lwe_dim = 1024`). Selectable per-bench via the
-  `--backend frodo|simple` CLI flag (default `frodo`).
+  reshape, default `lwe_dim = 1275`). Both `lwe_dim` defaults target
+  128-bit security, estimated via the lattice estimator under the
+  ADPS16 cost model. Selectable per-bench via the `--backend
+  frodo|simple` CLI flag (default `frodo`).
 
 - **Sparse row-delta encoding** — `HintDeltaBundle` carries
   `Vec<(row, Vec<(cell_offset, Δ)>)>` per segment. Wire cost is
@@ -114,24 +130,44 @@ without a full rebuild.
 | Wire-bundle definitions | `ikpir-common/src/wire.rs` |
 | `IkpirError` variants | `ikpir-common/src/error.rs` |
 | Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs`, `tests/frodo_compose.rs` + SimplePIR mirrors (`simple_*.rs`) |
-| Benches | `benches/setup_latency.rs`, `benches/answer_throughput.rs`, `benches/incremental_vs_rebuild.rs` (+ `failure_modes`, `wire_sizes`, `setup_to_first_query`, `steady_state_workload`). All accept `--backend frodo\|simple` |
+| Benches | `benches/server_setup.rs`, `benches/server_answer.rs`, `benches/server_mutation.rs`. All accept `--backend frodo\|simple` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-client/benches/helpers.rs` |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:
 
 1. Define `Config: Clone + Default` holding the backend's tunable knobs
-   (e.g. `FrodoConfig { lwe_dim }` or future `SimplePirConfig`).
-2. `server_setup(config, db, n_rows, row_width, plaintext_bits)` returns a
-   `(ServerParams, Hint)` from the DB slice and the supplied config.
-3. `client_setup` returns `ClientState` from `(ServerParams, Hint)`.
-4. `client_query(state, row)` + `server_answer(params, db, n_rows, row_width, query)` +
+   (e.g. `FrodoConfig { lwe_dim }`, `SimpleConfig { lwe_dim, sigma }`).
+2. Define `HintMaterial: Default + Send + 'static` for server-local
+   working state (e.g. the LWE matrix `A`). Backends with no analogous
+   material set `type HintMaterial = ()`.
+3. `server_setup(config, db, n_rows, row_width, plaintext_bits)` returns
+   `(ServerParams, HintMaterial, Hint)` from the DB slice and the
+   supplied config.
+4. `expand_hint_material(params)` re-derives the `HintMaterial`
+   deterministically from `ServerParams` (the server may drop and
+   re-expand mid-protocol; the client materialises its own copy
+   independently during `client_setup`).
+5. `client_setup` returns `ClientState` from `(ServerParams, Hint)`,
+   internally calling `expand_hint_material(params)`.
+6. `client_query(state, row)` + `server_answer(params, db, n_rows, row_width, query)` +
    `client_decode(state, response)` must satisfy:
    `client_decode(server_answer(client_query(state, row))) == db[row*row_width..(row+1)*row_width]`.
-5. If implementing `IncrementalPirBackend`: `server_patch_hint` and
-   `client_patch_state` must keep `Hint` and `ClientState` consistent
-   with the updated DB for all future queries.
+   `server_answer` is permitted **not** to read the `HintMaterial` — this
+   is what makes read-only `drop_hint_material` deployments work.
+7. If implementing `IncrementalPirBackend`: `server_patch_hint(params,
+   material, hint, row_deltas)` and `client_patch_state(state,
+   row_deltas)` must keep `Hint` and `ClientState` consistent with the
+   updated DB for all future queries.
 
 ### Bench layer (under `benches/`)
+
+Three focused benches covering classical and incremental server criteria for the paper:
+
+| Bench | Populate to | What it measures | CSV |
+|---|---|---|---|
+| `server_setup` | `TableFull` | `IkpirServer::new` wall-clock (trials=5, warmup=2); setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
+| `server_answer` | `TableFull` | PIR matvec answer rate (queries/sec, criterion); query_bytes, response_bytes | `ikpir_server_answer.csv` |
+| `server_mutation` | `--load-factor` (0.80) | Per-kind (insert/update/delete) throughput, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
 
 - Each bench is `harness = false` and parses CLI via `clap` (see helpers
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
@@ -140,28 +176,24 @@ without a full rebuild.
 - **Backend dispatch.** Every bench exposes `--backend frodo|simple`
   (default `frodo`). A two-level match in `main` picks the typed
   `<S, B>` pair; `run_one` is generic over both. `--lwe-dim` defaults
-  to the backend-appropriate value (1774 for Frodo, 1024 for Simple)
+  to the backend-appropriate value (1566 for Frodo, 1275 for Simple)
   via `helpers::backend_default_lwe_dim`.
-- **Script-level sweep.** The orchestrator scripts read
-  `IKPIR_BENCH_BACKENDS` (default `frodo`) and re-run every bench once
-  per backend. Set `IKPIR_BENCH_BACKENDS=frodo,simple` to cover both
-  in one sweep (~2× runtime).
+- **Script-level sweep.** The orchestrator reads `IKPIR_BENCH_BACKENDS`
+  (default `frodo`) and re-runs every bench once per backend. Set
+  `IKPIR_BENCH_BACKENDS=frodo,simple` to cover both (~2× runtime).
 - One invocation = one CSV row (append-mode writer); the orchestrator
   is responsible for `rm`-ing the CSV before sweeping.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — same content lives in `ikpir-client/benches/helpers.rs`):
-    - `default_num_buckets_for_arity(arity)` — academic-scale defaults
-      (2-ary → 16384, 3-ary → 24576, 4-ary → 16384).
     - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard
       `=== <bench> ===` / Parameters / KV store / Geometry banner.
-    - `run_criterion_throughput(label, elems, body)` and
-      `run_criterion_throughput_batched(label, elems, setup, routine)` —
-      criterion wrappers used by `answer_throughput`; the latter is
-      mirrored on the client side for the four client microbenches.
-- `answer_throughput` is the only criterion-backed server bench. It emits
-  `target/criterion/answer_throughput/...` for browsable HTML/JSON.
+    - `run_criterion_throughput_batched(label, elems, setup, routine)` —
+      criterion wrapper used by `server_answer`.
+- `server_mutation` uses wall-clock `Instant` batch timing (not criterion)
+  because store state changes between mutations; criterion cycling is not
+  meaningful here.
 
 **Per-segment data flow:**
 

@@ -59,12 +59,13 @@ use crate::backend::{BackendWireSize, IndexPirBackend, IncrementalPirBackend, Pr
 pub struct FrodoPirBackend;
 
 /// Per-segment public parameters: LWE dimensions, plaintext modulus,
-/// and the public matrix `A` (row-major shape `n_rows × lwe_dim`).
+/// and the 16-byte seed used to expand the public matrix `A`.
 ///
 /// # Purpose
 ///
 /// One instance per segment; combined with [`FrodoHint`] it forms the
-/// `(ServerParams, Hint)` pair every IKPIR client receives at setup.
+/// `(ServerParams, Hint)` pair every IKPIR client receives at setup. The
+/// matrix `A` itself is **not** carried here — see [`FrodoHintMaterial`].
 #[derive(Clone, Debug)]
 pub struct FrodoServerParams {
     /// LWE dimension, plaintext bits, and 16-byte seed used to sample `a`.
@@ -73,8 +74,33 @@ pub struct FrodoServerParams {
     pub n_rows:    u32,
     /// Number of `u32` cells per database row.
     pub row_width: u32,
+}
+
+/// Server-local working state: the LWE public matrix `A` in row-major
+/// shape `n_rows × lwe_dim`, expanded deterministically from
+/// [`FrodoServerParams::params`]`.seed` via [`sample_a`].
+///
+/// # Purpose
+///
+/// Used by [`FrodoPirBackend::server_setup`] to compute the hint and by
+/// [`FrodoPirBackend::server_patch_hint`] to keep the hint coherent
+/// across mutations. **Not part of the wire payload** — the client
+/// re-expands its own copy from the seed during
+/// [`FrodoPirBackend::client_setup`], and the server may drop and
+/// re-expand its copy via
+/// [`IkpirServer::drop_hint_material`](../../../ikpir_server/struct.IkpirServer.html#method.drop_hint_material).
+///
+/// # Rationale
+///
+/// Pulling `A` out of [`FrodoServerParams`] keeps the wire bundle small
+/// (only the 16-byte seed travels) and lets the server free `A` on
+/// pure-read workloads. Not `Clone`: every "extra" `A` buffer must be
+/// an explicit [`FrodoPirBackend::expand_hint_material`] call so
+/// accidental duplication is impossible.
+#[derive(Debug, Default)]
+pub struct FrodoHintMaterial {
     /// Public matrix `A` in row-major shape `n_rows × lwe_dim`.
-    pub a:         Vec<u32>,
+    pub a: Vec<u32>,
 }
 
 /// FrodoPIR hint matrix `H = Aᵀ · D mod 2³²` in row-major shape
@@ -129,16 +155,19 @@ struct PreparedSlot {
 /// query → one answer → one decode per round per segment).
 pub struct FrodoClientState {
     /// Public parameters for this segment.
-    pub params:    FrodoServerParams,
+    pub params:        FrodoServerParams,
+    /// Locally expanded copy of the LWE public matrix `A`, re-derived
+    /// from `params.params.seed` during `client_setup`.
+    pub hint_material: FrodoHintMaterial,
     /// Locally maintained copy of the segment hint matrix.
-    pub hint:      FrodoHint,
+    pub hint:          FrodoHint,
     /// Prepared but unconsumed slots, FIFO. Front is the next slot a
     /// `client_query` will use; back is where `client_precompute_queries`
     /// appends.
-    prepared:      VecDeque<PreparedSlot>,
+    prepared:          VecDeque<PreparedSlot>,
     /// The slot consumed by the most recent `client_query`, if any. Read
     /// by the matching `client_decode`.
-    in_flight:     Option<PreparedSlot>,
+    in_flight:         Option<PreparedSlot>,
 }
 
 impl FrodoClientState {
@@ -176,6 +205,7 @@ pub struct FrodoResponse {
 impl IndexPirBackend for FrodoPirBackend {
     type Config       = FrodoConfig;
     type ServerParams = FrodoServerParams;
+    type HintMaterial = FrodoHintMaterial;
     type Hint         = FrodoHint;
     type ClientState  = FrodoClientState;
     type Query        = FrodoQuery;
@@ -187,7 +217,7 @@ impl IndexPirBackend for FrodoPirBackend {
         n_rows: u32,
         row_width: u32,
         plaintext_bits: u32,
-    ) -> (FrodoServerParams, FrodoHint) {
+    ) -> (FrodoServerParams, FrodoHintMaterial, FrodoHint) {
         debug_assert_eq!(db.len(), (n_rows as usize) * (row_width as usize));
         let lwe_dim = config.lwe_dim;
 
@@ -199,17 +229,24 @@ impl IndexPirBackend for FrodoPirBackend {
         let hint_data = compute_hint(&a, db, n_rows, lwe_dim, row_width);
 
         (
-            FrodoServerParams { params, n_rows, row_width, a },
+            FrodoServerParams { params, n_rows, row_width },
+            FrodoHintMaterial { a },
             FrodoHint { data: hint_data },
         )
     }
 
+    fn expand_hint_material(params: &FrodoServerParams) -> FrodoHintMaterial {
+        let a = sample_a(&params.params.seed, params.n_rows, params.params.lwe_dim);
+        FrodoHintMaterial { a }
+    }
+
     fn client_setup(params: &FrodoServerParams, hint: &FrodoHint) -> FrodoClientState {
         FrodoClientState {
-            params:    params.clone(),
-            hint:      hint.clone(),
-            prepared:  VecDeque::new(),
-            in_flight: None,
+            params:        params.clone(),
+            hint_material: Self::expand_hint_material(params),
+            hint:          hint.clone(),
+            prepared:      VecDeque::new(),
+            in_flight:     None,
         }
     }
 
@@ -220,7 +257,8 @@ impl IndexPirBackend for FrodoPirBackend {
 
         // Cheap path if a prepared slot is available; otherwise sample inline
         // (matches the pre-precomputation behaviour for backward compatibility).
-        let slot = state.prepared.pop_front().unwrap_or_else(|| sample_slot(&state.params));
+        let slot = state.prepared.pop_front()
+            .unwrap_or_else(|| sample_slot(&state.params, &state.hint_material));
 
         let mut b = slot.b.clone();
         let delta = round_p_to_q(1, plaintext_bits);
@@ -302,7 +340,7 @@ impl IndexPirBackend for FrodoPirBackend {
 ///
 /// `O(n_rows · lwe_dim)` wrapping multiply-add — this is the per-query
 /// LWE cost amortised by `precompute_queries`.
-fn sample_slot(params: &FrodoServerParams) -> PreparedSlot {
+fn sample_slot(params: &FrodoServerParams, material: &FrodoHintMaterial) -> PreparedSlot {
     let lwe_dim = params.params.lwe_dim as usize;
     let n_rows  = params.n_rows  as usize;
 
@@ -314,7 +352,7 @@ fn sample_slot(params: &FrodoServerParams) -> PreparedSlot {
 
     // b = A·s + e
     let mut b = e;
-    let a = &params.a;
+    let a = &material.a;
     for (i, bi) in b.iter_mut().enumerate() {
         let row_off = i * lwe_dim;
         let mut acc = *bi;
@@ -361,7 +399,7 @@ impl PrecomputingPirBackend for FrodoPirBackend {
     fn client_precompute_queries(state: &mut FrodoClientState, count: u32) {
         state.prepared.reserve(count as usize);
         for _ in 0..count {
-            state.prepared.push_back(sample_slot(&state.params));
+            state.prepared.push_back(sample_slot(&state.params, &state.hint_material));
         }
     }
 
@@ -434,8 +472,9 @@ fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32
 /// Reports the minimum fixed-width little-endian encoding of each wire
 /// type. `FrodoQuery` and `FrodoResponse` are dense `u32` vectors;
 /// `FrodoHint` is the `lwe_dim × row_width` matrix; `FrodoServerParams`
-/// carries the public matrix `A` plus `(lwe_dim, plaintext_bits, n_rows,
-/// row_width)` and a 16-byte seed.
+/// carries `(lwe_dim, plaintext_bits, n_rows, row_width)` and a 16-byte
+/// seed — the public matrix `A` is **not** on the wire (it lives in
+/// [`FrodoHintMaterial`] and the client re-expands it from the seed).
 impl BackendWireSize for FrodoPirBackend {
     fn query_byte_size(q: &FrodoQuery) -> usize {
         q.b.len() * 4
@@ -446,26 +485,25 @@ impl BackendWireSize for FrodoPirBackend {
     fn hint_byte_size(h: &FrodoHint) -> usize {
         h.data.len() * 4
     }
-    fn server_params_byte_size(p: &FrodoServerParams) -> usize {
-        // 16-byte seed + 3 × u32 (lwe_dim, plaintext_bits, n_rows) + u32 (row_width)
-        // + u32 (lwe_dim again from FrodoParams)
-        // Treat FrodoParams as { lwe_dim: u32, plaintext_bits: u32, seed: [u8; 16] }
-        // and FrodoServerParams as { params, n_rows: u32, row_width: u32, a: Vec<u32> }.
+    fn server_params_byte_size(_p: &FrodoServerParams) -> usize {
+        // FrodoParams = { lwe_dim: u32, plaintext_bits: u32, seed: [u8; 16] }
+        // FrodoServerParams = { params, n_rows: u32, row_width: u32 }.
+        // The public matrix A lives in FrodoHintMaterial and never travels on the wire.
         let frodo_params = 4 + 4 + 16;          // lwe_dim + plaintext_bits + seed
         let dims         = 4 + 4;               // n_rows + row_width
-        let a            = p.a.len() * 4;
-        frodo_params + dims + a
+        frodo_params + dims
     }
 }
 
 impl IncrementalPirBackend for FrodoPirBackend {
     fn server_patch_hint(
         params: &FrodoServerParams,
+        material: &FrodoHintMaterial,
         hint: &mut FrodoHint,
         row_deltas: &[(u32, Vec<(u16, i64)>)],
     ) {
         apply_patch(
-            &params.a,
+            &material.a,
             params.params.lwe_dim,
             params.n_rows,
             params.row_width,
@@ -478,12 +516,12 @@ impl IncrementalPirBackend for FrodoPirBackend {
         state: &mut FrodoClientState,
         row_deltas: &[(u32, Vec<(u16, i64)>)],
     ) {
-        // Pull the params snapshot out of the state — `client_setup`
-        // already stashed a copy, so no separate `params` argument is
-        // needed (and threading one would be redundant).
-        let FrodoClientState { params, hint, prepared, in_flight } = state;
+        // Pull params + hint_material snapshots out of the state —
+        // `client_setup` already stashed both, so no separate arguments
+        // are threaded through.
+        let FrodoClientState { params, hint_material, hint, prepared, in_flight } = state;
         apply_patch(
-            &params.a,
+            &hint_material.a,
             params.params.lwe_dim,
             params.n_rows,
             params.row_width,
@@ -493,7 +531,7 @@ impl IncrementalPirBackend for FrodoPirBackend {
         // Slots that already carry `c = sᵀ·H` need their `c` patched in
         // lock-step. Slots with `c == None` are skipped — they will lazily
         // pick up the post-patch hint on first use.
-        patch_slot_c(&params.a, params.params.lwe_dim, params.row_width,
+        patch_slot_c(&hint_material.a, params.params.lwe_dim, params.row_width,
                      prepared.iter_mut().chain(in_flight.as_mut()),
                      row_deltas);
     }
@@ -629,7 +667,7 @@ mod tests {
     fn roundtrip_all_rows(n_rows: u32, row_width: u32) {
         let pb = 8u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
         for row in 0..n_rows {
             let q = FrodoPirBackend::client_query(&mut state, row);
@@ -663,7 +701,7 @@ mod tests {
         let n_rows = 64u32;
         let row_width = 16u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
         // Query 100 random rows (with wrapping) to stress the matvecs.
         for i in 0u32..100 {
@@ -684,7 +722,7 @@ mod tests {
         let n_rows = 8u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
         for row in 0..n_rows {
             let q = FrodoPirBackend::client_query(&mut state, row);
@@ -702,7 +740,7 @@ mod tests {
         let n_rows = 8u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
 
         let q3 = FrodoPirBackend::client_query(&mut state, 3);
@@ -724,8 +762,8 @@ mod tests {
         let n_rows = 4u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp1, _) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
-        let (sp2, _) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp1, _, _) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp2, _, _) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         assert_ne!(sp1.params.seed, sp2.params.seed, "seeds must differ across calls");
     }
 
@@ -735,7 +773,7 @@ mod tests {
         let n_rows = 4u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -768,11 +806,11 @@ mod tests {
         let n_rows = 4u32;
         let row_width = 4u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
 
         let actual_dlt = apply_cell_delta(&mut db, 1, 2, 1, row_width, pb);
         let row_deltas = vec![(1u32, vec![(2u16, actual_dlt)])];
-        FrodoPirBackend::server_patch_hint(&sp, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -786,7 +824,7 @@ mod tests {
         let n_rows = 4u32;
         let row_width = 4u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
 
         let raw_deltas: &[(u16, i64)] = &[(0, 3), (1, -1), (3, 2)];
         let cells: Vec<(u16, i64)> = raw_deltas
@@ -794,7 +832,7 @@ mod tests {
             .map(|&(off, dlt)| (off, apply_cell_delta(&mut db, 2, off, dlt, row_width, pb)))
             .collect();
         let row_deltas = vec![(2u32, cells)];
-        FrodoPirBackend::server_patch_hint(&sp, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -808,7 +846,7 @@ mod tests {
         let n_rows = 8u32;
         let row_width = 4u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
 
         let raw: &[(u32, &[(u16, i64)])] = &[
             (0, &[(0, 1)]),
@@ -825,7 +863,7 @@ mod tests {
                 (row, actual)
             })
             .collect();
-        FrodoPirBackend::server_patch_hint(&sp, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -839,11 +877,11 @@ mod tests {
         let n_rows = 4u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let hint_before = hint.data.clone();
 
         let row_deltas = vec![(2u32, vec![(1u16, 0i64)])];
-        FrodoPirBackend::server_patch_hint(&sp, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
 
         assert_eq!(hint.data, hint_before);
     }
@@ -854,12 +892,12 @@ mod tests {
         let n_rows = 4u32;
         let row_width = 4u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
 
         // Row 2, off 0: make_db value is 72 (≥ 5), so delta = −5 gives actual change = −5.
         let actual_dlt = apply_cell_delta(&mut db, 2, 0, -5, row_width, pb);
         let row_deltas = vec![(2u32, vec![(0u16, actual_dlt)])];
-        FrodoPirBackend::server_patch_hint(&sp, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -876,7 +914,7 @@ mod tests {
         let n_rows = 32u32;
         let row_width = 8u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, mut hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mask = (1u32 << pb) - 1;
 
         let mut rng = ChaCha20Rng::seed_from_u64(0xCAFE_F00D);
@@ -897,7 +935,7 @@ mod tests {
                 }
                 row_deltas.push((row, cells));
             }
-            FrodoPirBackend::server_patch_hint(&sp, &mut hint, &row_deltas);
+            FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
 
             let lwe_dim = sp.params.lwe_dim;
             let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -912,7 +950,7 @@ mod tests {
         let n_rows = 8u32;
         let row_width = 4u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
 
         let target_row = 3u32;
@@ -921,7 +959,7 @@ mod tests {
         let row_deltas = vec![(target_row, vec![(1u16, dlt1), (2u16, dlt2)])];
 
         let mut server_hint = hint;
-        FrodoPirBackend::server_patch_hint(&sp, &mut server_hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut server_hint, &row_deltas);
         FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
 
         assert_eq!(state.hint.data, server_hint.data,
@@ -941,7 +979,7 @@ mod tests {
         let n_rows = 16u32;
         let row_width = 8u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
 
         let raw: &[(u32, &[(u16, i64)])] = &[
@@ -961,7 +999,7 @@ mod tests {
             .collect();
 
         let mut server_hint = hint;
-        FrodoPirBackend::server_patch_hint(&sp, &mut server_hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut server_hint, &row_deltas);
         FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
 
         assert_eq!(state.hint.data, server_hint.data,
@@ -987,7 +1025,7 @@ mod tests {
         let n_rows = 16u32;
         let row_width = 8u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
 
         FrodoPirBackend::client_precompute_queries(&mut state, n_rows);
@@ -1016,7 +1054,7 @@ mod tests {
         let n_rows = 4u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
 
         FrodoPirBackend::client_precompute_queries(&mut state, 4);
@@ -1035,7 +1073,7 @@ mod tests {
         let n_rows = 8u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
 
         // Warm path: precompute queries + decodes.
         let mut warm = FrodoPirBackend::client_setup(&sp, &hint);
@@ -1073,7 +1111,7 @@ mod tests {
         let n_rows = 8u32;
         let row_width = 4u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
 
         FrodoPirBackend::client_precompute_queries(&mut state, 5);
@@ -1119,7 +1157,7 @@ mod tests {
         let n_rows = 16u32;
         let row_width = 8u32;
         let mut db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
         let mut server_hint = hint;
 
@@ -1141,7 +1179,7 @@ mod tests {
             })
             .collect();
 
-        FrodoPirBackend::server_patch_hint(&sp, &mut server_hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut server_hint, &row_deltas);
         FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
 
         for &(target_row, _) in raw {
@@ -1162,7 +1200,7 @@ mod tests {
         let n_rows = 8u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
         assert_eq!(state.prepared_len(), 0);
 
@@ -1182,7 +1220,7 @@ mod tests {
         let n_rows = 4u32;
         let row_width = 4u32;
         let db = make_db(n_rows, row_width, pb);
-        let (sp, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let (sp, _mat, hint) = FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
         let mut state = FrodoPirBackend::client_setup(&sp, &hint);
 
         let q = FrodoPirBackend::client_query(&mut state, 1);

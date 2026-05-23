@@ -64,12 +64,17 @@ use crate::hint_patch::fold_mutations_into_row_deltas;
 /// All methods are synchronous and take `&mut self` for any state-changing
 /// operation. Wrap in `Mutex` / `RwLock` if exposing across threads.
 pub struct IkpirServer<S: IndexScheme + SchemeMeta, B: IndexPirBackend> {
-    store:          CuckooKVStore<S>,
-    params:         CuckooParams,
-    backend_config: B::Config,
-    backend_params: Vec<B::ServerParams>,
-    hints:          Vec<B::Hint>,
-    epoch:          u64,
+    store:                 CuckooKVStore<S>,
+    params:                CuckooParams,
+    backend_config:        B::Config,
+    backend_params:        Vec<B::ServerParams>,
+    /// Per-segment seed-derived material (e.g. the LWE matrix `A`). May be
+    /// `None` after [`IkpirServer::drop_hint_material`]; transparently
+    /// re-expanded on the next mutation via
+    /// [`IndexPirBackend::expand_hint_material`].
+    backend_hint_material: Vec<Option<B::HintMaterial>>,
+    hints:                 Vec<B::Hint>,
+    epoch:                 u64,
 }
 
 impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
@@ -88,7 +93,7 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
     ///   the server.
     /// - `backend_config` — backend-specific tunables (e.g.
     ///   `FrodoConfig::default()` for FrodoPIR's 128-bit security
-    ///   `lwe_dim = 1774`). Persisted on the server and re-used by every
+    ///   `lwe_dim = 1566`). Persisted on the server and re-used by every
     ///   future [`Self::full_rebuild`] call.
     ///
     /// # Constraints
@@ -121,7 +126,7 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
     ///
     /// `O(arity × n_rows × lwe_dim × row_width)` arithmetic plus a
     /// per-segment seed sample. This is the hot path during cold start;
-    /// for FrodoPIR with `lwe_dim = 1774` and a 2-ary 16k-bucket store
+    /// for FrodoPIR with `lwe_dim = 1566` and a 2-ary 16k-bucket store
     /// it dominates the first-query latency.
     pub fn new(store: CuckooKVStore<S>, backend_config: B::Config) -> Self {
         let params       = store.params();
@@ -131,13 +136,14 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         let pb           = params.plaintext_bits;
         let seg_cells    = segment_size as usize * row_width as usize;
 
-        let mut backend_params = Vec::with_capacity(arity);
-        let mut hints          = Vec::with_capacity(arity);
+        let mut backend_params        = Vec::with_capacity(arity);
+        let mut backend_hint_material = Vec::with_capacity(arity);
+        let mut hints                 = Vec::with_capacity(arity);
         {
             let cells = store.as_cells();
             for j in 0..arity {
                 let start = j * seg_cells;
-                let (sp, h) = B::server_setup(
+                let (sp, mat, h) = B::server_setup(
                     &backend_config,
                     &cells[start..start + seg_cells],
                     segment_size,
@@ -145,10 +151,13 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
                     pb,
                 );
                 backend_params.push(sp);
+                backend_hint_material.push(Some(mat));
                 hints.push(h);
             }
         }
-        let mut s = Self { store, params, backend_config, backend_params, hints, epoch: 0 };
+        let mut s = Self {
+            store, params, backend_config, backend_params, backend_hint_material, hints, epoch: 0,
+        };
         s.store.enable_mutation_log();
         let _ = s.store.drain_mutations();
         s
@@ -289,11 +298,12 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         // Snapshot to avoid a borrow conflict with self.backend_params / self.hints writes.
         let cells: Vec<u32> = self.store.as_cells().to_vec();
 
-        let mut backend_params = Vec::with_capacity(arity);
-        let mut hints          = Vec::with_capacity(arity);
+        let mut backend_params        = Vec::with_capacity(arity);
+        let mut backend_hint_material = Vec::with_capacity(arity);
+        let mut hints                 = Vec::with_capacity(arity);
         for j in 0..arity {
             let start = j * seg_cells;
-            let (sp, h) = B::server_setup(
+            let (sp, mat, h) = B::server_setup(
                 &self.backend_config,
                 &cells[start..start + seg_cells],
                 segment_size,
@@ -301,13 +311,42 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
                 pb,
             );
             backend_params.push(sp);
+            backend_hint_material.push(Some(mat));
             hints.push(h);
         }
-        self.backend_params = backend_params;
-        self.hints          = hints;
+        self.backend_params        = backend_params;
+        self.backend_hint_material = backend_hint_material;
+        self.hints                 = hints;
         let _ = self.store.drain_mutations();
-        self.epoch         += 1;
+        self.epoch                += 1;
         self.setup()
+    }
+
+    /// Free the per-segment seed-derived [`HintMaterial`](IndexPirBackend::HintMaterial).
+    ///
+    /// # Purpose
+    ///
+    /// Lets read-only deployments (and benches that only sample queries
+    /// after setup) reclaim the LWE public matrix `A` from RAM. The next
+    /// mutation transparently re-expands the affected segments from the
+    /// seed inside [`B::ServerParams`](IndexPirBackend::ServerParams);
+    /// callers observe nothing different other than a one-time
+    /// first-mutation re-expansion cost.
+    ///
+    /// # Constraints
+    ///
+    /// Safe to call at any time. Calling it twice in a row is a no-op on
+    /// the second invocation. Production read-write services that mutate
+    /// frequently should generally **not** call this — they will pay the
+    /// re-expansion cost on every drop / mutate cycle.
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity)` `Option::take` operations.
+    pub fn drop_hint_material(&mut self) {
+        for slot in &mut self.backend_hint_material {
+            *slot = None;
+        }
     }
 
     /// Current server epoch. Strictly monotone across mutation and rebuild.
@@ -427,9 +466,28 @@ where
         let muts       = self.store.drain_mutations();
         let row_deltas = fold_mutations_into_row_deltas(&muts, &self.params);
 
+        // Phase 1: re-expand any dropped hint-material we are about to
+        // touch. Holds `&mut self.backend_hint_material` only, no overlap
+        // with `self.hints` writes.
+        for (j, deltas) in row_deltas.iter().enumerate() {
+            if !deltas.is_empty() && self.backend_hint_material[j].is_none() {
+                self.backend_hint_material[j] =
+                    Some(B::expand_hint_material(&self.backend_params[j]));
+            }
+        }
+        // Phase 2: split-borrow params / material / hints by index — three
+        // disjoint fields, the borrow checker is happy.
         for (j, deltas) in row_deltas.iter().enumerate() {
             if !deltas.is_empty() {
-                B::server_patch_hint(&self.backend_params[j], &mut self.hints[j], deltas);
+                let material = self.backend_hint_material[j]
+                    .as_ref()
+                    .expect("expanded in Phase 1");
+                B::server_patch_hint(
+                    &self.backend_params[j],
+                    material,
+                    &mut self.hints[j],
+                    deltas,
+                );
             }
         }
         self.epoch += 1;

@@ -41,7 +41,8 @@
 /// of width `sigma`, defaulting to the SimplePIR §4.2 value `σ = 6.4`.
 #[derive(Clone, Debug)]
 pub struct SimpleParams {
-    /// LWE dimension `n` (default 1024 for 128-bit security per SimplePIR §4.2).
+    /// LWE dimension `n` (default 1275 for 128-bit security, estimated via
+    /// the lattice estimator under the ADPS16 cost model).
     pub lwe_dim: u32,
     /// log₂ of the plaintext modulus `p`. Set per-call from the trait's
     /// `plaintext_bits` argument. Required: `1 ≤ plaintext_bits ≤ 31`.
@@ -55,9 +56,9 @@ pub struct SimpleParams {
 }
 
 impl SimpleParams {
-    /// Default LWE dimension for 128-bit security (SimplePIR §4.2,
-    /// `n = 2^10 = 1024`).
-    pub const DEFAULT_LWE_DIM: u32 = 1024;
+    /// Default LWE dimension for 128-bit security, estimated via the
+    /// lattice estimator under the ADPS16 cost model.
+    pub const DEFAULT_LWE_DIM: u32 = 1275;
 
     /// Default error standard deviation (SimplePIR §4.2).
     pub const DEFAULT_SIGMA: f64 = 6.4;
@@ -99,8 +100,9 @@ impl SimpleParams {
 ///
 /// # Rationale
 ///
-/// Use [`SimpleConfig::default`] for the SimplePIR §4.2 128-bit security
-/// setting (`lwe_dim = 1024`, `sigma = 6.4`). Use
+/// Use [`SimpleConfig::default`] for the 128-bit security setting
+/// (`lwe_dim = 1275` estimated via the lattice estimator under the
+/// ADPS16 cost model; `sigma = 6.4` from SimplePIR §4.2). Use
 /// [`SimpleConfig::with_lwe_dim`] / [`SimpleConfig::with_sigma`] /
 /// [`SimpleConfig::new`] to override (e.g. for benchmarking a reduced
 /// parameter set).
@@ -142,7 +144,7 @@ impl SimpleConfig {
     }
 
     /// New config overriding only `sigma`; `lwe_dim` stays at the default
-    /// `1024`.
+    /// `1275`.
     ///
     /// # Constraints
     ///
@@ -153,7 +155,8 @@ impl SimpleConfig {
 }
 
 impl Default for SimpleConfig {
-    /// 128-bit security default (`lwe_dim = 1024`, `sigma = 6.4`,
+    /// 128-bit security default (`lwe_dim = 1275` estimated via the
+    /// lattice estimator under the ADPS16 cost model; `sigma = 6.4` from
     /// SimplePIR §4.2).
     fn default() -> Self {
         Self { lwe_dim: SimpleParams::DEFAULT_LWE_DIM, sigma: SimpleParams::DEFAULT_SIGMA }

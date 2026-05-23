@@ -75,34 +75,28 @@ lookups into PIR query/response bundles and applies incremental hint deltas.
 See [`ikpir-client/CLAUDE.md`](ikpir-client/CLAUDE.md) for the epoch
 state machine, failure-mode table, and entry-point map.
 
-## Benches and visualization
+## Benches
 
-Each crate ships `clap`-parsed benches that emit CSV under `results/`,
-plus a `scripts/plot.py` (matplotlib + pandas) that turns those CSVs into
-PNG charts under `results/plots/`. Each invocation = one config = one CSV
-row (the writer is append-aware); sweeping across configs is the
-orchestrator's job — `rm` the CSV first, then loop. Specific flags
-(`--num-buckets`, `--bucket-size`, `--value-bits`, ...) pin a configuration.
+Six focused `clap`-parsed benches (3 server + 3 client) emit CSV under
+`results/`. Each invocation = one config = one CSV row; sweeping across
+configs is the orchestrator's job — `rm` the CSV first, then loop.
 
 The canonical sweep is `scripts/run_all.sh`, which iterates every bench
-over a paper-derived config matrix (see `scripts/configs.sh` — anchors
-ChalametPIR Tables 1/2 and Hao-2025 Table 1/Figure 10) and then renders
-all plots. Per-crate orchestrators (`<crate>/scripts/run_benches.sh`) run
-just that crate.
+over the full paper config matrix (20 configs × 3 value\_bits = 60 runs
+per bench; mutation benches × 7 N\_mutations = 420 runs; see
+`scripts/configs.sh`). Per-crate orchestrators (`<crate>/scripts/run_benches.sh`)
+run just that crate.
 
 ```bash
-# Full sweep + plots (server then client).
+# Full sweep (server then client), FrodoPIR only (default).
 ./scripts/run_all.sh
-IKPIR_BENCH_PROFILE=quick ./scripts/run_all.sh   # smaller matrix, ~minutes
-IKPIR_BENCH_PROFILE=full  ./scripts/run_all.sh   # adds m=2^22 (very slow)
+IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh  # both backends (~2× runtime)
 
 # One bench at one config (manual).
-cargo bench -p ikpir-server --bench answer_throughput -- \
-    --num-buckets 16384 --bucket-size 4 --value-bits 256
-
-# Plots only (CSVs already populated).
-cd ikpir-server && python scripts/plot.py
-cd ikpir-client && python scripts/plot.py
+cargo bench -p ikpir-server --bench server_answer -- \
+    --num-buckets 65536 --bucket-size 4 --value-bits 256
+cargo bench -p ikpir-client --bench client_query -- \
+    --num-buckets 65536 --bucket-size 4 --value-bits 256
 ```
 
 ## Design principles

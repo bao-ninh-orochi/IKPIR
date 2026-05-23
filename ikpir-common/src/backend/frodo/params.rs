@@ -40,7 +40,8 @@
 /// FrodoPIR §4.1 (Assumption 1); no σ is needed in the type.
 #[derive(Clone, Debug)]
 pub struct FrodoParams {
-    /// LWE dimension n in the paper (default 1774 for 128-bit security).
+    /// LWE dimension n in the paper (default 1566 for 128-bit security,
+    /// estimated via the lattice estimator under the ADPS16 cost model).
     pub lwe_dim: u32,
     /// log₂ of the plaintext modulus p. Set per-call from the trait's
     /// `plaintext_bits` argument. Required: `1 ≤ plaintext_bits ≤ 31`.
@@ -50,8 +51,9 @@ pub struct FrodoParams {
 }
 
 impl FrodoParams {
-    /// Default LWE dimension for 128-bit security (FrodoPIR Table 5).
-    pub const DEFAULT_LWE_DIM: u32 = 1774;
+    /// Default LWE dimension for 128-bit security, estimated via the
+    /// lattice estimator under the ADPS16 cost model.
+    pub const DEFAULT_LWE_DIM: u32 = 1566;
 
     /// Construct LWE parameters with explicit dimension, plaintext bit
     /// width, and 128-bit seed used to sample the public matrix `A`.
@@ -87,10 +89,10 @@ impl FrodoParams {
 ///
 /// # Rationale
 ///
-/// Use [`FrodoConfig::default`] for the FrodoPIR Table-5 128-bit
-/// security setting (`lwe_dim = 1774`); use
-/// [`FrodoConfig::with_lwe_dim`] to override (e.g. for benchmarking a
-/// reduced parameter set).
+/// Use [`FrodoConfig::default`] for the 128-bit security setting
+/// (`lwe_dim = 1566`, estimated via the lattice estimator under the
+/// ADPS16 cost model); use [`FrodoConfig::with_lwe_dim`] to override
+/// (e.g. for benchmarking a reduced parameter set).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrodoConfig {
     /// LWE dimension `n`. Larger values give stronger security at higher
@@ -115,7 +117,8 @@ impl FrodoConfig {
 }
 
 impl Default for FrodoConfig {
-    /// 128-bit security default (`lwe_dim = 1774`, FrodoPIR Table 5).
+    /// 128-bit security default (`lwe_dim = 1566`, estimated via the
+    /// lattice estimator under the ADPS16 cost model).
     fn default() -> Self {
         Self { lwe_dim: FrodoParams::DEFAULT_LWE_DIM }
     }

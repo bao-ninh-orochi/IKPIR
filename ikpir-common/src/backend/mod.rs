@@ -49,17 +49,28 @@
 //!    tunable knobs (e.g. LWE dimension for FrodoPIR). It must be `Clone +
 //!    Default` so callers can either pass an explicit config or fall back to
 //!    sensible defaults.
-//! 2. `server_setup` returns a `(ServerParams, Hint)` from the DB slice and
-//!    the backend `Config` — same `(config, db)` → same hint, modulo any
-//!    internal random seed.
-//! 3. `client_setup` materialises a `ClientState` that captures whatever the
-//!    decode step needs (e.g. the LWE secret + a copy of `Hint`).
-//! 4. The triple `(client_query, server_answer, client_decode)` must satisfy
+//! 2. Define [`HintMaterial`](IndexPirBackend::HintMaterial) — server-local
+//!    working state derived deterministically from `ServerParams` (e.g. the
+//!    LWE public matrix `A` expanded from a 16-byte seed). Not part of the
+//!    wire payload. Backends with no analogous material set
+//!    `type HintMaterial = ()`.
+//! 3. `server_setup` returns `(ServerParams, HintMaterial, Hint)` from the DB
+//!    slice and the backend `Config` — same `(config, db)` → same hint,
+//!    modulo any internal random seed.
+//! 4. `expand_hint_material(params)` re-derives the `HintMaterial` from
+//!    `ServerParams` whenever the server has dropped its copy. Must be
+//!    bit-identically deterministic in any seed/state inside `params`.
+//! 5. `client_setup` materialises a `ClientState` that captures whatever the
+//!    decode step needs (e.g. the LWE secret + a copy of `Hint` + a freshly
+//!    expanded `HintMaterial`).
+//! 6. The triple `(client_query, server_answer, client_decode)` must satisfy
 //!    `client_decode(server_answer(client_query(state, row))) == db[row*row_width..(row+1)*row_width]`
 //!    for every valid `row`.
-//! 5. If implementing [`IncrementalPirBackend`]: `server_patch_hint` and
+//! 7. If implementing [`IncrementalPirBackend`]: `server_patch_hint` and
 //!    `client_patch_state` must keep `Hint` and `ClientState` consistent
-//!    with the updated DB for **all** future queries.
+//!    with the updated DB for **all** future queries. `server_patch_hint`
+//!    takes a `&HintMaterial` so the server can replay seed-derived state
+//!    without re-cloning it.
 
 pub mod frodo;
 pub mod simple;
@@ -80,9 +91,19 @@ pub trait IndexPirBackend {
     /// `IkpirServer` and re-used by `full_rebuild` so
     /// every regenerated `Hint` has the same dimensions as the originals.
     type Config: Clone + Default;
-    /// Public preprocessing parameters produced at setup time
-    /// (e.g. an LWE matrix `A`, plaintext modulus, dimensions).
+    /// Public preprocessing parameters produced at setup time. Carries the
+    /// wire-shippable description of the segment (shape constants, seeds);
+    /// the bulky derived state lives in [`Self::HintMaterial`].
     type ServerParams: Clone;
+    /// Server-local working state derived deterministically from
+    /// [`Self::ServerParams`] — e.g. the LWE public matrix `A` expanded
+    /// from a 16-byte seed. Used by [`Self::server_setup`] to compute the
+    /// hint and by [`IncrementalPirBackend::server_patch_hint`] to keep
+    /// the hint coherent across mutations. **Not part of the wire payload.**
+    /// The server may drop its copy and re-expand it on demand via
+    /// [`Self::expand_hint_material`]; backends with no analogous material
+    /// set `type HintMaterial = ()`.
+    type HintMaterial: Default + Send + 'static;
     /// Server-held preprocessing matrix; for FrodoPIR this is `H = Aᵀ · D`.
     type Hint: Clone;
     /// Client-held state derived from `(ServerParams, Hint)` and used to
@@ -96,16 +117,31 @@ pub trait IndexPirBackend {
     /// Server-side preprocessing on a single segment's cell array.
     ///
     /// `db.len()` must equal `n_rows × row_width`. Implementations may sample
-    /// fresh randomness on each call.
+    /// fresh randomness on each call. Returns the wire-shippable
+    /// [`Self::ServerParams`], the server-local [`Self::HintMaterial`]
+    /// (which the caller may immediately drop if not needed), and the
+    /// derived [`Self::Hint`].
     fn server_setup(
         config: &Self::Config,
         db: &[u32],
         n_rows: u32,
         row_width: u32,
         plaintext_bits: u32,
-    ) -> (Self::ServerParams, Self::Hint);
+    ) -> (Self::ServerParams, Self::HintMaterial, Self::Hint);
 
-    /// Client-side preprocessing for one segment.
+    /// Re-derive [`Self::HintMaterial`] from [`Self::ServerParams`].
+    ///
+    /// **Determinism contract.** Implementations must be bit-identically
+    /// deterministic in any seed/state inside `params`: the server may
+    /// drop and re-expand the result mid-protocol and require the same
+    /// matrix back. The client also calls this during [`Self::client_setup`]
+    /// to materialise its own copy from the wire-shipped seed. Backends
+    /// with no analogous material return `Default::default()`.
+    fn expand_hint_material(params: &Self::ServerParams) -> Self::HintMaterial;
+
+    /// Client-side preprocessing for one segment. The implementation
+    /// should call [`Self::expand_hint_material`] to materialise its own
+    /// copy of the seed-derived state; the wire bundle does not carry it.
     fn client_setup(params: &Self::ServerParams, hint: &Self::Hint) -> Self::ClientState;
 
     /// Build the query that retrieves row `row` from the server's segment.
@@ -137,8 +173,16 @@ pub trait IndexPirBackend {
 /// patch.
 pub trait IncrementalPirBackend: IndexPirBackend {
     /// Apply `row_deltas` to the server-held [`Hint`](IndexPirBackend::Hint).
+    ///
+    /// Takes the server-local
+    /// [`HintMaterial`](IndexPirBackend::HintMaterial) by reference so the
+    /// patch can read seed-derived state (e.g. the LWE public matrix `A`)
+    /// without re-cloning it. Callers must materialise `material` via
+    /// [`IndexPirBackend::expand_hint_material`] before this call if the
+    /// server has dropped its copy.
     fn server_patch_hint(
         params: &Self::ServerParams,
+        material: &Self::HintMaterial,
         hint: &mut Self::Hint,
         row_deltas: &[(u32, Vec<(u16, i64)>)],
     );
@@ -159,11 +203,12 @@ pub trait IncrementalPirBackend: IndexPirBackend {
     /// empty queue.)
     ///
     /// Implementations should read the backend's
-    /// [`ServerParams`](IndexPirBackend::ServerParams) from the
+    /// [`ServerParams`](IndexPirBackend::ServerParams) and
+    /// [`HintMaterial`](IndexPirBackend::HintMaterial) from the
     /// `ClientState` itself; the caller does **not** thread a separate
-    /// `params` argument through, since
-    /// [`client_setup`](IndexPirBackend::client_setup) already stashes a
-    /// copy.
+    /// `params` or `material` argument through, since
+    /// [`client_setup`](IndexPirBackend::client_setup) already stashes
+    /// both at setup time.
     fn client_patch_state(
         state: &mut Self::ClientState,
         row_deltas: &[(u32, Vec<(u16, i64)>)],

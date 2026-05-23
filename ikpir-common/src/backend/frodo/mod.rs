@@ -17,7 +17,7 @@ mod backend;
 mod params;
 mod sampler;
 
-pub use backend::{FrodoPirBackend, FrodoServerParams, FrodoHint, FrodoClientState, FrodoQuery, FrodoResponse};
+pub use backend::{FrodoPirBackend, FrodoServerParams, FrodoHintMaterial, FrodoHint, FrodoClientState, FrodoQuery, FrodoResponse};
 pub use params::{FrodoConfig, FrodoParams};
 
 pub(crate) use arith::{round_p_to_q, round_q_to_p};

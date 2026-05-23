@@ -32,25 +32,21 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [[bench]]
-name    = "query_throughput"
+name    = "client_query"
 harness = false
 
 [[bench]]
-name    = "decode_throughput"
+name    = "client_decode"
 harness = false
 
 [[bench]]
-name    = "apply_delta_throughput"
+name    = "client_mutation"
 harness = false
 
 [[bench]]
-name    = "preprocess_throughput"
+name    = "classical_throughput"
 harness = false
 
 [[bench]]
-name    = "client_setup_latency"
-harness = false
-
-[[bench]]
-name    = "client_memory_footprint"
+name    = "mutation_throughput"
 harness = false
