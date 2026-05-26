@@ -62,6 +62,11 @@
 //!   `results/ikpir_server_mutation.csv`
 //!   `results/ikpir_client_mutation.csv`
 //!
+//! Each row carries `db_rows` / `db_cols` reporting the per-segment PIR
+//! matrix shape **after** any backend-specific reshape. For FrodoPIR
+//! this is `(segment_rows, row_width)`; for SimplePIR this is the
+//! post-reshape `(⌈segment_rows/k⌉, k·row_width)`.
+//!
 //! Use `scripts/run_mutation.sh` to sweep the full mutation config
 //! matrix. Do **not** also run the individual `server_mutation` /
 //! `client_mutation` scripts for the same configs — the CSV files are
@@ -82,14 +87,14 @@ use std::io::Write;
 use std::time::Instant;
 
 const HEADER_SERVER: &str =
-    "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+    "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
      n_mutations,load_factor,n_attempted,n_succeeded,total_ms,ops_per_s,delta_bytes_total,\
-     cells_per_slot,row_width,segment_rows";
+     cells_per_slot,row_width,segment_rows,db_rows,db_cols";
 
 const HEADER_CLIENT: &str =
-    "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+    "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
      n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
-     cells_per_slot,row_width,segment_rows";
+     cells_per_slot,row_width,segment_rows,db_rows,db_cols";
 
 #[derive(Clone, Copy, Debug)]
 enum MutationKind { Insert, Update, Delete }
@@ -177,7 +182,13 @@ where
     let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
 
-    let store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
+    let mut store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
+    // `from_cells` resets `max_kicks` to `MAX_KICKS_DEFAULT` (500); restore the
+    // 2_500 budget the populate helper used so the timed insert loop runs with
+    // the same cuckoo-eviction headroom as the populate phase. Without this,
+    // inserts at near-full load hit `TableFull` ~5× sooner than they would in
+    // a consistent deployment, biasing the throughput downward.
+    store.set_max_kicks(2_500);
     let mut server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
 
     // Capture the epoch-0 bundle BEFORE any mutation. This kind's deltas
@@ -340,14 +351,15 @@ where
                 hint_delta_typical_bytes: None,
             };
             let knobs = [
-                helpers::Knob { name: "backend",     value: cli.backend.to_string(),           is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "arity",       value: arity.to_string(),                 is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "num_buckets", value: num_buckets.to_string(),           is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "bucket_size", value: cli.bucket_size.to_string(),       is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "value_bits",  value: cli.value_bits.to_string(),        is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "lwe_dim",     value: lwe_dim_eff.to_string(),           is_default: cli.lwe_dim.is_none() },
-                helpers::Knob { name: "n_mutations", value: cli.n_mutations.to_string(),       is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "load_factor", value: format!("{:.2}", cli.load_factor), is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
+                helpers::Knob { name: "backend",        value: cli.backend.to_string(),           is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
+                helpers::Knob { name: "arity",          value: arity.to_string(),                 is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
+                helpers::Knob { name: "num_buckets",    value: num_buckets.to_string(),           is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
+                helpers::Knob { name: "bucket_size",    value: cli.bucket_size.to_string(),       is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+                helpers::Knob { name: "value_bits",     value: cli.value_bits.to_string(),        is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+                helpers::Knob { name: "plaintext_bits", value: cli.plaintext_bits.to_string(),    is_default: matches.value_source("plaintext_bits") != Some(ValueSource::CommandLine) },
+                helpers::Knob { name: "lwe_dim",        value: lwe_dim_eff.to_string(),           is_default: cli.lwe_dim.is_none() },
+                helpers::Knob { name: "n_mutations",    value: cli.n_mutations.to_string(),       is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
+                helpers::Knob { name: "load_factor",    value: format!("{:.2}", cli.load_factor), is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
             ];
             helpers::print_preamble("mutation_throughput", &knobs, &store_state, &geom);
         }
@@ -388,12 +400,14 @@ where
     let cps          = bundle.params.cells_per_slot();
     let row_width    = cli.bucket_size * cps;
     let segment_rows = bundle.params.segment_size();
+    let (db_rows, db_cols) =
+        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
 
     // Server-side row.
     writeln!(
         csv_server,
-        "{},{},{arity},{num_buckets},{},{},{lwe_dim_eff},{},{:.2},{},{},{:.3},{:.2},{},{cps},{row_width},{segment_rows}",
-        cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits,
+        "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{},{:.3},{:.2},{},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+        cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
         cli.n_mutations, cli.load_factor,
         cli.n_mutations, n_succeeded, server_total_ms, server_ops_per_s, delta_bytes_total,
     ).unwrap();
@@ -427,8 +441,8 @@ where
 
     writeln!(
         csv_client,
-        "{},{},{arity},{num_buckets},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{cps},{row_width},{segment_rows}",
-        cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits,
+        "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+        cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
         cli.n_mutations, cli.load_factor, n_succeeded, client_total_ms, client_ops_per_s,
     ).unwrap();
 

@@ -101,7 +101,7 @@ Three focused benches covering classical and incremental client criteria for the
 |---|---|---|---|
 | `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
 | `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
-| `client_mutation` | `--load-factor` (0.80) | `apply_delta` throughput per kind (insert/update/delete), wall-clock, empty queue (isolates hint-patch cost) | `ikpir_client_mutation.csv` |
+| `client_mutation` | `--load-factor` (0.90) | `apply_delta` throughput per kind (insert/update/delete), wall-clock, empty queue (isolates hint-patch cost) | `ikpir_client_mutation.csv` |
 
 `client_query` and `client_decode` use **warm-bc** mode (precompute the
 prepared-query queue + decode material before the timed loop), so the
@@ -123,6 +123,13 @@ in isolation, without warm-bc queue-maintenance overhead mixed in.
   `<S, B>` pair; `run_one` is generic over both. `--lwe-dim` defaults
   to the backend-appropriate value (1566 for Frodo, 1275 for Simple)
   via `helpers::backend_default_lwe_dim`.
+- **Plaintext bits.** Every bench accepts `--plaintext-bits` (default
+  `8` — a safe lower bound that works for every backend and every DB
+  size). The orchestrator scripts override this per `(backend, m_label)`
+  via `scripts/configs.sh::backend_plaintext_bits` so each sweep runs
+  at the largest `pb` admitted by the backend's correctness bound at
+  `q = 2^32`. The chosen value is written to every CSV row as the
+  `plaintext_bits` column.
 - One invocation = one CSV row (append-mode writer); the orchestrator
   is responsible for `rm`-ing the CSV before sweeping. The orchestrator
   also reads `IKPIR_BENCH_BACKENDS` (default `frodo`) and re-runs every

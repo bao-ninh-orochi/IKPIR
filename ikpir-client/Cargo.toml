@@ -48,5 +48,9 @@ name    = "classical_throughput"
 harness = false
 
 [[bench]]
+name    = "headtohead_throughput"
+harness = false
+
+[[bench]]
 name    = "mutation_throughput"
 harness = false

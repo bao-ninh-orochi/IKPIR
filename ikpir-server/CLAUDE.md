@@ -167,7 +167,7 @@ Three focused benches covering classical and incremental server criteria for the
 |---|---|---|---|
 | `server_setup` | `TableFull` | `IkpirServer::new` wall-clock (trials=5, warmup=2); setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR matvec answer rate (queries/sec, criterion); query_bytes, response_bytes | `ikpir_server_answer.csv` |
-| `server_mutation` | `--load-factor` (0.80) | Per-kind (insert/update/delete) throughput, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
+| `server_mutation` | `--load-factor` (0.90) | Per-kind (insert/update/delete) throughput, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
 
 - Each bench is `harness = false` and parses CLI via `clap` (see helpers
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
@@ -178,6 +178,13 @@ Three focused benches covering classical and incremental server criteria for the
   `<S, B>` pair; `run_one` is generic over both. `--lwe-dim` defaults
   to the backend-appropriate value (1566 for Frodo, 1275 for Simple)
   via `helpers::backend_default_lwe_dim`.
+- **Plaintext bits.** Every bench accepts `--plaintext-bits` (default
+  `8` — a safe lower bound that works for every backend and every DB
+  size). The orchestrator scripts override this per `(backend, m_label)`
+  via `scripts/configs.sh::backend_plaintext_bits` so each sweep runs
+  at the largest `pb` admitted by the backend's correctness bound at
+  `q = 2^32`. The chosen value is written to every CSV row as the
+  `plaintext_bits` column.
 - **Script-level sweep.** The orchestrator reads `IKPIR_BENCH_BACKENDS`
   (default `frodo`) and re-runs every bench once per backend. Set
   `IKPIR_BENCH_BACKENDS=frodo,simple` to cover both (~2× runtime).

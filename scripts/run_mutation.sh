@@ -31,8 +31,10 @@
 # (default 12.0). Raise it on 32 GB+ machines.
 #
 # Config matrix (scripts/configs.sh):
-#   6 (arity, bucket_size, num_buckets) MUTATION_CONFIGS × 3 value_bits
-#   = 18 runs/backend (some may be skipped by the OOM guard).
+#   12 (arity, bucket_size, num_buckets) BENCH_CONFIGS × 3 value_bits
+#   = 36 runs/backend (some may be skipped by the OOM guard).
+#   (BENCH_CONFIGS is shared with the classical sweep — the historical
+#   separate MUTATION_CONFIGS array was unified into BENCH_CONFIGS.)
 #   n_mutations = capacity / 100  (1 % of capacity per config).
 #   load_factor = MUTATION_LOAD_FACTOR (0.90).
 #
@@ -88,24 +90,26 @@ rm -f "$RESULTS_DIR/ikpir_client_mutation.csv"
 for backend in "${BACKENDS_ARR[@]}"; do
     backend_note "$backend"
     lwe=$(backend_lwe_dim "$backend")
-    for cfg in "${MUTATION_CONFIGS[@]}"; do
+    for cfg in "${BENCH_CONFIGS[@]}"; do
         IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
+        pb=$(backend_plaintext_bits "$backend" "$m_label")
         capacity=$(( nb * bs ))
         n_mut=$(( capacity / 100 ))   # 1 % of capacity, same rule as today
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
-            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe N=$n_mut lf=$MUTATION_LOAD_FACTOR"
+            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb N=$n_mut lf=$MUTATION_LOAD_FACTOR"
             "${CARGO[@]}" -- \
-                --backend      "$backend"              \
-                --arity        "$arity"                \
-                --num-buckets  "$nb"                   \
-                --bucket-size  "$bs"                   \
-                --value-bits   "$vb"                   \
-                --lwe-dim      "$lwe"                  \
-                --n-mutations  "$n_mut"                \
-                --load-factor  "$MUTATION_LOAD_FACTOR" \
-                --max-mem-gb   "$MAX_MEM_GB"
+                --backend         "$backend"              \
+                --arity           "$arity"                \
+                --num-buckets     "$nb"                   \
+                --bucket-size     "$bs"                   \
+                --value-bits      "$vb"                   \
+                --plaintext-bits  "$pb"                   \
+                --lwe-dim         "$lwe"                  \
+                --n-mutations     "$n_mut"                \
+                --load-factor     "$MUTATION_LOAD_FACTOR" \
+                --max-mem-gb      "$MAX_MEM_GB"
         done
     done
 done

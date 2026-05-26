@@ -82,21 +82,35 @@ Six focused `clap`-parsed benches (3 server + 3 client) emit CSV under
 configs is the orchestrator's job — `rm` the CSV first, then loop.
 
 The canonical sweep is `scripts/run_all.sh`, which iterates every bench
-over the full paper config matrix (20 configs × 3 value\_bits = 60 runs
-per bench; mutation benches × 7 N\_mutations = 420 runs; see
-`scripts/configs.sh`). Per-crate orchestrators (`<crate>/scripts/run_benches.sh`)
-run just that crate.
+over the full paper config matrix (12 configs × 3 value\_bits = 36 runs
+per bench; mutation benches reuse the same 12 `BENCH_CONFIGS` entries
+× 3 value\_bits = 36 runs per bench with `n_mutations = capacity/100`
+per config; the historical separate `MUTATION_CONFIGS` array has been
+unified into `BENCH_CONFIGS`; see `scripts/configs.sh`). Per-crate
+orchestrators (`<crate>/scripts/run_benches.sh`) run just that crate.
+
+`plaintext_bits` is **not fixed across configs**. For each
+`(backend, DB size)` pair, the orchestrator picks the maximum `pb` whose
+correctness bound holds at `q = 2^32` — FrodoPIR uses paper Eq. 8
+(`q ≥ 8·p²·√m`), SimplePIR uses paper Appendix C.2 Eq. 2
+(`⌊q/p⌋ ≥ √2·σ·p·N^{1/4}·√ln(2/δ)`, σ = 6.4, δ = 2⁻⁴⁰). The lookup
+lives in `scripts/configs.sh::backend_plaintext_bits` and is passed
+to every bench as `--plaintext-bits`. Each CSV row carries its
+`plaintext_bits` so analyses can match results to operating points.
 
 ```bash
 # Full sweep (server then client), FrodoPIR only (default).
 ./scripts/run_all.sh
 IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh  # both backends (~2× runtime)
 
-# One bench at one config (manual).
+# One bench at one config (manual). When omitted, --plaintext-bits
+# defaults to 8 — safe for every backend / DB size combination but
+# usually *not* the max that the backend supports. Pass it explicitly
+# (or use the orchestrator scripts) to bench at the best operating point.
 cargo bench -p ikpir-server --bench server_answer -- \
-    --num-buckets 65536 --bucket-size 4 --value-bits 256
+    --num-buckets 65536 --bucket-size 4 --value-bits 256 --plaintext-bits 10
 cargo bench -p ikpir-client --bench client_query -- \
-    --num-buckets 65536 --bucket-size 4 --value-bits 256
+    --num-buckets 65536 --bucket-size 4 --value-bits 256 --plaintext-bits 10
 ```
 
 ## Design principles

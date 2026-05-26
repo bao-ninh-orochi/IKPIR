@@ -2,7 +2,7 @@
 //! total delta wire cost for N mutations per kind, across both backends
 //! (FrodoPIR and SimplePIR).
 //!
-//! **Method:** Populate to `--load-factor` (default 0.80), snapshot the cell
+//! **Method:** Populate to `--load-factor` (default 0.90), snapshot the cell
 //! array, then for each mutation kind clone the snapshot and time N
 //! consecutive mutations with wall-clock. Reports n_succeeded, total_ms,
 //! ops_per_s = n_succeeded / total_ms × 1000, and the total delta bytes
@@ -14,13 +14,17 @@
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
 //! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
 //! `--lwe-dim` (backend-dependent default), `--n-mutations` (default 1024),
-//! `--load-factor` (default 0.80).
+//! `--load-factor` (default 0.90).
 //!
 //! **Output:** `results/ikpir_server_mutation.csv`
 //! Columns: backend, mutation_kind, arity, num_buckets, bucket_size,
-//! value_bits, lwe_dim, n_mutations, load_factor, n_attempted, n_succeeded,
-//! total_ms, ops_per_s, delta_bytes_total, cells_per_slot, row_width,
-//! segment_rows
+//! value_bits, plaintext_bits, lwe_dim, n_mutations, load_factor, n_attempted,
+//! n_succeeded, total_ms, ops_per_s, delta_bytes_total, cells_per_slot,
+//! row_width, segment_rows, db_rows, db_cols
+//!
+//! `db_rows` / `db_cols` report the per-segment PIR matrix shape **after** any
+//! backend-specific reshape. For FrodoPIR this is `(segment_rows, row_width)`;
+//! for SimplePIR this is the post-reshape `(⌈segment_rows/k⌉, k·row_width)`.
 
 mod helpers;
 
@@ -36,9 +40,9 @@ use segmented_cuckoo::{
 use std::io::Write;
 use std::time::Instant;
 
-const HEADER: &str = "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+const HEADER: &str = "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
     n_mutations,load_factor,n_attempted,n_succeeded,total_ms,ops_per_s,delta_bytes_total,\
-    cells_per_slot,row_width,segment_rows";
+    cells_per_slot,row_width,segment_rows,db_rows,db_cols";
 
 #[derive(Clone, Copy, Debug)]
 enum MutationKind { Insert, Update, Delete }
@@ -64,7 +68,7 @@ struct Cli {
     /// LWE dimension. Defaults to 1566 (Frodo) or 1275 (Simple) when omitted.
     #[arg(long)]                           lwe_dim: Option<u32>,
     #[arg(long, default_value_t = 1024)]   n_mutations: u32,
-    #[arg(long, default_value_t = 0.80)]   load_factor: f64,
+    #[arg(long, default_value_t = 0.90)]   load_factor: f64,
 }
 
 fn effective_lwe_dim(cli: &Cli) -> u32 {
@@ -99,7 +103,11 @@ where
     let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
 
-    let store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
+    let mut store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
+    // `from_cells` resets `max_kicks` to `MAX_KICKS_DEFAULT` (500); restore the
+    // 2_500 budget the populate helper used so the timed insert loop runs with
+    // the same cuckoo-eviction headroom as the populate phase.
+    store.set_max_kicks(2_500);
     let mut server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
 
     let mut delta_bytes_total = 0usize;
@@ -168,6 +176,8 @@ where
     let cps          = params.cells_per_slot();
     let row_width    = cli.bucket_size * cps;
     let segment_rows = params.segment_size();
+    let (db_rows, db_cols) =
+        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
     let store_state = helpers::StoreState {
         capacity:      (num_buckets as u64) * (cli.bucket_size as u64),
         populated:     n_seed,
@@ -184,11 +194,12 @@ where
         helpers::Knob { name: "backend",     value: cli.backend.to_string(),           is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "arity",       value: arity.to_string(),                 is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "num_buckets", value: num_buckets.to_string(),           is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "bucket_size", value: cli.bucket_size.to_string(),       is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "value_bits",  value: cli.value_bits.to_string(),        is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "lwe_dim",     value: lwe_dim_eff.to_string(),           is_default: cli.lwe_dim.is_none() },
-        helpers::Knob { name: "n_mutations", value: cli.n_mutations.to_string(),       is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "load_factor", value: format!("{:.2}", cli.load_factor), is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",    value: cli.bucket_size.to_string(),       is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",     value: cli.value_bits.to_string(),        is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "plaintext_bits", value: cli.plaintext_bits.to_string(),    is_default: matches.value_source("plaintext_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",        value: lwe_dim_eff.to_string(),           is_default: cli.lwe_dim.is_none() },
+        helpers::Knob { name: "n_mutations",    value: cli.n_mutations.to_string(),       is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "load_factor",    value: format!("{:.2}", cli.load_factor), is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
     ];
     helpers::print_preamble("server_mutation", &knobs, &store_state, &geom);
 
@@ -197,8 +208,8 @@ where
         let ops_per_s = if r.total_ms > 0.0 { r.n_succeeded as f64 / r.total_ms * 1e3 } else { 0.0 };
         writeln!(
             csv,
-            "{},{},{arity},{num_buckets},{},{},{lwe_dim_eff},{},{:.2},{},{},{:.3},{:.2},{},{cps},{row_width},{segment_rows}",
-            cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits,
+            "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{},{:.3},{:.2},{},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+            cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
             cli.n_mutations, cli.load_factor,
             r.n_attempted, r.n_succeeded, r.total_ms, ops_per_s, r.delta_bytes_total,
         ).unwrap();

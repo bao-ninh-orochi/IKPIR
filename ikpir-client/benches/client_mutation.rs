@@ -18,8 +18,12 @@
 //!
 //! **Output:** `results/ikpir_client_mutation.csv`
 //! Columns: backend, mutation_kind, arity, num_buckets, bucket_size,
-//! value_bits, lwe_dim, n_mutations, load_factor, n_succeeded, total_ms,
-//! ops_per_s, cells_per_slot, row_width, segment_rows
+//! value_bits, plaintext_bits, lwe_dim, n_mutations, load_factor, n_succeeded,
+//! total_ms, ops_per_s, cells_per_slot, row_width, segment_rows, db_rows, db_cols
+//!
+//! `db_rows` / `db_cols` report the per-segment PIR matrix shape **after** any
+//! backend-specific reshape. For FrodoPIR this is `(segment_rows, row_width)`;
+//! for SimplePIR this is the post-reshape `(⌈segment_rows/k⌉, k·row_width)`.
 
 mod helpers;
 
@@ -35,9 +39,9 @@ use segmented_cuckoo::{
 use std::io::Write;
 use std::time::Instant;
 
-const HEADER: &str = "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+const HEADER: &str = "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
     n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
-    cells_per_slot,row_width,segment_rows";
+    cells_per_slot,row_width,segment_rows,db_rows,db_cols";
 
 #[derive(Clone, Copy, Debug)]
 enum MutationKind { Insert, Update, Delete }
@@ -152,6 +156,8 @@ where
     let cps          = params.cells_per_slot();
     let row_width    = cli.bucket_size * cps;
     let segment_rows = params.segment_size();
+    let (db_rows, db_cols) =
+        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
     let store_state = helpers::StoreState {
         capacity:       (num_buckets as u64) * (cli.bucket_size as u64),
         populated:      n_seed,
@@ -168,11 +174,12 @@ where
         helpers::Knob { name: "backend",     value: cli.backend.to_string(),           is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "arity",       value: arity.to_string(),                 is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "num_buckets", value: num_buckets.to_string(),           is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "bucket_size", value: cli.bucket_size.to_string(),       is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "value_bits",  value: cli.value_bits.to_string(),        is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "lwe_dim",     value: lwe_dim_eff.to_string(),           is_default: cli.lwe_dim.is_none() },
-        helpers::Knob { name: "n_mutations", value: cli.n_mutations.to_string(),       is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "load_factor", value: format!("{:.2}", cli.load_factor), is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",    value: cli.bucket_size.to_string(),       is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",     value: cli.value_bits.to_string(),        is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "plaintext_bits", value: cli.plaintext_bits.to_string(),    is_default: matches.value_source("plaintext_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",        value: lwe_dim_eff.to_string(),           is_default: cli.lwe_dim.is_none() },
+        helpers::Knob { name: "n_mutations",    value: cli.n_mutations.to_string(),       is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "load_factor",    value: format!("{:.2}", cli.load_factor), is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
     ];
     helpers::print_preamble("client_mutation", &knobs, &store_state, &geom);
 
@@ -201,8 +208,8 @@ where
 
         writeln!(
             csv,
-            "{},{},{arity},{num_buckets},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{cps},{row_width},{segment_rows}",
-            cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits,
+            "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+            cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
             cli.n_mutations, cli.load_factor, n_succeeded, total_ms, ops_per_s,
         ).unwrap();
         println!(

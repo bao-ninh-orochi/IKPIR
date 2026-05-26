@@ -27,7 +27,7 @@
 # (default 12.0). Raise it on 32 GB+ machines.
 #
 # Config matrix (scripts/configs.sh):
-#   20 (arity, bucket_size, num_buckets) tuples × 3 value_bits = 60 runs/backend
+#   12 (arity, bucket_size, num_buckets) tuples × 3 value_bits = 36 runs/backend
 #   (some may be skipped by the OOM guard).
 #
 # Output (three CSV files in results/):
@@ -81,19 +81,21 @@ for backend in "${BACKENDS_ARR[@]}"; do
     lwe=$(backend_lwe_dim "$backend")
     for cfg in "${BENCH_CONFIGS[@]}"; do
         IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
+        pb=$(backend_plaintext_bits "$backend" "$m_label")
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
-            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe"
+            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb"
             "${CARGO[@]}" -- \
-                --backend      "$backend"     \
-                --arity        "$arity"       \
-                --num-buckets  "$nb"          \
-                --bucket-size  "$bs"          \
-                --value-bits   "$vb"          \
-                --lwe-dim      "$lwe"         \
-                --batch        64             \
-                --max-mem-gb "$MAX_MEM_GB"
+                --backend         "$backend"     \
+                --arity           "$arity"       \
+                --num-buckets     "$nb"          \
+                --bucket-size     "$bs"          \
+                --value-bits      "$vb"          \
+                --plaintext-bits  "$pb"          \
+                --lwe-dim         "$lwe"         \
+                --batch           64             \
+                --max-mem-gb      "$MAX_MEM_GB"
         done
     done
 done

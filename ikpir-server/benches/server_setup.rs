@@ -10,10 +10,14 @@
 //! `--lwe-dim` (defaults to backend recommendation), `--trials`, `--warmup`.
 //!
 //! **Output:** `results/ikpir_server_setup.csv`
-//! Columns: backend, arity, num_buckets, bucket_size, value_bits, lwe_dim,
-//! mean_setup_ms, min_setup_ms, max_setup_ms, stddev_setup_ms,
+//! Columns: backend, arity, num_buckets, bucket_size, value_bits, plaintext_bits,
+//! lwe_dim, mean_setup_ms, min_setup_ms, max_setup_ms, stddev_setup_ms,
 //! setup_bundle_bytes, hint_bytes_per_segment, server_params_bytes_per_segment,
-//! cells_per_slot, row_width, segment_rows, load_factor
+//! cells_per_slot, row_width, segment_rows, db_rows, db_cols, load_factor
+//!
+//! `db_rows` / `db_cols` report the per-segment PIR matrix shape **after** any
+//! backend-specific reshape. For FrodoPIR this is `(segment_rows, row_width)`;
+//! for SimplePIR this is the post-reshape `(⌈segment_rows/k⌉, k·row_width)`.
 
 mod helpers;
 
@@ -28,10 +32,10 @@ use segmented_cuckoo::{
 use std::io::Write;
 use std::time::Instant;
 
-const HEADER: &str = "backend,arity,num_buckets,bucket_size,value_bits,lwe_dim,\
+const HEADER: &str = "backend,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
     mean_setup_ms,min_setup_ms,max_setup_ms,stddev_setup_ms,\
     setup_bundle_bytes,hint_bytes_per_segment,server_params_bytes_per_segment,\
-    cells_per_slot,row_width,segment_rows,load_factor";
+    cells_per_slot,row_width,segment_rows,db_rows,db_cols,load_factor";
 
 #[derive(clap::Parser)]
 #[command(about = "Measure ikpir-server setup wall-clock cost (populate-to-full then IkpirServer::new).")]
@@ -100,11 +104,13 @@ where
     let cps          = params.cells_per_slot();
     let row_width    = cli.bucket_size * cps;
     let segment_rows = params.segment_size();
+    let (db_rows, db_cols) =
+        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
     let load_factor  = n_inserted as f64 / (num_buckets as u64 * cli.bucket_size as u64) as f64;
     writeln!(
         csv,
-        "{},{arity},{num_buckets},{},{},{lwe_dim_eff},{:.3},{:.3},{:.3},{:.3},{bundle_bytes},{hint_bytes},{sp_bytes},{cps},{row_width},{segment_rows},{:.4}",
-        cli.backend, cli.bucket_size, cli.value_bits,
+        "{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{:.3},{:.3},{:.3},{:.3},{bundle_bytes},{hint_bytes},{sp_bytes},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
+        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits,
         s.mean, s.min, s.max, s.stddev, load_factor,
     ).unwrap();
 
@@ -130,6 +136,7 @@ where
         helpers::Knob { name: "bucket_size",      value: cli.bucket_size.to_string(),      is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "fingerprint_bits", value: cli.fingerprint_bits.to_string(), is_default: matches.value_source("fingerprint_bits") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "value_bits",       value: cli.value_bits.to_string(),       is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "plaintext_bits",   value: cli.plaintext_bits.to_string(),   is_default: matches.value_source("plaintext_bits") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "lwe_dim",          value: lwe_dim_eff.to_string(),          is_default: cli.lwe_dim.is_none() },
     ];
     helpers::print_preamble("server_setup", &knobs, &store_state, &geom);

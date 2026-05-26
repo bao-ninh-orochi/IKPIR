@@ -9,9 +9,11 @@
 #   IKPIR_BENCH_BACKENDS=frodo,simple           # both backends (~2× runtime)
 #
 # Config matrix (scripts/configs.sh):
-#   client_query     20 cfgs × 3 value_bits =  60 runs/backend  (warm-bc)
-#   client_decode    20 cfgs × 3 value_bits =  60 runs/backend  (warm-bc)
-#   client_mutation   6 cfgs × 3 value_bits × N=1% capacity = 18 runs/backend (warm-bc)
+#   client_query    12 cfgs × 3 value_bits = 36 runs/backend  (warm-bc)
+#   client_decode   12 cfgs × 3 value_bits = 36 runs/backend  (warm-bc)
+#   client_mutation 12 cfgs × 3 value_bits × N=1% capacity = 36 runs/backend (warm-bc)
+# (All three sweeps now share BENCH_CONFIGS — the historical separate
+# MUTATION_CONFIGS array was unified into BENCH_CONFIGS.)
 #
 # One invocation = one CSV row (append-mode). The CSV is rm'd before each
 # sweep so prior rows don't accumulate. Criterion's target/criterion/ is
@@ -45,7 +47,7 @@ ok()           { echo -e "${GREEN}  $*${RESET}"; }
 backend_note() { echo -e "${MAGENTA}▶ backend=$1${RESET}"; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: iterate BENCH_CONFIGS × VALUE_BITS (60 pairs).
+# Helper: iterate BENCH_CONFIGS × VALUE_BITS (36 pairs).
 # Calls `$1 arity bucket_size num_buckets n_label m_label value_bits w_label`
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -55,6 +57,7 @@ for_each_bench_config() {
     local i vb w
     for cfg in "${BENCH_CONFIGS[@]}"; do
         IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
+        pb=$(backend_plaintext_bits "$backend" "$m_label")
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
@@ -64,7 +67,7 @@ for_each_bench_config() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# client_query — 60 runs/backend  (warm-bc)
+# client_query — 36 runs/backend  (warm-bc)
 # ─────────────────────────────────────────────────────────────────────────────
 run_client_query() {
     step "client_query"
@@ -72,14 +75,15 @@ run_client_query() {
 
     for backend in "${BACKENDS_ARR[@]}"; do
         backend_note "$backend"
-        local lwe; lwe=$(backend_lwe_dim "$backend")
+        local lwe pb; lwe=$(backend_lwe_dim "$backend")
         _query_one() {
             local arity=$1 bs=$2 nb=$3 n_label=$4 m_label=$5 vb=$6 w=$7
-            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe"
+            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb"
             "${CARGO[@]}" client_query -- \
                 --backend "$backend" \
                 --arity "$arity" --num-buckets "$nb" \
                 --bucket-size "$bs" --value-bits "$vb" \
+                --plaintext-bits "$pb" \
                 --lwe-dim "$lwe" --batch 64
         }
         for_each_bench_config _query_one
@@ -88,7 +92,7 @@ run_client_query() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# client_decode — 60 runs/backend  (warm-bc)
+# client_decode — 36 runs/backend  (warm-bc)
 # ─────────────────────────────────────────────────────────────────────────────
 run_client_decode() {
     step "client_decode"
@@ -96,14 +100,15 @@ run_client_decode() {
 
     for backend in "${BACKENDS_ARR[@]}"; do
         backend_note "$backend"
-        local lwe; lwe=$(backend_lwe_dim "$backend")
+        local lwe pb; lwe=$(backend_lwe_dim "$backend")
         _decode_one() {
             local arity=$1 bs=$2 nb=$3 n_label=$4 m_label=$5 vb=$6 w=$7
-            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe"
+            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb"
             "${CARGO[@]}" client_decode -- \
                 --backend "$backend" \
                 --arity "$arity" --num-buckets "$nb" \
                 --bucket-size "$bs" --value-bits "$vb" \
+                --plaintext-bits "$pb" \
                 --lwe-dim "$lwe" --batch 64
         }
         for_each_bench_config _decode_one
@@ -112,7 +117,7 @@ run_client_decode() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# client_mutation — 18 runs/backend  (MUTATION_CONFIGS × VALUE_BITS, N=1% capacity)
+# client_mutation — 36 runs/backend  (BENCH_CONFIGS × VALUE_BITS, N=1% capacity)
 # ─────────────────────────────────────────────────────────────────────────────
 run_client_mutation() {
     step "client_mutation"
@@ -121,18 +126,20 @@ run_client_mutation() {
     for backend in "${BACKENDS_ARR[@]}"; do
         backend_note "$backend"
         local lwe; lwe=$(backend_lwe_dim "$backend")
-        local cfg arity bs nb n_label m_label n_mut i vb w
-        for cfg in "${MUTATION_CONFIGS[@]}"; do
+        local cfg arity bs nb n_label m_label n_mut pb i vb w
+        for cfg in "${BENCH_CONFIGS[@]}"; do
             IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
+            pb=$(backend_plaintext_bits "$backend" "$m_label")
             n_mut=$(( nb * bs / 100 ))
             for i in "${!VALUE_BITS[@]}"; do
                 vb=${VALUE_BITS[$i]}
                 w=${W_LABELS[$i]}
-                note "arity=$arity bs=$bs nb=$nb (m=$m_label) w=$w N=$n_mut lwe=$lwe"
+                note "arity=$arity bs=$bs nb=$nb (m=$m_label) w=$w N=$n_mut lwe=$lwe pb=$pb"
                 "${CARGO[@]}" client_mutation -- \
                     --backend "$backend" \
                     --arity "$arity" --num-buckets "$nb" \
                     --bucket-size "$bs" --value-bits "$vb" \
+                    --plaintext-bits "$pb" \
                     --lwe-dim "$lwe" \
                     --n-mutations "$n_mut" --load-factor "$MUTATION_LOAD_FACTOR"
             done

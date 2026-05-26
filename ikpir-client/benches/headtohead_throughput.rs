@@ -1,41 +1,33 @@
 //! **Intent:** Measure `server_answer`, `client_query`, and `client_decode`
-//! throughput in a single bench process so the expensive `populate_until_full`
-//! and `IkpirServer::new` setup is paid once per config, not three times.
+//! throughput at a **fixed keyword count** (1 M / 1.5 M / 3 M / 4 M), in
+//! support of head-to-head comparisons with ChalametPIR and Hao et al. 2025.
 //!
-//! **Motivation:** Each individual bench (`server_answer`, `client_query`,
-//! `client_decode`) independently runs `populate_until_full` + `IkpirServer::new`
-//! before its criterion loop. At paper-scale configs (4 M+ slots, lwe_dim ≥ 1024)
-//! those two steps can each take 30–120 s, making them the dominant cost of a
-//! full sweep. This bench merges all three into one process so fill + hint-matrix
-//! computation is shared, cutting per-config overhead from 3× to 1×.
+//! **Motivation:** The `classical_throughput` bench fixes `num_buckets` (and
+//! thus DB size) and populates `until_full`, so different schemes end up
+//! storing different keyword counts in the same-size DB — a setting where
+//! IKPIR's slot/cell layout wins by construction. For a fair head-to-head, we
+//! flip the protocol: fix `num_keys` and let each scheme report the DB size
+//! it needed to absorb that load. The expansion rate `db_size /
+//! num_keys` (or in bytes, `num_keys / db_size` ↔ load factor) can then
+//! be computed directly from the CSV.
 //!
-//! **Method:** Populate to `TableFull`, build `IkpirServer`, and call
-//! `server.setup()` once. Then run three successive criterion benchmarks:
-//!   1. `server_answer` — cycle through `batch` pre-built queries.
-//!   2. `client_query` (warm-bc) — `precompute_queries` refilled per criterion
-//!      sample so the timed call always pops from a warm queue.
-//!   3. `client_decode` (warm-bc) — `precompute_queries` + `precompute_decodes`
-//!      refilled per sample; `server.answer` runs outside the timing bracket.
+//! **Method:** Identical fill+setup+three-measurement pipeline as
+//! `classical_throughput`, except `populate_exact_n_keys(target_n=num_keys)`
+//! replaces `populate_until_full`. All three measurements (`server_answer`,
+//! `client_query`, `client_decode`) share one fill+setup per config.
 //!
-//! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple, default
-//! frodo), `--num-buckets`, `--bucket-size`, `--value-bits`, `--lwe-dim`
-//! (defaults to backend recommendation), `--batch` (shared key-pool / query-pool
-//! size; default 64).
+//! **Arguments (CLI):** Same as `classical_throughput`, plus `--num-keys`
+//! (required, the keyword count to populate).
 //!
-//! **Output:** Three CSV files with the same schema as the individual benches:
-//!   `results/ikpir_server_answer.csv`
-//!   `results/ikpir_client_query.csv`
-//!   `results/ikpir_client_decode.csv`
+//! **Output:** Three CSV files with the same shape as
+//! `classical_throughput`'s output **plus** two extra columns,
+//! `num_keys` and `db_size` (= `num_buckets × bucket_size`):
+//!   `results/ikpir_headtohead_server_answer.csv`
+//!   `results/ikpir_headtohead_client_query.csv`
+//!   `results/ikpir_headtohead_client_decode.csv`
 //!
-//! Each row carries `db_rows` / `db_cols` reporting the per-segment PIR matrix
-//! shape **after** any backend-specific reshape. For FrodoPIR this is
-//! `(segment_rows, row_width)`; for SimplePIR this is the post-reshape
-//! `(⌈segment_rows/k⌉, k·row_width)`.
-//!
-//! Use `scripts/run_classical.sh` to sweep the full config matrix. Do **not**
-//! also run the individual `server_answer` / `client_query` / `client_decode`
-//! scripts for the same configs — the CSV files are shared and would accumulate
-//! duplicate rows.
+//! Use `scripts/run_headtohead.sh` to sweep the head-to-head matrix
+//! defined in `scripts/configs.sh::HEADTOHEAD_CONFIGS`.
 
 mod helpers;
 
@@ -53,27 +45,32 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const HEADER_ANSWER: &str =
-    "backend,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,batch,\
+    "backend,arity,num_buckets,bucket_size,num_keys,db_size,value_bits,plaintext_bits,fingerprint_bits,lwe_dim,batch,\
     mean_qps,min_qps,max_qps,stddev_qps,query_bytes,response_bytes,\
     cells_per_slot,row_width,segment_rows,db_rows,db_cols,load_factor";
 
 const HEADER_QUERY: &str =
-    "backend,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,batch,\
+    "backend,arity,num_buckets,bucket_size,num_keys,db_size,value_bits,plaintext_bits,fingerprint_bits,lwe_dim,batch,\
     mean_qps,min_qps,max_qps,stddev_qps,query_bytes,\
     cells_per_slot,row_width,segment_rows,db_rows,db_cols,load_factor";
 
 const HEADER_DECODE: &str =
-    "backend,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,batch,\
+    "backend,arity,num_buckets,bucket_size,num_keys,db_size,value_bits,plaintext_bits,fingerprint_bits,lwe_dim,batch,\
     mean_dps,min_dps,max_dps,stddev_dps,\
     cells_per_slot,row_width,segment_rows,db_rows,db_cols,load_factor";
 
 #[derive(clap::Parser)]
-#[command(about = "Measure server_answer + client_query + client_decode sharing one fill + setup.")]
+#[command(about = "Head-to-head bench: fixes num_keys, reports DB size, otherwise mirrors classical_throughput.")]
 struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
     arity: u32,
     #[arg(long, value_enum, default_value_t = Backend::Frodo)]
     backend: Backend,
+    /// Required: number of keys to populate. The DB size (= `num_buckets ×
+    /// bucket_size`) is fixed by `--num-buckets` / `--bucket-size`; the
+    /// caller is responsible for picking those so capacity ≥ `num_keys`
+    /// at a reasonable load factor (~95% for the head-to-head matrix).
+    #[arg(long)]                           num_keys: u64,
     #[arg(long, default_value_t = 16_384)] num_buckets: u32,
     #[arg(long, default_value_t = 4)]      bucket_size: u32,
     #[arg(long, default_value_t = 256)]    value_bits: u32,
@@ -83,11 +80,8 @@ struct Cli {
     #[arg(long)]                           lwe_dim: Option<u32>,
     /// Shared key-pool / query-pool size for all three measurements.
     #[arg(long, default_value_t = 64)]     batch: u32,
-    /// Skip configs whose estimated peak memory exceeds this limit. The
-    /// dominant term is the FrodoPIR A matrix (segment_rows × lwe_dim × 4 B
-    /// per segment), held simultaneously by the server and by each client state
-    /// created from the setup bundle. Protects against SIGKILL from the OS OOM
-    /// killer. Raise on machines with ≥ 32 GB RAM (e.g. --max-mem-gb 24.0).
+    /// Skip configs whose estimated peak memory exceeds this limit. See
+    /// `classical_throughput.rs` for the dominant terms; this guard mirrors it.
     #[arg(long, default_value_t = 12.0)]   max_mem_gb: f64,
 }
 
@@ -129,32 +123,9 @@ where
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
 
     // ── 0. Memory guard ─────────────────────────────────────────────────────────
-    // Dominant cost is the per-segment LWE public matrix `A`, held in
-    // `B::HintMaterial`. After the HintMaterial refactor `setup()` no
-    // longer ships `A` over the wire and the server drops its copy
-    // immediately after setup; peak coexisting copies = 1 (only the
-    // active client). Each `IkpirClient::from_setup` re-expands `A`
-    // from the seed.
-    //
-    // Per-segment `A` shape is backend-aware (see
-    // `helpers::backend_shape_estimate`):
-    //   FrodoPIR:  (n_rows,       lwe_dim)   n_rows = num_buckets / arity
-    //   SimplePIR: (reshape_rows, lwe_dim)   reshape_rows ≈ √(n_rows × row_width)
-    //                                        via the √N reshape (~100× smaller).
-    //
-    // The pre-built `queries` Vec is held across all three measurements
-    // (sections 3–5):
-    //   batch × arity × b_len × 4 bytes, where b_len = a_rows_per_seg.
-    // For paper-scale Frodo + batch=64 this is ~1 GB; for SimplePIR it
-    // is negligible.
-    //
-    // Other secondary terms — server/client hint copies, criterion-driven
-    // refill queues (bounded by `iters`, typically << 1024 per sample),
-    // per-bundle wire payloads — are dwarfed by `A` and the queries Vec
-    // and not modelled here.
-    //
-    // Exceeding available RAM causes a silent SIGKILL from the OS — fail
-    // fast with a clear message instead.
+    // Same estimator as classical_throughput. The dominant term (per-segment
+    // LWE matrix `A`, held in B::HintMaterial) is independent of how many
+    // keys we end up inserting, so the formula is unchanged.
     let lwe_dim_est        = effective_lwe_dim(cli) as u64;
     let cells_per_slot_est = (cli.fingerprint_bits + cli.value_bits).div_ceil(cli.plaintext_bits) as u64;
     let row_width_est      = cli.bucket_size as u64 * cells_per_slot_est;
@@ -180,19 +151,20 @@ where
         return;
     }
 
-    // ── 1. Populate once ────────────────────────────────────────────────────────
-    let (store, n_inserted) = helpers::populate_until_full::<S>(
+    // ── 1. Populate exactly num_keys ────────────────────────────────────────────
+    // Fixed-N populate; panics if capacity is insufficient or cuckoo eviction
+    // exhausts before the target is reached. The orchestrator picks
+    // num_buckets / bucket_size to keep load at ~95%.
+    let (store, n_inserted) = helpers::populate_exact_n_keys::<S>(
         num_buckets, cli.bucket_size, cli.fingerprint_bits, cli.value_bits, cli.plaintext_bits,
+        cli.num_keys,
     );
-    if n_inserted == 0 { eprintln!("  Skip: empty store"); return; }
+    assert_eq!(n_inserted, cli.num_keys, "populate_exact_n_keys must return target_n");
 
     // ── 2. Build server + hint matrix once ─────────────────────────────────────
     let mut server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
     let bundle = server.setup();
-    // Read-only bench: free the server's seed-derived `A` matrix immediately.
-    // `server.answer` doesn't touch `HintMaterial`, so no re-expansion is
-    // triggered for the rest of the bench. This brings peak coexisting A
-    // copies down to 1 (only the active client's copy).
+    // Read-only bench: drop the server's seed-derived `A` immediately.
     server.drop_hint_material();
 
     let params_store = server.params();
@@ -201,13 +173,14 @@ where
     let segment_rows = params_store.segment_size();
     let (db_rows, db_cols) =
         helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
-    let load_factor  = n_inserted as f64 / (num_buckets as f64 * cli.bucket_size as f64);
-    let lwe_dim_eff  = effective_lwe_dim(cli);
-    let n            = n_inserted as u32;
-    let batch        = cli.batch;
+    let db_size       = (num_buckets as u64) * (cli.bucket_size as u64);
+    let load_factor   = n_inserted as f64 / db_size as f64;
+    let lwe_dim_eff   = effective_lwe_dim(cli);
+    let n             = n_inserted as u32;
+    let batch         = cli.batch;
 
     let store_state = helpers::StoreState {
-        capacity:       (num_buckets as u64) * (cli.bucket_size as u64),
+        capacity:       db_size,
         populated:      n_inserted,
         load_pct:       100.0 * load_factor,
         cells_per_slot: cps,
@@ -220,8 +193,6 @@ where
     let keys_v: Vec<Vec<u8>> = (0..batch).map(|i| (i % n).to_le_bytes().to_vec()).collect();
 
     // ── 3. Measure server_answer ────────────────────────────────────────────────
-    // Build queries from a temporary client then drop it immediately — its A copy
-    // is no longer needed once the query vectors are materialised.
     let (queries, query_bytes, response_bytes) = {
         let mut qclient = IkpirClient::<B>::from_setup(bundle.clone());
         let qs: Vec<PirQueryBundle<B>> = (0..batch)
@@ -230,7 +201,6 @@ where
         let qb = qs[0].wire_byte_size();
         let rb = server.answer(&qs[0]).expect("answer ok").wire_byte_size();
         (qs, qb, rb)
-        // qclient dropped here — frees one A copy
     };
 
     let mut ans_idx = 0usize;
@@ -240,7 +210,6 @@ where
     });
 
     // ── 4. Measure client_query (warm-bc) ───────────────────────────────────────
-    // client_q is scoped so its A copy is freed before client_d is created.
     let crit_query = {
     let mut client_q = IkpirClient::<B>::from_setup(bundle.clone());
     let samples_q: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -268,25 +237,17 @@ where
         group.finish();
     }
     let crit_q = ops_per_sec_stats(mem::take(&mut *samples_q.lock().unwrap()));
-    // client_q dropped here — frees one A copy before client_d is created
     crit_q
     };
 
     // ── 5. Measure client_decode (warm-bc) ──────────────────────────────────────
-    // Extract wire sizes before moving bundle — cannot borrow after move.
     let hint_per_seg_bytes = B::hint_byte_size(&bundle.hints[0]);
     let setup_bundle_bytes = bundle.wire_byte_size();
-    // Move bundle (not clone) into the last client. The bundle no longer
-    // carries `A` after the HintMaterial refactor, so this is mostly
-    // ergonomic; the client still re-expands its own `A` from the seed
-    // during `from_setup`.
     let mut client_d = IkpirClient::<B>::from_setup(bundle);
 
-    // Once-per-config decode sanity check: run one untimed query/answer/decode
-    // for a known key and verify the recovered bytes equal the value the
-    // populate helper wrote (`fill_value(k, salt=17)`). Catches packing,
-    // cells_per_slot, and hint-mismatch regressions that would otherwise
-    // produce silent garbage decodes with valid `Ok(Some(_))` shape.
+    // Once-per-config decode sanity check: same shape as classical_throughput.
+    // Catches silent decode regressions (wrong cells_per_slot, packing bug,
+    // hint mismatch) before the long-running timed loops.
     helpers::verify_decode::<B, _>(&mut client_d, &mut server, 1u32, cli.value_bits);
 
     let samples_d: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -330,6 +291,7 @@ where
     let knobs = [
         helpers::Knob { name: "backend",          value: cli.backend.to_string(),          is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "arity",            value: arity.to_string(),                is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "num_keys",         value: cli.num_keys.to_string(),         is_default: false },
         helpers::Knob { name: "num_buckets",      value: num_buckets.to_string(),          is_default: nb_is_default },
         helpers::Knob { name: "bucket_size",      value: cli.bucket_size.to_string(),      is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "fingerprint_bits", value: cli.fingerprint_bits.to_string(), is_default: matches.value_source("fingerprint_bits") != Some(ValueSource::CommandLine) },
@@ -338,7 +300,7 @@ where
         helpers::Knob { name: "lwe_dim",          value: lwe_dim_eff.to_string(),          is_default: cli.lwe_dim.is_none() },
         helpers::Knob { name: "batch",            value: batch.to_string(),                is_default: matches.value_source("batch") != Some(ValueSource::CommandLine) },
     ];
-    helpers::print_preamble("classical_throughput", &knobs, &store_state, &geom);
+    helpers::print_preamble("headtohead_throughput", &knobs, &store_state, &geom);
     println!(
         "  answer={:.2} qps (±{:.2}) | query={:.2} qps (±{:.2}) | decode={:.2} dps (±{:.2})",
         crit_answer.mean_ops_per_s, crit_answer.stddev_ops_per_s,
@@ -347,26 +309,27 @@ where
     );
 
     // ── 7. Write CSVs ───────────────────────────────────────────────────────────
+    let num_keys = cli.num_keys;
     writeln!(
         csv_answer,
-        "{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{batch},{:.2},{:.2},{:.2},{:.2},{query_bytes},{response_bytes},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
-        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits,
+        "{},{arity},{num_buckets},{},{num_keys},{db_size},{},{},{},{lwe_dim_eff},{batch},{:.2},{:.2},{:.2},{:.2},{query_bytes},{response_bytes},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
+        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits, cli.fingerprint_bits,
         crit_answer.mean_ops_per_s, crit_answer.min_ops_per_s,
         crit_answer.max_ops_per_s,  crit_answer.stddev_ops_per_s,
         load_factor,
     ).unwrap();
     writeln!(
         csv_query,
-        "{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{batch},{:.2},{:.2},{:.2},{:.2},{query_bytes},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
-        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits,
+        "{},{arity},{num_buckets},{},{num_keys},{db_size},{},{},{},{lwe_dim_eff},{batch},{:.2},{:.2},{:.2},{:.2},{query_bytes},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
+        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits, cli.fingerprint_bits,
         crit_query.mean_ops_per_s, crit_query.min_ops_per_s,
         crit_query.max_ops_per_s,  crit_query.stddev_ops_per_s,
         load_factor,
     ).unwrap();
     writeln!(
         csv_decode,
-        "{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{batch},{:.2},{:.2},{:.2},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
-        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits,
+        "{},{arity},{num_buckets},{},{num_keys},{db_size},{},{},{},{lwe_dim_eff},{batch},{:.2},{:.2},{:.2},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
+        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits, cli.fingerprint_bits,
         crit_decode.mean_ops_per_s, crit_decode.min_ops_per_s,
         crit_decode.max_ops_per_s,  crit_decode.stddev_ops_per_s,
         load_factor,
@@ -402,9 +365,9 @@ fn main() {
         helpers::default_num_buckets_for_arity(cli.arity)
     };
 
-    let mut csv_answer = helpers::csv_writer("ikpir_server_answer.csv", HEADER_ANSWER);
-    let mut csv_query  = helpers::csv_writer("ikpir_client_query.csv",  HEADER_QUERY);
-    let mut csv_decode = helpers::csv_writer("ikpir_client_decode.csv", HEADER_DECODE);
+    let mut csv_answer = helpers::csv_writer("ikpir_headtohead_server_answer.csv", HEADER_ANSWER);
+    let mut csv_query  = helpers::csv_writer("ikpir_headtohead_client_query.csv",  HEADER_QUERY);
+    let mut csv_decode = helpers::csv_writer("ikpir_headtohead_client_decode.csv", HEADER_DECODE);
 
     match cli.arity {
         2 => dispatch_backend::<Segmented2aryScheme>(&mut csv_answer, &mut csv_query, &mut csv_decode, &cli, 2, num_buckets),
@@ -412,5 +375,5 @@ fn main() {
         4 => dispatch_backend::<Segmented4aryScheme>(&mut csv_answer, &mut csv_query, &mut csv_decode, &cli, 4, num_buckets),
         _ => unreachable!("clap value_parser bounds arity to 2..=4"),
     }
-    println!("\nResults written to results/ikpir_server_answer.csv, ikpir_client_query.csv, ikpir_client_decode.csv");
+    println!("\nResults written to results/ikpir_headtohead_server_answer.csv, ikpir_headtohead_client_query.csv, ikpir_headtohead_client_decode.csv");
 }

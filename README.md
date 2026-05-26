@@ -97,8 +97,10 @@ invocation runs one config and appends one row; sweeping across configs is
 the orchestrator's job.
 
 The canonical sweep is **`./scripts/run_all.sh`**, which iterates every
-bench over the full paper config matrix (20 configs × 3 value\_bits = 60
-runs per bench; mutation benches × 7 N\_mutations = 420 runs):
+bench over the full paper config matrix (12 configs × 3 value\_bits = 36
+runs per bench; mutation benches reuse the same 12 configs × 3 value\_bits
+= 36 runs per bench, with N\_mutations derived per config as
+capacity / 100):
 
 ```bash
 ./scripts/run_all.sh                                  # FrodoPIR only (default)
@@ -110,7 +112,17 @@ IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh      # SimplePIR only
 ./ikpir-server/scripts/run_benches.sh server_answer   # one bench only
 ```
 
-For one-off measurements, invoke `cargo bench` directly:
+**Plaintext bits per config.** The orchestrator selects the largest
+`plaintext_bits` whose noise budget admits `q = 2^32` for each
+`(backend, DB size)` pair (FrodoPIR Eq. 8 `q ≥ 8·p²·√m`; SimplePIR App. C.2
+Eq. 2 `⌊q/p⌋ ≥ √2·σ·p·N^{1/4}·√ln(2/δ)` with σ = 6.4, δ = 2⁻⁴⁰).
+The chosen `pb` lands in `scripts/configs.sh::backend_plaintext_bits` and
+appears as a column in every CSV — see `scripts/configs.sh` for the table.
+
+For one-off measurements, invoke `cargo bench` directly. The CLI default
+for `--plaintext-bits` is `8` (safe everywhere, but usually below the max
+each backend supports); pass `--plaintext-bits N` explicitly to bench at
+the best operating point.
 
 ```bash
 # Server: setup time, answer throughput, mutation throughput.
@@ -126,6 +138,9 @@ cargo bench -p ikpir-client --bench client_mutation -- --n-mutations 64
 # Backend selection: every bench accepts --backend frodo|simple (default frodo).
 cargo bench -p ikpir-server --bench server_answer  -- --backend simple
 cargo bench -p ikpir-client --bench client_query   -- --backend simple
+
+# Override plaintext_bits explicitly (defaults to 8).
+cargo bench -p ikpir-server --bench server_answer -- --plaintext-bits 10
 
 # Filter / KV-store baselines (load_factor, fpr, throughputs).
 cargo bench -p segmented-cuckoo

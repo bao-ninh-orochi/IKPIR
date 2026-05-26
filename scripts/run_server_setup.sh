@@ -7,14 +7,22 @@
 #   IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_server_setup.sh  # both backends
 #   MAX_MEM_GB=20.0 ./scripts/run_server_setup.sh   # raise OOM guard (default 12 GB)
 #
-# Memory: peak ≈ 2 × (num_buckets × lwe_dim × 4 B) — the server holds A once,
-# then server.setup() clones A into the bundle during the single warmup trial
-# where wire sizes are read.  Both are live simultaneously at that point.
-# The bench skips any config whose estimated peak exceeds MAX_MEM_GB (default
-# 12.0).  Raise it if your machine has 32 GB+ RAM.
+# Memory: dominant cost is the per-segment LWE public matrix A, summed across
+# segments to ≈ num_buckets × lwe_dim × 4 B.  After the HintMaterial refactor
+# `server.setup()` no longer copies A into the bundle (A is re-expanded
+# client-side from the seed), so the server-side bench holds A exactly once.
+# This shell guard intentionally multiplies by 2 as a conservative safety
+# margin (slack for the table cells, transient bundle clones during the wire-
+# size readout, and OS overhead).  This guard is also FrodoPIR-shaped — it
+# does not divide by the SimplePIR √N reshape factor and will therefore
+# over-skip large SimplePIR configs that would actually fit; if SimplePIR runs
+# need to cover the largest configs, run via `scripts/run_classical.sh`
+# instead (its in-bench guard is backend-aware).  The bench skips any config
+# whose estimated peak exceeds MAX_MEM_GB (default 12.0).  Raise it if your
+# machine has 32 GB+ RAM.
 #
 # Config matrix (scripts/configs.sh):
-#   20 (arity, bucket_size, num_buckets) tuples × 3 value_bits = 60 runs/backend
+#   12 (arity, bucket_size, num_buckets) tuples × 3 value_bits = 36 runs/backend
 #   (some may be skipped by the OOM guard).
 #
 # Output:
@@ -61,6 +69,7 @@ for backend in "${BACKENDS_ARR[@]}"; do
     lwe=$(backend_lwe_dim "$backend")
     for cfg in "${BENCH_CONFIGS[@]}"; do
         IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
+        pb=$(backend_plaintext_bits "$backend" "$m_label")
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
@@ -76,14 +85,15 @@ for backend in "${BACKENDS_ARR[@]}"; do
                 continue
             fi
 
-            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe"
+            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb"
             "${CARGO[@]}" -- \
-                --backend      "$backend" \
-                --arity        "$arity"   \
-                --num-buckets  "$nb"      \
-                --bucket-size  "$bs"      \
-                --value-bits   "$vb"      \
-                --lwe-dim      "$lwe"     \
+                --backend         "$backend" \
+                --arity           "$arity"   \
+                --num-buckets     "$nb"      \
+                --bucket-size     "$bs"      \
+                --value-bits      "$vb"      \
+                --plaintext-bits  "$pb"      \
+                --lwe-dim         "$lwe"     \
                 --trials 5 --warmup 2
         done
     done

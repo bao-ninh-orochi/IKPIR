@@ -16,9 +16,13 @@
 //! do not reuse hot CPU-cache state from the previous call; default 64).
 //!
 //! **Output:** `results/ikpir_client_decode.csv`
-//! Columns: backend, arity, num_buckets, bucket_size, value_bits, lwe_dim,
-//! batch, mean_dps, min_dps, max_dps, stddev_dps,
-//! cells_per_slot, row_width, segment_rows, load_factor
+//! Columns: backend, arity, num_buckets, bucket_size, value_bits, plaintext_bits,
+//! lwe_dim, batch, mean_dps, min_dps, max_dps, stddev_dps,
+//! cells_per_slot, row_width, segment_rows, db_rows, db_cols, load_factor
+//!
+//! `db_rows` / `db_cols` report the per-segment PIR matrix shape **after** any
+//! backend-specific reshape. For FrodoPIR this is `(segment_rows, row_width)`;
+//! for SimplePIR this is the post-reshape `(⌈segment_rows/k⌉, k·row_width)`.
 
 mod helpers;
 
@@ -34,9 +38,9 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const HEADER: &str = "backend,arity,num_buckets,bucket_size,value_bits,lwe_dim,batch,\
+const HEADER: &str = "backend,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,batch,\
     mean_dps,min_dps,max_dps,stddev_dps,\
-    cells_per_slot,row_width,segment_rows,load_factor";
+    cells_per_slot,row_width,segment_rows,db_rows,db_cols,load_factor";
 
 #[derive(Clone, clap::Parser)]
 #[command(about = "Measure ikpir-client decode throughput (warm-bc) via criterion.")]
@@ -101,6 +105,8 @@ where
     let cps          = params_store.cells_per_slot();
     let row_width    = cli.bucket_size * cps;
     let segment_rows = params_store.segment_size();
+    let (db_rows, db_cols) =
+        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
     let load_factor  = n_inserted as f64 / (num_buckets as f64 * cli.bucket_size as f64);
     let lwe_dim_eff = effective_lwe_dim(cli);
     let store_state = helpers::StoreState {
@@ -122,10 +128,11 @@ where
         helpers::Knob { name: "backend",      value: cli.backend.to_string(),     is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "arity",        value: arity.to_string(),           is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
         helpers::Knob { name: "num_buckets",  value: num_buckets.to_string(),     is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "bucket_size",  value: cli.bucket_size.to_string(), is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "value_bits",   value: cli.value_bits.to_string(),  is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
-        helpers::Knob { name: "lwe_dim",      value: lwe_dim_eff.to_string(),     is_default: cli.lwe_dim.is_none() },
-        helpers::Knob { name: "batch",        value: cli.batch.to_string(),       is_default: matches.value_source("batch") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "bucket_size",    value: cli.bucket_size.to_string(),    is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "value_bits",     value: cli.value_bits.to_string(),     is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "plaintext_bits", value: cli.plaintext_bits.to_string(), is_default: matches.value_source("plaintext_bits") != Some(ValueSource::CommandLine) },
+        helpers::Knob { name: "lwe_dim",        value: lwe_dim_eff.to_string(),        is_default: cli.lwe_dim.is_none() },
+        helpers::Knob { name: "batch",          value: cli.batch.to_string(),          is_default: matches.value_source("batch") != Some(ValueSource::CommandLine) },
     ];
     helpers::print_preamble("client_decode", &knobs, &store_state, &geom);
 
@@ -185,8 +192,8 @@ where
 
     writeln!(
         csv,
-        "{},{arity},{num_buckets},{},{},{lwe_dim_eff},{},{:.2},{:.2},{:.2},{:.2},{cps},{row_width},{segment_rows},{:.4}",
-        cli.backend, cli.bucket_size, cli.value_bits, cli.batch,
+        "{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{:.2},{:.2},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
+        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits, cli.batch,
         crit.mean_ops_per_s, crit.min_ops_per_s, crit.max_ops_per_s, crit.stddev_ops_per_s,
         load_factor,
     ).unwrap();

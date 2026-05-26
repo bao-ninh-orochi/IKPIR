@@ -111,22 +111,29 @@ pub fn backend_default_lwe_dim(b: Backend) -> u32 {
     }
 }
 
-/// Per-segment `A`-matrix rows and `c` precomputed-decode vector length
-/// for the given backend, given the original `(n_rows_per_seg, row_width)`.
+/// Per-segment database matrix `D` shape `(rows, row_width)` for the
+/// given backend, given the original `(n_rows_per_seg, row_width)`.
 ///
 /// # Rationale
 ///
 /// Memory estimators in `classical_throughput` and `mutation_throughput`
-/// need the per-segment `A`-matrix shape (drives both the `A` allocation
-/// and the per-slot `b` vector size) and the prepared-slot `c`-vector
-/// length to estimate peak RAM. FrodoPIR keeps the original layout;
-/// SimplePIR reshapes into a near-square `(reshape_rows × reshape_row_width)`
-/// matrix with `k = max(1, round(√(n_rows_per_seg / row_width)))`. The
-/// formula mirrors `reshape_dims` in `ikpir-common/src/backend/simple/backend.rs`.
+/// need the per-segment `D` shape because every other LWE-PIR buffer
+/// derives its dimensions from it:
+/// - `A` is `rows × lwe_dim` — shares `D`'s row count, so `rows` drives
+///   the `A` allocation and the per-slot `b`-vector length
+///   (`b = A·s + e + Δ·u`, length `rows`).
+/// - `H = Aᵀ · D` is `lwe_dim × row_width` — shares `D`'s row width,
+///   so `row_width` drives the hint allocation and the prepared-slot
+///   `c`-vector length (`c = sᵀ · H`, length `row_width`).
+///
+/// FrodoPIR keeps the original layout; SimplePIR reshapes into a
+/// near-square `(reshape_rows × reshape_row_width)` matrix with
+/// `k = max(1, round(√(n_rows_per_seg / row_width)))`. The formula
+/// mirrors `reshape_dims` in `ikpir-common/src/backend/simple/backend.rs`.
 ///
 /// # Returns
 ///
-/// `(a_rows_per_seg, c_len_per_seg)`:
+/// `(d_rows_per_seg, d_row_width_per_seg)`:
 /// - FrodoPIR:  `(n_rows_per_seg, row_width)`
 /// - SimplePIR: `(⌈n_rows_per_seg / k⌉, k · row_width)`
 #[allow(dead_code)]
@@ -273,6 +280,53 @@ pub fn populate_until_full<S: MakeStore>(
             Err(e) => panic!("populate_until_full: {e:?}"),
         }
     }
+    (store, n_inserted)
+}
+
+/// Populate a fresh store with **exactly** `target_n` items, inserting keys
+/// `0,1,2,…` until the count is reached. Panics if `target_n` exceeds capacity
+/// or if cuckoo eviction fails before the target is reached. Used by the
+/// head-to-head bench (fixed N, schemes report their own DB size).
+#[allow(dead_code)]
+pub fn populate_exact_n_keys<S: MakeStore>(
+    num_buckets: u32,
+    bucket_size: u32,
+    fingerprint_bits: u32,
+    value_bits: u32,
+    plaintext_bits: u32,
+    target_n: u64,
+) -> (segmented_cuckoo::CuckooKVStore<S>, u64) {
+    let capacity = (num_buckets as u64) * (bucket_size as u64);
+    assert!(
+        target_n <= capacity,
+        "populate_exact_n_keys: target_n={target_n} > capacity={capacity} \
+         (num_buckets={num_buckets}, bucket_size={bucket_size})"
+    );
+    let mut store = S::make_store(num_buckets, bucket_size, fingerprint_bits, value_bits, plaintext_bits)
+        .expect("make_store");
+    store.set_max_kicks(2_500);
+    let vsize = (value_bits as usize).div_ceil(8);
+    let mut value = vec![0u8; vsize];
+    let mut n_inserted = 0u64;
+    let cap2 = capacity.saturating_mul(2);
+    for k in 0u64..cap2 {
+        if n_inserted >= target_n { break; }
+        let k32 = k as u32;
+        for (i, b) in value.iter_mut().enumerate() {
+            *b = (k32.wrapping_mul(17).wrapping_add(i as u32) & 0xFF) as u8;
+        }
+        match store.insert(k32.to_le_bytes(), &value) {
+            Ok(()) => n_inserted += 1,
+            Err(segmented_cuckoo::CuckooError::TableFull) =>
+                panic!("populate_exact_n_keys: TableFull at {n_inserted}/{target_n} \
+                        (capacity={capacity}); raise num_buckets or bucket_size"),
+            Err(e) => panic!("populate_exact_n_keys: {e:?} at {n_inserted}/{target_n}"),
+        }
+    }
+    assert!(
+        n_inserted == target_n,
+        "populate_exact_n_keys: inserted {n_inserted}/{target_n} (cuckoo eviction limit)"
+    );
     (store, n_inserted)
 }
 

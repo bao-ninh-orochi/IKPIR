@@ -1,5 +1,7 @@
 //! Shared bench helpers for ikpir-client benches.
-//! duplicated deliberately — see CLAUDE.md (same content lives in ikpir-server/benches/helpers.rs)
+//! Largely duplicated with `ikpir-server/benches/helpers.rs` (see CLAUDE.md).
+//! Exception: `verify_decode` lives only here — it round-trips through both
+//! client and server and would create a dev-dep cycle on the server side.
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -8,6 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use criterion::{Criterion, Throughput};
+use ikpir_client::{IkpirClient, IndexPirBackend};
+use ikpir_server::IkpirServer;
+use segmented_cuckoo::{IndexScheme, SchemeMeta};
 
 // ── CSV writer (append-aware) ───────────────────────────────────────────────
 
@@ -103,22 +108,29 @@ pub fn backend_default_lwe_dim(b: Backend) -> u32 {
     }
 }
 
-/// Per-segment `A`-matrix rows and `c` precomputed-decode vector length
-/// for the given backend, given the original `(n_rows_per_seg, row_width)`.
+/// Per-segment database matrix `D` shape `(rows, row_width)` for the
+/// given backend, given the original `(n_rows_per_seg, row_width)`.
 ///
 /// # Rationale
 ///
 /// Memory estimators in `classical_throughput` and `mutation_throughput`
-/// need the per-segment `A`-matrix shape (drives both the `A` allocation
-/// and the per-slot `b` vector size) and the prepared-slot `c`-vector
-/// length to estimate peak RAM. FrodoPIR keeps the original layout;
-/// SimplePIR reshapes into a near-square `(reshape_rows × reshape_row_width)`
-/// matrix with `k = max(1, round(√(n_rows_per_seg / row_width)))`. The
-/// formula mirrors `reshape_dims` in `ikpir-common/src/backend/simple/backend.rs`.
+/// need the per-segment `D` shape because every other LWE-PIR buffer
+/// derives its dimensions from it:
+/// - `A` is `rows × lwe_dim` — shares `D`'s row count, so `rows` drives
+///   the `A` allocation and the per-slot `b`-vector length
+///   (`b = A·s + e + Δ·u`, length `rows`).
+/// - `H = Aᵀ · D` is `lwe_dim × row_width` — shares `D`'s row width,
+///   so `row_width` drives the hint allocation and the prepared-slot
+///   `c`-vector length (`c = sᵀ · H`, length `row_width`).
+///
+/// FrodoPIR keeps the original layout; SimplePIR reshapes into a
+/// near-square `(reshape_rows × reshape_row_width)` matrix with
+/// `k = max(1, round(√(n_rows_per_seg / row_width)))`. The formula
+/// mirrors `reshape_dims` in `ikpir-common/src/backend/simple/backend.rs`.
 ///
 /// # Returns
 ///
-/// `(a_rows_per_seg, c_len_per_seg)`:
+/// `(d_rows_per_seg, d_row_width_per_seg)`:
 /// - FrodoPIR:  `(n_rows_per_seg, row_width)`
 /// - SimplePIR: `(⌈n_rows_per_seg / k⌉, k · row_width)`
 #[allow(dead_code)]
@@ -292,6 +304,121 @@ pub fn populate_to_load<S: MakeStore>(
         }
     }
     (store, n_inserted)
+}
+
+/// Populate a fresh store with **exactly** `target_n` items, inserting keys
+/// `0,1,2,…` until the count is reached. Panics if `target_n` exceeds capacity
+/// or if cuckoo eviction fails before the target is reached. Used by the
+/// head-to-head bench (fixed N, schemes report their own DB size).
+#[allow(dead_code)]
+pub fn populate_exact_n_keys<S: MakeStore>(
+    num_buckets: u32,
+    bucket_size: u32,
+    fingerprint_bits: u32,
+    value_bits: u32,
+    plaintext_bits: u32,
+    target_n: u64,
+) -> (segmented_cuckoo::CuckooKVStore<S>, u64) {
+    let capacity = (num_buckets as u64) * (bucket_size as u64);
+    assert!(
+        target_n <= capacity,
+        "populate_exact_n_keys: target_n={target_n} > capacity={capacity} \
+         (num_buckets={num_buckets}, bucket_size={bucket_size})"
+    );
+    let mut store = S::make_store(num_buckets, bucket_size, fingerprint_bits, value_bits, plaintext_bits)
+        .expect("make_store");
+    store.set_max_kicks(2_500);
+    let vsize = (value_bits as usize).div_ceil(8);
+    let mut value = vec![0u8; vsize];
+    let mut n_inserted = 0u64;
+    let cap2 = capacity.saturating_mul(2);
+    for k in 0u64..cap2 {
+        if n_inserted >= target_n { break; }
+        let k32 = k as u32;
+        for (i, b) in value.iter_mut().enumerate() {
+            *b = (k32.wrapping_mul(17).wrapping_add(i as u32) & 0xFF) as u8;
+        }
+        match store.insert(k32.to_le_bytes(), &value) {
+            Ok(()) => n_inserted += 1,
+            Err(segmented_cuckoo::CuckooError::TableFull) =>
+                panic!("populate_exact_n_keys: TableFull at {n_inserted}/{target_n} \
+                        (capacity={capacity}); raise num_buckets or bucket_size"),
+            Err(e) => panic!("populate_exact_n_keys: {e:?} at {n_inserted}/{target_n}"),
+        }
+    }
+    assert!(
+        n_inserted == target_n,
+        "populate_exact_n_keys: inserted {n_inserted}/{target_n} (cuckoo eviction limit)"
+    );
+    (store, n_inserted)
+}
+
+// ── Decode sanity check ─────────────────────────────────────────────────────
+
+/// Compute the value bytes that the `populate_*` helpers wrote for `key`.
+///
+/// All three population helpers use the same deterministic formula:
+/// `value[i] = (key * 17 + i) & 0xFF`. Mirror it here so the read-bench
+/// sanity check can verify a decoded value matches what was inserted.
+#[allow(dead_code)]
+pub fn populate_value_for_key(key: u32, value_bits: u32) -> Vec<u8> {
+    let vsize = (value_bits as usize).div_ceil(8);
+    (0..vsize)
+        .map(|i| (key.wrapping_mul(17).wrapping_add(i as u32) & 0xFF) as u8)
+        .collect()
+}
+
+/// Once-per-config decode sanity check.
+///
+/// Runs one untimed `build_query` → `server.answer` → `client.decode` round
+/// trip for `test_key` and panics if the recovered bytes differ from
+/// `populate_value_for_key(test_key, value_bits)`. Catches packing /
+/// cells_per_slot / hint-mismatch regressions that would otherwise return
+/// `Ok(Some(garbage))` and silently bias the bench output. The recovered
+/// query slot ends up in `client.in_flight`; the first `build_query` of the
+/// subsequent timed loop discards it (one wasted slot, no timing impact).
+#[allow(dead_code)]
+pub fn verify_decode<B, S>(
+    client:     &mut IkpirClient<B>,
+    server:     &IkpirServer<S, B>,
+    test_key:   u32,
+    value_bits: u32,
+)
+where
+    S: IndexScheme + SchemeMeta,
+    B: IndexPirBackend,
+    B::Query:    Clone,
+    B::Response: Clone,
+{
+    let key_bytes = test_key.to_le_bytes();
+    let q        = client.build_query(&key_bytes);
+    let r        = server.answer(&q).expect("verify_decode: server.answer");
+    let decoded  = client.decode(&key_bytes, &r).expect("verify_decode: client.decode");
+    let expected = populate_value_for_key(test_key, value_bits);
+    match decoded {
+        Some(ref v) if v == &expected => {
+            println!(
+                "  decode sanity OK (key={test_key}, vsize={} B)",
+                expected.len()
+            );
+        }
+        Some(v) => {
+            let first_diff = v.iter().zip(expected.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(usize::min(v.len(), expected.len()));
+            panic!(
+                "verify_decode FAILED for key={test_key}: decoded len={} expected len={}; \
+                 first diff at idx={first_diff}: got=0x{:02x} expected=0x{:02x}",
+                v.len(), expected.len(),
+                v.get(first_diff).copied().unwrap_or(0),
+                expected.get(first_diff).copied().unwrap_or(0),
+            );
+        }
+        None => panic!(
+            "verify_decode FAILED for key={test_key}: decode returned None \
+             (key missing from store or fingerprint mismatch)"
+        ),
+    }
 }
 
 // ── Criterion throughput helper ──────────────────────────────────────────────

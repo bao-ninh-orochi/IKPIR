@@ -88,9 +88,10 @@ cargo bench -p ikpir-server --bench <name> -- --help
 ### Orchestrator sweep
 
 `ikpir-server/scripts/run_benches.sh` sweeps the full paper config matrix
-(20 configs × 3 value\_bits = 60 runs per bench; mutation bench × 7
-N\_mutations = 420 runs). The orchestrator removes the CSV before each
-sweep and re-runs per backend set in `IKPIR_BENCH_BACKENDS`.
+(12 configs × 3 value\_bits = 36 runs per bench; the mutation bench
+reuses the same 12 configs × 3 value\_bits = 36 runs, with N\_mutations
+derived per config as capacity / 100). The orchestrator removes the CSV
+before each sweep and re-runs per backend set in `IKPIR_BENCH_BACKENDS`.
 
 ```bash
 # Server benches only, FrodoPIR.
