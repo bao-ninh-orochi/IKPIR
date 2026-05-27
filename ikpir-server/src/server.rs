@@ -33,6 +33,7 @@
 //! - `backend/mod.rs` — `IndexPirBackend` / `IncrementalPirBackend`
 //!   trait contract.
 
+use rayon::prelude::*;
 use segmented_cuckoo::{
     CuckooError, CuckooKVStore, CuckooParams, IndexScheme, SchemeMeta, Segmented2aryScheme,
     Segmented3aryScheme, Segmented4aryScheme,
@@ -136,24 +137,33 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         let pb           = params.plaintext_bits;
         let seg_cells    = segment_size as usize * row_width as usize;
 
+        // Per-segment setups are independent and CPU-bound — run them on the
+        // shared rayon pool so the dominant `compute_hint` cost (already
+        // parallelised internally) composes via work-stealing rather than
+        // serialising across segments.
+        let triples: Vec<(B::ServerParams, B::HintMaterial, B::Hint)> = {
+            let cells = store.as_cells();
+            (0..arity)
+                .into_par_iter()
+                .map(|j| {
+                    let start = j * seg_cells;
+                    B::server_setup(
+                        &backend_config,
+                        &cells[start..start + seg_cells],
+                        segment_size,
+                        row_width,
+                        pb,
+                    )
+                })
+                .collect()
+        };
         let mut backend_params        = Vec::with_capacity(arity);
         let mut backend_hint_material = Vec::with_capacity(arity);
         let mut hints                 = Vec::with_capacity(arity);
-        {
-            let cells = store.as_cells();
-            for j in 0..arity {
-                let start = j * seg_cells;
-                let (sp, mat, h) = B::server_setup(
-                    &backend_config,
-                    &cells[start..start + seg_cells],
-                    segment_size,
-                    row_width,
-                    pb,
-                );
-                backend_params.push(sp);
-                backend_hint_material.push(Some(mat));
-                hints.push(h);
-            }
+        for (sp, mat, h) in triples {
+            backend_params.push(sp);
+            backend_hint_material.push(Some(mat));
+            hints.push(h);
         }
         let mut s = Self {
             store, params, backend_config, backend_params, backend_hint_material, hints, epoch: 0,
@@ -298,18 +308,25 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         // Snapshot to avoid a borrow conflict with self.backend_params / self.hints writes.
         let cells: Vec<u32> = self.store.as_cells().to_vec();
 
+        // Per-segment setups in parallel — same pattern as `Self::new`.
+        let backend_config = &self.backend_config;
+        let triples: Vec<(B::ServerParams, B::HintMaterial, B::Hint)> = (0..arity)
+            .into_par_iter()
+            .map(|j| {
+                let start = j * seg_cells;
+                B::server_setup(
+                    backend_config,
+                    &cells[start..start + seg_cells],
+                    segment_size,
+                    row_width,
+                    pb,
+                )
+            })
+            .collect();
         let mut backend_params        = Vec::with_capacity(arity);
         let mut backend_hint_material = Vec::with_capacity(arity);
         let mut hints                 = Vec::with_capacity(arity);
-        for j in 0..arity {
-            let start = j * seg_cells;
-            let (sp, mat, h) = B::server_setup(
-                &self.backend_config,
-                &cells[start..start + seg_cells],
-                segment_size,
-                row_width,
-                pb,
-            );
+        for (sp, mat, h) in triples {
             backend_params.push(sp);
             backend_hint_material.push(Some(mat));
             hints.push(h);

@@ -82,7 +82,9 @@ struct Cli {
     #[arg(long, default_value_t = 64)]     batch: u32,
     /// Skip configs whose estimated peak memory exceeds this limit. See
     /// `classical_throughput.rs` for the dominant terms; this guard mirrors it.
-    #[arg(long, default_value_t = 12.0)]   max_mem_gb: f64,
+    /// Default 85.0 is tuned for a ~96 GB server; lower
+    /// `--max-mem-gb` on smaller machines.
+    #[arg(long, default_value_t = 85.0)]   max_mem_gb: f64,
 }
 
 fn effective_lwe_dim(cli: &Cli) -> u32 {

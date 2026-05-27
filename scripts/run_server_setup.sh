@@ -5,7 +5,7 @@
 #   ./scripts/run_server_setup.sh                    # FrodoPIR only (default)
 #   IKPIR_BENCH_BACKENDS=simple       ./scripts/run_server_setup.sh
 #   IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_server_setup.sh  # both backends
-#   MAX_MEM_GB=20.0 ./scripts/run_server_setup.sh   # raise OOM guard (default 12 GB)
+#   MAX_MEM_GB=20.0 ./scripts/run_server_setup.sh   # override OOM guard (default 85 GB)
 #
 # Memory: dominant cost is the per-segment LWE public matrix A, summed across
 # segments to ≈ num_buckets × lwe_dim × 4 B.  After the HintMaterial refactor
@@ -18,8 +18,8 @@
 # over-skip large SimplePIR configs that would actually fit; if SimplePIR runs
 # need to cover the largest configs, run via `scripts/run_classical.sh`
 # instead (its in-bench guard is backend-aware).  The bench skips any config
-# whose estimated peak exceeds MAX_MEM_GB (default 12.0).  Raise it if your
-# machine has 32 GB+ RAM.
+# whose estimated peak exceeds MAX_MEM_GB (default 85.0; tuned for ~96 GB
+# servers — lower on smaller machines).
 #
 # Config matrix (scripts/configs.sh):
 #   12 (arity, bucket_size, num_buckets) tuples × 3 value_bits = 36 runs/backend
@@ -56,7 +56,7 @@ note()         { echo -e "${YELLOW}  $*${RESET}"; }
 ok()           { echo -e "${GREEN}  $*${RESET}"; }
 backend_note() { echo -e "${MAGENTA}▶ backend=$1${RESET}"; }
 
-MAX_MEM_GB=${MAX_MEM_GB:-12.0}
+MAX_MEM_GB=${MAX_MEM_GB:-85.0}
 MAX_MEM_BYTES=$(awk "BEGIN { printf \"%d\", $MAX_MEM_GB * 1e9 }")
 
 CARGO=(cargo bench -p ikpir-server --bench server_setup)

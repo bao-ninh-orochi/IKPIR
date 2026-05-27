@@ -54,7 +54,7 @@
 //! `--lwe-dim` (backend-dependent default), `--n-mutations` (default
 //! 1024), `--load-factor` (default 0.90, matches
 //! `MUTATION_LOAD_FACTOR` in `scripts/configs.sh`),
-//! `--max-mem-gb` (default 12.0; same OOM guard as
+//! `--max-mem-gb` (default 85.0; same OOM guard as
 //! `classical_throughput`).
 //!
 //! **Output:** Two CSV files with the same schemas as the individual
@@ -132,8 +132,9 @@ struct Cli {
     /// empty-queue mode (no `precompute_queries` / `precompute_decodes`),
     /// so no large prepared-query queue coexists with `A`. Peak coexisting
     /// `A` copies is therefore 1 (server during mutations, then the
-    /// client during apply_delta). Raise on machines with ≥ 32 GB RAM.
-    #[arg(long, default_value_t = 12.0)]   max_mem_gb: f64,
+    /// client during apply_delta). Default 85.0 is tuned for a ~96 GB
+    /// server; lower `--max-mem-gb` on smaller machines.
+    #[arg(long, default_value_t = 85.0)]   max_mem_gb: f64,
 }
 
 fn effective_lwe_dim(cli: &Cli) -> u32 {

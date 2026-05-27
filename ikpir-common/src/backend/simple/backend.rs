@@ -48,6 +48,8 @@
 use std::collections::VecDeque;
 
 use rand::RngCore;
+use rayon::prelude::*;
+use wide::u32x8;
 
 use super::{
     SimpleConfig, SimpleParams, round_p_to_q, round_q_to_p, sample_a,
@@ -567,18 +569,26 @@ impl PrecomputingPirBackend for SimplePirBackend {
 /// where `R` indexes reshape rows and `off` indexes the
 /// `reshape_row_width`-wide column space.
 ///
-/// # Rationale
+/// # Parallelism / SIMD
 ///
-/// Loop nest is `r, k_idx, j` over the **original** `(n_rows, lwe_dim,
-/// row_width)` shape so the flat `db` slice is read sequentially per
-/// original row. Each original row contributes to a `row_width`-wide
-/// sub-segment of one reshape row, starting at `off_within = (r % k) *
-/// row_width`. The `aik == 0` early-exit is a sparsity shortcut on the
-/// public matrix `A` (safe to branch on since `A` is public). With `A`
-/// sampled uniformly over `Z_q` via ChaCha20, this branch fires only
-/// when ChaCha20 produces a literal zero `u32` — i.e. ~2⁻³² of cells,
-/// so the early-exit is effectively dead code on the hot path but
-/// retained for parity with FrodoPIR's `compute_hint`.
+/// `H` is tiled across rows: each task owns `CHUNK_ROWS` consecutive
+/// output rows via [`rayon::slice::ParallelSliceMut::par_chunks_mut`].
+/// No thread-local accumulator and no final reduction — each task
+/// writes only to its own slice of `H`. This is essential at SimplePIR
+/// scale where a full `H` is ≈ 5.9 MB per segment; the previous
+/// accumulator-per-worker pattern thrashed L2 once worker count
+/// exceeded 2 and erased the parallel gains entirely.
+///
+/// The loop nest is restructured to `(reshape_row, k_idx, r_within, j)`
+/// so the integer division and modulo on `r` (in the original `(r,
+/// k_idx, j)` layout) are lifted out of the hot loop. The innermost
+/// `j` axpy is vectorised with `wide::u32x8`; a scalar tail handles
+/// `row_width % 8`. The `aik == 0` short-circuit from FrodoPIR is
+/// dropped — SimplePIR samples `A` uniformly over `Z_q`, so the branch
+/// fires only ~2⁻³² of the time and only costs a misprediction.
+///
+/// Tiling over rows of `H` is deterministic, so output is bit-identical
+/// to a sequential walk regardless of worker count.
 ///
 /// # Complexity
 ///
@@ -598,25 +608,70 @@ fn compute_hint(
     let row_width_us         = row_width as usize;
     let reshape_row_width_us = reshape_row_width as usize;
     let k_us                 = k as usize;
+    let n_rows_us            = n_rows as usize;
+    let reshape_rows_us      = n_rows_us.div_ceil(k_us);
     let mut h = vec![0u32; lwe_dim_us * reshape_row_width_us];
 
-    for r in 0..n_rows as usize {
-        let reshape_row = r / k_us;
-        let off_within  = (r % k_us) * row_width_us;
-        let a_row = &a[reshape_row * lwe_dim_us..(reshape_row + 1) * lwe_dim_us];
-        let d_row = &db[r * row_width_us..(r + 1) * row_width_us];
-        for k_idx in 0..lwe_dim_us {
-            let aik = a_row[k_idx];
-            if aik == 0 { continue; }
-            let h_row = &mut h[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
-            for j in 0..row_width_us {
-                h_row[off_within + j] =
-                    h_row[off_within + j].wrapping_add(aik.wrapping_mul(d_row[j]));
+    h.par_chunks_mut(CHUNK_ROWS * reshape_row_width_us)
+        .enumerate()
+        .for_each(|(chunk_idx, h_chunk)| {
+            let k_start = chunk_idx * CHUNK_ROWS;
+            let k_count = h_chunk.len() / reshape_row_width_us; // last chunk may be shorter
+            for reshape_row in 0..reshape_rows_us {
+                let a_row = &a[reshape_row * lwe_dim_us..(reshape_row + 1) * lwe_dim_us];
+                let r_start = reshape_row * k_us;
+                let r_end   = ((reshape_row + 1) * k_us).min(n_rows_us);
+                for k_off in 0..k_count {
+                    let aik = a_row[k_start + k_off];
+                    let h_row = &mut h_chunk
+                        [k_off * reshape_row_width_us..(k_off + 1) * reshape_row_width_us];
+                    for r in r_start..r_end {
+                        let off_within = (r - r_start) * row_width_us;
+                        let d_row = &db[r * row_width_us..(r + 1) * row_width_us];
+                        simd_axpy_u32(
+                            &mut h_row[off_within..off_within + row_width_us],
+                            aik,
+                            d_row,
+                        );
+                    }
+                }
             }
-        }
-    }
+        });
     h
 }
+
+/// Output rows of `H` per parallel task. Same constant as in the
+/// FrodoPIR backend; duplicated per project convention (no shared arith
+/// helpers across backends).
+const CHUNK_ROWS: usize = 8;
+
+/// `h[j] += scalar * d[j]` over `u32` with wrapping arithmetic, for all `j`.
+///
+/// SIMD body processes 8 lanes per iteration via `wide::u32x8` (whose
+/// `Mul`/`Add` impls wrap mod 2³², matching `u32::wrapping_mul` /
+/// `wrapping_add`). The scalar tail keeps callers with `row_width % 8 != 0`
+/// correct. Duplicated from the FrodoPIR module per the project rule
+/// that backend modules do not share arith helpers.
+#[inline(always)]
+fn simd_axpy_u32(h: &mut [u32], scalar: u32, d: &[u32]) {
+    debug_assert_eq!(h.len(), d.len());
+    let s = u32x8::splat(scalar);
+    let mut idx = 0;
+    while idx + 8 <= h.len() {
+        let mut d_buf = [0u32; 8];
+        d_buf.copy_from_slice(&d[idx..idx + 8]);
+        let mut h_buf = [0u32; 8];
+        h_buf.copy_from_slice(&h[idx..idx + 8]);
+        let v = u32x8::new(h_buf) + u32x8::new(d_buf) * s;
+        let out: [u32; 8] = v.into();
+        h[idx..idx + 8].copy_from_slice(&out);
+        idx += 8;
+    }
+    for j in idx..h.len() {
+        h[j] = h[j].wrapping_add(scalar.wrapping_mul(d[j]));
+    }
+}
+
 
 /// Wire-size accounting for SimplePIR.
 ///

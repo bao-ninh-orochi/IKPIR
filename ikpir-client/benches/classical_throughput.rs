@@ -87,8 +87,9 @@ struct Cli {
     /// dominant term is the FrodoPIR A matrix (segment_rows × lwe_dim × 4 B
     /// per segment), held simultaneously by the server and by each client state
     /// created from the setup bundle. Protects against SIGKILL from the OS OOM
-    /// killer. Raise on machines with ≥ 32 GB RAM (e.g. --max-mem-gb 24.0).
-    #[arg(long, default_value_t = 12.0)]   max_mem_gb: f64,
+    /// killer. Default 85.0 is tuned for a ~96 GB server; lower
+    /// `--max-mem-gb` on smaller machines.
+    #[arg(long, default_value_t = 85.0)]   max_mem_gb: f64,
 }
 
 fn effective_lwe_dim(cli: &Cli) -> u32 {

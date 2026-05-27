@@ -10,13 +10,13 @@
 #   ./scripts/run_headtohead.sh                    # FrodoPIR only (default)
 #   IKPIR_BENCH_BACKENDS=simple       ./scripts/run_headtohead.sh
 #   IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_headtohead.sh  # both backends
-#   MAX_MEM_GB=20.0 ./scripts/run_headtohead.sh    # raise OOM guard (default 12 GB)
+#   MAX_MEM_GB=20.0 ./scripts/run_headtohead.sh    # override OOM guard (default 85 GB)
 #
 # Memory: same dominant terms as run_classical.sh (per-segment LWE matrix A,
 # pre-built queries Vec). The in-bench estimator
 # (headtohead_throughput.rs) accounts for table + A + queries Vec and skips
-# any config whose estimated peak exceeds MAX_MEM_GB (default 12.0). Raise it
-# on 32 GB+ machines.
+# any config whose estimated peak exceeds MAX_MEM_GB (default 85.0; tuned
+# for ~96 GB servers — lower on smaller machines).
 #
 # Config matrix (scripts/configs.sh::HEADTOHEAD_CONFIGS):
 #   10 (num_keys, arity, bucket_size, num_buckets) tuples × 3 value_bits
@@ -57,7 +57,7 @@ note()         { echo -e "${YELLOW}  $*${RESET}"; }
 ok()           { echo -e "${GREEN}  $*${RESET}"; }
 backend_note() { echo -e "${MAGENTA}▶ backend=$1${RESET}"; }
 
-MAX_MEM_GB=${MAX_MEM_GB:-12.0}
+MAX_MEM_GB=${MAX_MEM_GB:-85.0}
 
 CARGO=(cargo bench -p ikpir-client --bench headtohead_throughput)
 

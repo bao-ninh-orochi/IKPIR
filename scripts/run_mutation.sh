@@ -10,7 +10,7 @@
 #   ./scripts/run_mutation.sh                                    # FrodoPIR only (default)
 #   IKPIR_BENCH_BACKENDS=simple       ./scripts/run_mutation.sh
 #   IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_mutation.sh  # both backends
-#   MAX_MEM_GB=20.0 ./scripts/run_mutation.sh   # raise OOM guard (default 12 GB)
+#   MAX_MEM_GB=20.0 ./scripts/run_mutation.sh   # override OOM guard (default 85 GB)
 #
 # Memory: dominant allocation is the per-segment LWE public matrix A (in
 # B::HintMaterial). After the HintMaterial refactor setup() no longer ships
@@ -28,7 +28,7 @@
 #
 # The in-bench estimator (mutation_throughput.rs) accounts for table + A
 # and skips any config whose estimated peak exceeds MAX_MEM_GB
-# (default 12.0). Raise it on 32 GB+ machines.
+# (default 85.0; tuned for ~96 GB servers — lower on smaller machines).
 #
 # Config matrix (scripts/configs.sh):
 #   12 (arity, bucket_size, num_buckets) BENCH_CONFIGS × 3 value_bits
@@ -79,7 +79,7 @@ note()         { echo -e "${YELLOW}  $*${RESET}"; }
 ok()           { echo -e "${GREEN}  $*${RESET}"; }
 backend_note() { echo -e "${MAGENTA}▶ backend=$1${RESET}"; }
 
-MAX_MEM_GB=${MAX_MEM_GB:-12.0}
+MAX_MEM_GB=${MAX_MEM_GB:-85.0}
 
 CARGO=(cargo bench -p ikpir-client --bench mutation_throughput)
 
