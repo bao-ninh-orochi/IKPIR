@@ -21,8 +21,6 @@ workspace = true
 segmented-cuckoo = { workspace = true }
 rand             = { workspace = true }
 rand_chacha      = { workspace = true }
-rayon            = { workspace = true }
-wide             = { workspace = true }
 
 [package.metadata.docs.rs]
 all-features = true

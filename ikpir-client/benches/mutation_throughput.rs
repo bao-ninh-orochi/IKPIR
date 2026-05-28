@@ -1,49 +1,51 @@
 //! **Intent:** Measure server-side `insert / update / delete` throughput
 //! *and* client-side `apply_delta` throughput in a single bench process so
 //! the expensive `populate_to_load` and `IkpirServer::new` are paid once
-//! per kind instead of once for each side.
+//! per (config, backend) and shared across both sides and all three kinds.
 //!
 //! **Motivation:** Today `server_mutation` and `client_mutation` each
 //! independently populate the KV store and construct a fresh
 //! `IkpirServer` per mutation kind. At paper-scale configs that's 7
 //! expensive `IkpirServer::new` calls per (config, backend) — 3 in the
 //! server bench, 4 in the client bench. The hint-matrix preprocessing
-//! that fires inside `new` dominates wall-clock cost (30–120 s per
-//! call). This bench fuses both measurements: for each kind we
-//! construct *one* fresh server, time the mutation loop while
-//! collecting the deltas, then build a fresh empty-queue client from a
-//! captured setup bundle and time `apply_delta` over the very same
-//! deltas. Total expensive setups per config drops 7 → 3.
+//! (`H = Aᵀ·D`) that fires inside `new` dominates wall-clock cost
+//! (30–120 s per call). This bench fuses both measurements **and**
+//! collapses setup to a single `IkpirServer::new` per (config, backend):
+//! all three kinds replay against the same epoch-0 snapshot, so they
+//! share one `(seed, A, H)` triple. We build the server once and return
+//! it to epoch 0 between kinds via `IkpirServer::reset_for_replay`
+//! (which swaps in a fresh snapshot store and restores the epoch-0 hint
+//! without recomputing `A` or `H`). Total expensive setups per config
+//! drops 7 → 1.
 //!
 //! **Method:** Populate to `--load-factor` once and snapshot the cells.
-//! For each kind (insert / update / delete):
-//!   1. Clone the cells, build a fresh `IkpirServer` (fresh random seed
-//!      → fresh `A`, fresh hint `H = Aᵀ·D`).
-//!   2. Call `server.setup()` to capture this kind's epoch-0
-//!      `ServerSetupBundle` (small — params + hint clones; no `A` on
-//!      the wire after the HintMaterial refactor). The bundle is
-//!      captured **per kind**, not shared across kinds, so the client
-//!      built in step 4 tracks this kind's server's exact `(seed, A, H)`
-//!      and the post-`apply_delta` client hint equals the server's
-//!      post-mutation hint bit-for-bit.
-//!   3. Wall-clock time the N-mutation loop on the server, collecting
-//!      each returned `HintDeltaBundle`.
-//!   4. Build a fresh client from the captured bundle, with an **empty
-//!      prepared-query queue** (no `precompute_queries` / `precompute_decodes`).
-//!      Each `apply_delta` then patches only the hint `H`; the
-//!      queue-iteration inside `client_patch_state` is a no-op. This
-//!      isolates the "compute new hint" cost from any warm-bc
-//!      queue-maintenance overhead.
-//!   5. Wall-clock time the N `apply_delta` calls on those collected
-//!      deltas.
-//!   6. Drop client + server before the next kind so peak live
-//!      A-matrix copies stay at the 1-copy budget the memory guard
-//!      accounts for. `run_server_kind` keeps `A` resident throughout
-//!      the mutation loop (no `drop_hint_material` call), so all N
-//!      mutations reuse the original allocation and no re-expansion
-//!      bias creeps into `server_total_ms`. The server is dropped at
-//!      function return — before the client is built — so peak
-//!      coexisting `A` copies is 1.
+//! Build *one* `IkpirServer` (one random seed → one `A`, one hint
+//! `H = Aᵀ·D`) and capture its epoch-0 `ServerSetupBundle` once (small —
+//! params + hint clones; no `A` on the wire after the HintMaterial
+//! refactor). That single bundle is reused for every kind's client: the
+//! shared `(seed, A, H)` triple means each kind's post-`apply_delta`
+//! client hint equals that kind's post-mutation server hint
+//! bit-for-bit. Then in two phases:
+//!
+//! *Phase 1 (server, one resident `A`):* for each kind (insert / update
+//! / delete), return the server to epoch 0 (`reset_for_replay`, skipped
+//! for the first kind) and wall-clock time the N-mutation loop,
+//! collecting each returned `HintDeltaBundle`. `A` stays resident across
+//! the loop (no `drop_hint_material`), so all N mutations reuse the
+//! original allocation and no re-expansion bias creeps into
+//! `server_total_ms`. Keeping one server alive across kinds holds peak
+//! coexisting `A` copies at 1 for the whole phase.
+//!
+//! *Phase 2 (client, one resident `A` at a time):* drop the server
+//! (freeing its `A`) and the snapshot cells, then for each kind build a
+//! fresh client from the shared bundle with an **empty prepared-query
+//! queue** (no `precompute_queries` / `precompute_decodes`) and
+//! wall-clock time the N `apply_delta` calls over that kind's deltas.
+//! Each `apply_delta` patches only the hint `H`; the queue-iteration
+//! inside `client_patch_state` is a no-op when the queue is empty, so
+//! the timing isolates the "compute new hint" cost from warm-bc
+//! queue-maintenance overhead. Because the server is dropped before any
+//! client is built, peak coexisting `A` copies is 1 here too.
 //!
 //! Wall-clock batch timing is used (not Criterion) for both sides,
 //! because each mutation advances the server epoch / mutates state, so
@@ -81,7 +83,7 @@ use ikpir_client::{
 };
 use ikpir_server::{IkpirError, IkpirServer};
 use segmented_cuckoo::{
-    CuckooParams, Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
+    Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
 };
 use std::io::Write;
 use std::time::Instant;
@@ -125,15 +127,16 @@ struct Cli {
     /// dominant term is the LWE public matrix `A` (segment_rows × lwe_dim
     /// × 4 B per segment), held by `B::HintMaterial`. After the
     /// HintMaterial refactor the captured setup bundle no longer carries
-    /// `A`. `run_server_kind` keeps `A` resident throughout its mutation
-    /// loop (no `drop_hint_material` — that would re-expand `A` on the
-    /// first mutation and bias the timing) and the server drops at
-    /// function return, before the client is built. The client runs in
-    /// empty-queue mode (no `precompute_queries` / `precompute_decodes`),
+    /// `A`. One server is built per config and kept resident across all
+    /// three kinds' mutation loops (Phase 1; no `drop_hint_material` — that
+    /// would re-expand `A` on the first mutation and bias the timing),
+    /// then dropped before any client is built (Phase 2). The client runs
+    /// in empty-queue mode (no `precompute_queries` / `precompute_decodes`),
     /// so no large prepared-query queue coexists with `A`. Peak coexisting
-    /// `A` copies is therefore 1 (server during mutations, then the
-    /// client during apply_delta). Default 85.0 is tuned for a ~96 GB
-    /// server; lower `--max-mem-gb` on smaller machines.
+    /// `A` copies is therefore 1 (the single server during all mutation
+    /// loops, then one client at a time during apply_delta). Default 85.0
+    /// is tuned for a ~96 GB server; lower `--max-mem-gb` on smaller
+    /// machines.
     #[arg(long, default_value_t = 85.0)]   max_mem_gb: f64,
 }
 
@@ -155,27 +158,29 @@ struct KindResult<B: IndexPirBackend> {
     delta_bytes_total: usize,
 }
 
-/// Run N mutations of `kind` on a fresh server cloned from `cells`,
-/// timing only the mutation loop. Returns the collected deltas plus the
-/// epoch-0 setup bundle from this kind's own server so the caller can
-/// feed them into a matching client-side measurement.
+/// Run N mutations of `kind` on a server already sitting at a fresh
+/// epoch-0 snapshot, timing only the mutation loop. Returns the collected
+/// deltas plus throughput counters.
 ///
 /// # Rationale
 ///
-/// The bundle is captured per-kind (not once-then-reused) so the client
-/// built from it shares this kind's server's `(seed, A, hint)` triple
-/// exactly. apply_delta on the kind's deltas then yields a
-/// self-consistent client state — same hint as the server would reach
-/// after applying the same mutations. The cost is one extra `server.setup()`
-/// per kind (a cheap clone of params/hints, NOT a re-derivation of `A`).
-fn run_server_kind<S, B>(
-    cli:         &Cli,
-    cells:       &[u32],
-    params:      CuckooParams,
-    n_seed:      u64,
-    kind:        MutationKind,
-    make_config: &impl Fn() -> B::Config,
-) -> (KindResult<B>, ikpir_client::ServerSetupBundle<B>)
+/// The caller builds the server **once** per config (paying
+/// `IkpirServer::new`'s `H = Aᵀ·D` matmul a single time) and returns it to
+/// epoch 0 before each kind via [`IkpirServer::reset_for_replay`]. All
+/// three kinds therefore share one `(seed, A, epoch-0 hint)` triple, so the
+/// single `ServerSetupBundle` captured by the caller matches every kind's
+/// server step-for-step — apply_delta on a kind's deltas yields a
+/// self-consistent client whose post-mutation hint equals the server's.
+///
+/// `A` stays resident throughout the loop (the caller does not
+/// `drop_hint_material`), so all N mutations reuse the original allocation
+/// and no re-expansion bias creeps into `server_total_ms`.
+fn run_kind_loop<S, B>(
+    server: &mut IkpirServer<S, B>,
+    cli:    &Cli,
+    n_seed: u64,
+    kind:   MutationKind,
+) -> KindResult<B>
 where
     S: CloneStore,
     B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
@@ -183,26 +188,6 @@ where
     let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
 
-    let mut store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
-    // `from_cells` resets `max_kicks` to `MAX_KICKS_DEFAULT` (500); restore the
-    // 2_500 budget the populate helper used so the timed insert loop runs with
-    // the same cuckoo-eviction headroom as the populate phase. Without this,
-    // inserts at near-full load hit `TableFull` ~5× sooner than they would in
-    // a consistent deployment, biasing the throughput downward.
-    store.set_max_kicks(2_500);
-    let mut server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
-
-    // Capture the epoch-0 bundle BEFORE any mutation. This kind's deltas
-    // (collected below) will be applied to a client built from this
-    // bundle, so the client tracks this kind's server step-for-step.
-    let bundle = server.setup();
-
-    // NOTE: do NOT call `server.drop_hint_material()` here. Dropping the
-    // matrix forces `commit_mutations` to re-expand it from the seed on
-    // the first mutation, which biases `server_total_ms` (especially at
-    // small N). The server is dropped at function return anyway, before
-    // the client is built — peak coexisting `A` copies stays at 1 either
-    // way (see the Memory guard below).
     let mut deltas: Vec<HintDeltaBundle<B>> = Vec::with_capacity(cli.n_mutations as usize);
     let mut delta_bytes_total = 0usize;
     let mut n_succeeded = 0u32;
@@ -236,11 +221,7 @@ where
         }
     }
     let server_total_ms = t.elapsed().as_secs_f64() * 1e3;
-
-    (
-        KindResult { deltas, n_succeeded, server_total_ms, delta_bytes_total },
-        bundle,
-    )
+    KindResult { deltas, n_succeeded, server_total_ms, delta_bytes_total }
 }
 
 fn run_one<S, B>(
@@ -264,15 +245,15 @@ where
     // ── 0. Memory guard ─────────────────────────────────────────────────────────
     // Dominant allocation is the per-segment LWE public matrix `A` (in
     // `B::HintMaterial`). After the HintMaterial refactor `setup()` no
-    // longer ships `A` over the wire. `run_server_kind` keeps `A`
-    // resident for the whole mutation loop (no `drop_hint_material` call
-    // — otherwise the first `commit_mutations` would silently re-expand
-    // `A` and bias the timing). The server drops at function return, so
-    // the client built inside `measure_and_write` is the only `A` holder
-    // during apply_delta: peak coexisting `A` copies = 1. The client
-    // runs in empty-queue mode (no `precompute_queries` /
-    // `precompute_decodes`), so no large prepared-query queue coexists
-    // with `A`.
+    // longer ships `A` over the wire. One server is built per config and
+    // kept resident across all three kinds' mutation loops (Phase 1; no
+    // `drop_hint_material` call — otherwise the first `commit_mutations`
+    // would silently re-expand `A` and bias the timing), then dropped
+    // before Phase 2 builds any client. So the client built inside
+    // `measure_and_write` is the only `A` holder during apply_delta: peak
+    // coexisting `A` copies = 1. The client runs in empty-queue mode (no
+    // `precompute_queries` / `precompute_decodes`), so no large
+    // prepared-query queue coexists with `A`.
     //
     // Per-segment `A` shape depends on the backend (same dispatch as
     // `classical_throughput`):
@@ -317,60 +298,94 @@ where
     let params = seed_store.params();
     drop(seed_store); // we only need the cells + params from here on
 
-    // ── 2. Per-kind: server mutations + client apply_delta ─────────────────────
-    // Each kind builds its own server (fresh seed → fresh A/hint) and
-    // captures its own bundle from that server. The client constructed
-    // inside `measure_and_write` is therefore matched to *this kind's*
-    // server: same A, same starting hint, same epoch trajectory. The
-    // resulting apply_delta produces a self-consistent client whose
-    // post-mutation hint exactly equals the post-mutation server hint.
-    //
-    // Preamble (`=== mutation_throughput ===` banner) is printed once
-    // on the first kind's bundle; the geometry numbers depend on the
-    // backend config, not on which kind is running.
-    for (idx, &kind) in MutationKind::all().iter().enumerate() {
-        let (result, bundle) =
-            run_server_kind::<S, B>(cli, &cells, params, n_seed, kind, &make_config);
+    // ── 2. Build ONE server — the single expensive setup ───────────────────────
+    // All three kinds replay against the SAME epoch-0 snapshot, so they
+    // share one `(seed, A, hint)` triple. We pay `IkpirServer::new`'s
+    // `H = Aᵀ·D` matmul exactly once here; `reset_for_replay` returns the
+    // server to this epoch-0 state between kinds without recomputing `A`
+    // or `H`. The bundle is captured once and reused for every kind's
+    // client — it matches each kind's server step-for-step because the
+    // triple is identical across kinds.
+    let mut store0 = S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
+    // `from_cells` resets `max_kicks` to `MAX_KICKS_DEFAULT` (500); restore the
+    // 2_500 budget the populate helper used so the timed insert loop runs with
+    // the same cuckoo-eviction headroom as the populate phase. Without this,
+    // inserts at near-full load hit `TableFull` ~5× sooner than they would in
+    // a consistent deployment, biasing the throughput downward.
+    store0.set_max_kicks(2_500);
+    let mut server: IkpirServer<S, B> = IkpirServer::new(store0, make_config());
+    let bundle = server.setup();
+    let hints0 = bundle.hints.clone(); // epoch-0 hints for the per-kind reset
 
-        if idx == 0 {
-            let setup_bundle_bytes = bundle.wire_byte_size();
-            let hint_per_seg_bytes = B::hint_byte_size(&bundle.hints[0]);
-            let cps = params.cells_per_slot();
-            let store_state = helpers::StoreState {
-                capacity:       (num_buckets as u64) * (cli.bucket_size as u64),
-                populated:      n_seed,
-                load_pct:       100.0 * n_seed as f64 / (num_buckets as f64 * cli.bucket_size as f64),
-                cells_per_slot: cps,
-                row_width:      cli.bucket_size * cps,
-                segment_rows:   params.segment_size(),
-            };
-            let geom = helpers::Geometry {
-                hint_per_seg_bytes,
-                setup_bundle_bytes,
-                query_bytes: 0,
-                response_bytes: 0,
-                hint_delta_typical_bytes: None,
-            };
-            let knobs = [
-                helpers::Knob { name: "backend",        value: cli.backend.to_string(),           is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "arity",          value: arity.to_string(),                 is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "num_buckets",    value: num_buckets.to_string(),           is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "bucket_size",    value: cli.bucket_size.to_string(),       is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "value_bits",     value: cli.value_bits.to_string(),        is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "plaintext_bits", value: cli.plaintext_bits.to_string(),    is_default: matches.value_source("plaintext_bits") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "lwe_dim",        value: lwe_dim_eff.to_string(),           is_default: cli.lwe_dim.is_none() },
-                helpers::Knob { name: "n_mutations",    value: cli.n_mutations.to_string(),       is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
-                helpers::Knob { name: "load_factor",    value: format!("{:.2}", cli.load_factor), is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
-            ];
-            helpers::print_preamble("mutation_throughput", &knobs, &store_state, &geom);
+    // Preamble once — geometry depends on the backend config, not the kind.
+    {
+        let setup_bundle_bytes = bundle.wire_byte_size();
+        let hint_per_seg_bytes = B::hint_byte_size(&bundle.hints[0]);
+        let cps = params.cells_per_slot();
+        let store_state = helpers::StoreState {
+            capacity:       (num_buckets as u64) * (cli.bucket_size as u64),
+            populated:      n_seed,
+            load_pct:       100.0 * n_seed as f64 / (num_buckets as f64 * cli.bucket_size as f64),
+            cells_per_slot: cps,
+            row_width:      cli.bucket_size * cps,
+            segment_rows:   params.segment_size(),
+        };
+        let geom = helpers::Geometry {
+            hint_per_seg_bytes,
+            setup_bundle_bytes,
+            query_bytes: 0,
+            response_bytes: 0,
+            hint_delta_typical_bytes: None,
+        };
+        let knobs = [
+            helpers::Knob { name: "backend",        value: cli.backend.to_string(),           is_default: matches.value_source("backend") != Some(ValueSource::CommandLine) },
+            helpers::Knob { name: "arity",          value: arity.to_string(),                 is_default: matches.value_source("arity") != Some(ValueSource::CommandLine) },
+            helpers::Knob { name: "num_buckets",    value: num_buckets.to_string(),           is_default: matches.value_source("num_buckets") != Some(ValueSource::CommandLine) },
+            helpers::Knob { name: "bucket_size",    value: cli.bucket_size.to_string(),       is_default: matches.value_source("bucket_size") != Some(ValueSource::CommandLine) },
+            helpers::Knob { name: "value_bits",     value: cli.value_bits.to_string(),        is_default: matches.value_source("value_bits") != Some(ValueSource::CommandLine) },
+            helpers::Knob { name: "plaintext_bits", value: cli.plaintext_bits.to_string(),    is_default: matches.value_source("plaintext_bits") != Some(ValueSource::CommandLine) },
+            helpers::Knob { name: "lwe_dim",        value: lwe_dim_eff.to_string(),           is_default: cli.lwe_dim.is_none() },
+            helpers::Knob { name: "n_mutations",    value: cli.n_mutations.to_string(),       is_default: matches.value_source("n_mutations") != Some(ValueSource::CommandLine) },
+            helpers::Knob { name: "load_factor",    value: format!("{:.2}", cli.load_factor), is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine) },
+        ];
+        helpers::print_preamble("mutation_throughput", &knobs, &store_state, &geom);
+    }
+
+    // ── 3. Phase 1: server mutation loops (one resident `A`) ───────────────────
+    // Run every kind's mutation loop on the single server, resetting to
+    // epoch 0 between kinds. Keeping one server alive (rather than building
+    // a fresh one per kind) holds peak coexisting `A` copies at 1 for the
+    // whole server phase. Deltas are collected per kind for the client
+    // phase; with the `--n-mutations` cap they total well under 1 GB.
+    let kinds = MutationKind::all();
+    let mut results: Vec<KindResult<B>> = Vec::with_capacity(kinds.len());
+    for (idx, &kind) in kinds.iter().enumerate() {
+        if idx != 0 {
+            // Return the server to epoch 0 with a fresh snapshot store and
+            // the captured epoch-0 hints — no `A` / `H` recompute.
+            let mut store = S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
+            store.set_max_kicks(2_500);
+            server.reset_for_replay(store, hints0.clone());
         }
+        results.push(run_kind_loop::<S, B>(&mut server, cli, n_seed, kind));
+    }
+    // Free the server (its `A`), the snapshot cells, and the epoch-0 hint
+    // clone before the client phase so the client's freshly re-expanded
+    // `A` is the only large copy resident during apply_delta.
+    drop(server);
+    drop(cells);
+    drop(hints0);
 
+    // ── 4. Phase 2: client apply_delta (one resident `A` at a time) ────────────
+    // Each kind builds a fresh empty-queue client from the shared epoch-0
+    // bundle and times apply_delta over that kind's collected deltas. The
+    // server-side CSV row (timed in Phase 1) is also written here via
+    // `measure_and_write`, alongside the client-side row.
+    for (&kind, result) in kinds.iter().zip(results) {
         measure_and_write::<B>(
             csv_server, csv_client, cli, arity, num_buckets, lwe_dim_eff,
             kind, result, &bundle,
         );
-        // `bundle` drops at end of iteration → its hint/params clones are
-        // freed before the next kind's server allocates `A` anew.
     }
 }
 

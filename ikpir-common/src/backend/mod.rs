@@ -90,17 +90,11 @@ pub trait IndexPirBackend {
     /// (e.g. LWE dimension, error distribution width). Persisted by
     /// `IkpirServer` and re-used by `full_rebuild` so
     /// every regenerated `Hint` has the same dimensions as the originals.
-    ///
-    /// `Send + Sync` so a single `&Config` can be shared across the rayon
-    /// workers that run per-segment setup in parallel.
-    type Config: Clone + Default + Send + Sync;
+    type Config: Clone + Default;
     /// Public preprocessing parameters produced at setup time. Carries the
     /// wire-shippable description of the segment (shape constants, seeds);
     /// the bulky derived state lives in [`Self::HintMaterial`].
-    ///
-    /// `Send` so per-segment setup results can be returned from rayon worker
-    /// closures into the main thread.
-    type ServerParams: Clone + Send;
+    type ServerParams: Clone;
     /// Server-local working state derived deterministically from
     /// [`Self::ServerParams`] — e.g. the LWE public matrix `A` expanded
     /// from a 16-byte seed. Used by [`Self::server_setup`] to compute the
@@ -111,10 +105,7 @@ pub trait IndexPirBackend {
     /// set `type HintMaterial = ()`.
     type HintMaterial: Default + Send + 'static;
     /// Server-held preprocessing matrix; for FrodoPIR this is `H = Aᵀ · D`.
-    ///
-    /// `Send` so per-segment hint results can be returned from rayon worker
-    /// closures into the main thread.
-    type Hint: Clone + Send;
+    type Hint: Clone;
     /// Client-held state derived from `(ServerParams, Hint)` and used to
     /// build queries and decode responses.
     type ClientState;

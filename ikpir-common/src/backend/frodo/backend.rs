@@ -38,8 +38,6 @@
 use std::collections::VecDeque;
 
 use rand::RngCore;
-use rayon::prelude::*;
-use wide::u32x8;
 
 use super::{FrodoConfig, FrodoParams, round_p_to_q, round_q_to_p, sample_a, sample_ternary_into};
 use crate::backend::{BackendWireSize, IndexPirBackend, IncrementalPirBackend, PrecomputingPirBackend};
@@ -439,90 +437,34 @@ impl PrecomputingPirBackend for FrodoPirBackend {
 /// is row-major shape `lwe_dim × row_width`:
 /// `H[k, j] = Σ_i A[i, k] · D[i, j] mod q`.
 ///
-/// # Parallelism / SIMD
+/// # Rationale
 ///
-/// `H` is tiled across rows: each task owns `CHUNK_ROWS` consecutive
-/// output rows via [`rayon::slice::ParallelSliceMut::par_chunks_mut`]
-/// (the last chunk may be shorter). No thread-local accumulator and no
-/// final reduction — each task writes only to its own slice of `H`,
-/// reading the matching `CHUNK_ROWS` consecutive columns of `A` and the
-/// full database `db` once. Tiling by rows keeps each task's working
-/// set (`CHUNK_ROWS × row_width × 4 B`) small enough to live in L1
-/// during the per-`i` updates, so writes accumulate in cache rather
-/// than thrashing memory bandwidth.
-///
-/// The innermost `j` loop is vectorised with `wide::u32x8` (NEON on
-/// Apple Silicon, SSE2/AVX on x86); a scalar tail handles the trailing
-/// `row_width % 8` cells so small test configs (`row_width=4`) stay
-/// correct. The `aik == 0` early-exit is preserved as a scalar branch
-/// in front of the SIMD kernel — it saves the ~1/3 of inner loops where
-/// the ternary `A` cell is zero. `A` is public, so the branch leaks
-/// nothing.
-///
-/// Tiling over rows of `H` is deterministic (each output cell is written
-/// in the same `i` order regardless of worker count), so output is
-/// bit-identical to a sequential walk across `RAYON_NUM_THREADS=1/8`
-/// (verified in the test suite).
+/// Loop nest is `i, k, j` to keep `A` and `D` row accesses sequential
+/// per `i` — the inner-loop pattern LLVM auto-vectorises. The
+/// `aik == 0` early-exit is a sparsity shortcut on the random ternary
+/// `A` (about 1/3 of cells); harmless to timing since `A` is public.
 ///
 /// # Complexity
 ///
 /// `O(n_rows · lwe_dim · row_width)` wrapping multiply-add — dominates
 /// the cost of `server_setup` and `full_rebuild`.
-/// Output rows of `H` per parallel task. Sized so the chunk
-/// (`CHUNK_ROWS × row_width × 4 B`) plus one `d_row` (`row_width × 4 B`)
-/// fits comfortably in L1 at paper-config `row_width` (≤ 256 cells).
-const CHUNK_ROWS: usize = 8;
-
 fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32) -> Vec<u32> {
     let lwe_dim_us   = lwe_dim as usize;
     let row_width_us = row_width as usize;
-    let n_rows_us    = n_rows as usize;
     let mut h = vec![0u32; lwe_dim_us * row_width_us];
-
-    h.par_chunks_mut(CHUNK_ROWS * row_width_us)
-        .enumerate()
-        .for_each(|(chunk_idx, h_chunk)| {
-            let k_start = chunk_idx * CHUNK_ROWS;
-            let k_count = h_chunk.len() / row_width_us; // last chunk may be shorter
-            for i in 0..n_rows_us {
-                let a_row = &a[i * lwe_dim_us..(i + 1) * lwe_dim_us];
-                let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
-                for k_off in 0..k_count {
-                    let aik = a_row[k_start + k_off];
-                    if aik == 0 { continue; }
-                    let h_row =
-                        &mut h_chunk[k_off * row_width_us..(k_off + 1) * row_width_us];
-                    simd_axpy_u32(h_row, aik, d_row);
-                }
+    for i in 0..n_rows as usize {
+        let a_row = &a[i * lwe_dim_us..(i + 1) * lwe_dim_us];
+        let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
+        for k in 0..lwe_dim_us {
+            let aik = a_row[k];
+            if aik == 0 { continue; }
+            let h_row = &mut h[k * row_width_us..(k + 1) * row_width_us];
+            for j in 0..row_width_us {
+                h_row[j] = h_row[j].wrapping_add(aik.wrapping_mul(d_row[j]));
             }
-        });
+        }
+    }
     h
-}
-
-/// `h[j] += scalar * d[j]` over `u32` with wrapping arithmetic, for all `j`.
-///
-/// SIMD body processes 8 lanes per iteration via `wide::u32x8` (whose
-/// `Mul`/`Add` impls wrap mod 2³², matching `u32::wrapping_mul` /
-/// `wrapping_add`). The scalar tail keeps callers with `row_width % 8 != 0`
-/// (test configs like `row_width=4`) correct.
-#[inline(always)]
-fn simd_axpy_u32(h: &mut [u32], scalar: u32, d: &[u32]) {
-    debug_assert_eq!(h.len(), d.len());
-    let s = u32x8::splat(scalar);
-    let mut idx = 0;
-    while idx + 8 <= h.len() {
-        let mut d_buf = [0u32; 8];
-        d_buf.copy_from_slice(&d[idx..idx + 8]);
-        let mut h_buf = [0u32; 8];
-        h_buf.copy_from_slice(&h[idx..idx + 8]);
-        let v = u32x8::new(h_buf) + u32x8::new(d_buf) * s;
-        let out: [u32; 8] = v.into();
-        h[idx..idx + 8].copy_from_slice(&out);
-        idx += 8;
-    }
-    for j in idx..h.len() {
-        h[j] = h[j].wrapping_add(scalar.wrapping_mul(d[j]));
-    }
 }
 
 /// Wire-size accounting for FrodoPIR.

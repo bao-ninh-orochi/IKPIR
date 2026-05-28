@@ -24,8 +24,6 @@ clap         = { version = "4", features = ["derive"] }
 criterion    = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 rand         = "0.9"
 rand_chacha  = "0.9"
-rayon        = "1"
-wide         = "0.7"
 xxhash-rust  = { version = "0.8", features = ["xxh3"] }
 proptest     = "1"
 

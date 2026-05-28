@@ -35,7 +35,7 @@
 #   = 36 runs/backend (some may be skipped by the OOM guard).
 #   (BENCH_CONFIGS is shared with the classical sweep — the historical
 #   separate MUTATION_CONFIGS array was unified into BENCH_CONFIGS.)
-#   n_mutations = capacity / 100  (1 % of capacity per config).
+#   n_mutations = min(capacity / 100, N_MUTATIONS_CAP)  (see below).
 #   load_factor = MUTATION_LOAD_FACTOR (0.90).
 #
 # Output (two CSV files in results/):
@@ -81,6 +81,16 @@ backend_note() { echo -e "${MAGENTA}▶ backend=$1${RESET}"; }
 
 MAX_MEM_GB=${MAX_MEM_GB:-85.0}
 
+# Cap on n_mutations per (config, kind). Mutation throughput is a *rate*:
+# the reported ops/s is stable regardless of how many mutations are timed
+# (empirically within ~1 %: insert ops/s = 1450 at N=10485 vs 1440 at
+# N=41943 on the same operating point). capacity/100 grows to ~42k at
+# paper scale, which makes the timed loop the dominant cost for large
+# value_bits without improving the rate estimate. Capping it keeps the
+# loop short. Raise N_MUTATIONS_CAP for a tighter estimate, or set it
+# huge (e.g. 100000000) to restore the pure capacity/100 rule.
+N_MUTATIONS_CAP=${N_MUTATIONS_CAP:-2000}
+
 CARGO=(cargo bench -p ikpir-client --bench mutation_throughput)
 
 step "mutation_throughput  (server insert/update/delete + client apply_delta, shared populate+setup, max_mem=${MAX_MEM_GB}GB)"
@@ -94,7 +104,8 @@ for backend in "${BACKENDS_ARR[@]}"; do
         IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
         pb=$(backend_plaintext_bits "$backend" "$m_label")
         capacity=$(( nb * bs ))
-        n_mut=$(( capacity / 100 ))   # 1 % of capacity, same rule as today
+        n_mut=$(( capacity / 100 ))   # 1 % of capacity
+        if (( n_mut > N_MUTATIONS_CAP )); then n_mut=$N_MUTATIONS_CAP; fi
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
