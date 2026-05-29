@@ -4,22 +4,38 @@
 #
 # Measures the honest single-threaded, non-SIMD server setup cost
 # (IkpirServer::new: derive the LWE matrix A from the seed, then compute the
-# hint H = Aᵀ·D). The preprocessing acceleration (rayon + wide SIMD) has been
-# reverted, so setup is inherently single-threaded — no RAYON_NUM_THREADS to
-# set. Expect tens of seconds to minutes per build at paper scale.
+# per-segment hint H_j = A_jᵀ·D_j). The preprocessing acceleration (rayon +
+# wide SIMD) has been reverted, so setup is inherently single-threaded — no
+# RAYON_NUM_THREADS to set.
+#
+# Per-segment estimate (ON by default): IkpirServer::new computes the `arity`
+# segment hints in an independent sequential loop, and every segment has the
+# same shape, so timing ONE segment's hint and multiplying by `arity` recovers
+# the full single-threaded time exactly:
+#   full = arity × time(B::server_setup over one segment),
+# computing 1/arity of the work (~arity× faster) while staying single-threaded
+# / non-SIMD. `mean_setup_ms` always carries the full single-threaded time.
+# Toggle via IKPIR_SETUP_ESTIMATE (see scripts/configs.sh):
+#   IKPIR_SETUP_ESTIMATE=1  (default) pass --estimate (one segment × arity).
+#   IKPIR_SETUP_ESTIMATE=0            time the full IkpirServer::new over all
+#                                     segments (slower ground truth; use this
+#                                     to validate the estimate).
+# The store is built (real per-segment D) in BOTH modes.
 #
 # Usage:
-#   ./scripts/run_server_setup.sh                                    # both backends (default)
+#   ./scripts/run_server_setup.sh                                    # both backends, per-segment estimate (default)
 #   IKPIR_BENCH_BACKENDS=frodo        ./scripts/run_server_setup.sh  # one backend only
 #   IKPIR_BENCH_BACKENDS=simple       ./scripts/run_server_setup.sh
-#   TRIALS=1 WARMUP=0 ./scripts/run_server_setup.sh   # one build/config (fastest)
-#   MAX_MEM_GB=20.0   ./scripts/run_server_setup.sh   # override OOM guard (default 85 GB)
+#   IKPIR_SETUP_ESTIMATE=0            ./scripts/run_server_setup.sh  # full IkpirServer::new ground truth (slow)
+#   TRIALS=3 WARMUP=1 ./scripts/run_server_setup.sh                  # more samples per config (default 1/0)
+#   MAX_MEM_GB=20.0   ./scripts/run_server_setup.sh                  # override OOM guard (default 85 GB)
 #
 # Trials/warmup: each (config, value_bits, backend) times WARMUP+TRIALS
-# IkpirServer::new builds; only the TRIALS post-warmup samples feed the
-# reported mean/stddev. Defaults TRIALS=3, WARMUP=1 (override via env). Single-
-# threaded setup is slow, so each extra trial costs a full rebuild — use
-# TRIALS=1 WARMUP=0 for a quick point estimate (stddev column will be 0.000).
+# measurements; only the TRIALS post-warmup samples feed the reported
+# mean/stddev. Defaults are TRIALS=1, WARMUP=0 (one measurement per config, no
+# warmup) — override via env. NOTE: with WARMUP=0 the single measurement is a
+# cold first run; a warmup round trims a small cold-cache bias if you want a
+# tighter number (TRIALS=3 WARMUP=1).
 #
 # RESUME (this sweep is long): the CSV is NEVER cleared here — rows are
 # appended, so prior results survive a re-run. To continue after an
@@ -30,21 +46,23 @@
 # the sweep resumes with the next one. Leave RESUME_AFTER='' for a full sweep.
 # Iteration order is: backend (frodo, simple) → BENCH_CONFIGS (top→bottom) →
 # VALUE_BITS (256, 2048, 8192). Example resume:
-#       RESUME_AFTER='frodo,4,4194304,1,2048' TRIALS=1 WARMUP=0 \
+#       RESUME_AFTER='frodo,4,4194304,1,2048' \
 #           ./scripts/run_server_setup.sh
 # To start fresh, delete ikpir-server/results/ikpir_server_setup.csv first.
 #
-# Memory: dominant cost is the per-segment LWE public matrix A, summed across
-# segments to ≈ num_buckets × lwe_dim × 4 B. After the HintMaterial refactor
+# Memory: dominant cost is the per-segment LWE public matrix A. The full path
+# (IkpirServer::new) holds A for all segments at once ≈ num_buckets × lwe_dim
+# × 4 B; the estimate path holds only one segment's A ≈ that ÷ arity. Plus the
+# store snapshot (built in both modes). After the HintMaterial refactor
 # `server.setup()` no longer copies A into the bundle (A is re-expanded
-# client-side from the seed), so the server-side bench holds A exactly once.
-# The shell guard below multiplies by 2 as a conservative safety margin (table
-# cells, transient bundle clones during the wire-size readout, OS overhead).
-# It is FrodoPIR-shaped — it does not divide by the SimplePIR √N reshape
-# factor and so over-estimates SimplePIR — but even the over-estimate clears
-# 85 GB for every BENCH_CONFIGS entry (largest peak ≈ 4194304 × 1566 × 4 × 2
-# ≈ 52.5 GB), so nothing is skipped at the default MAX_MEM_GB. The guard still
-# protects smaller machines.
+# client-side from the seed), so the server-side bench holds A once. The shell
+# guard below uses the full-path bound (2 × num_buckets × lwe_dim × 4, the ×2
+# a conservative margin for table cells / transient clones / OS overhead) for
+# both modes; it is FrodoPIR-shaped (no SimplePIR √N reshape divisor) and so
+# over-estimates SimplePIR and the estimate path — but even the over-estimate
+# clears 85 GB for every BENCH_CONFIGS entry (largest peak ≈ 4194304 × 1566 ×
+# 4 × 2 ≈ 52.5 GB), so nothing is skipped at the default MAX_MEM_GB. The guard
+# still protects smaller machines.
 #
 # Config matrix (scripts/configs.sh) — identical to run_mutation.sh:
 #   12 BENCH_CONFIGS × 3 VALUE_BITS = 36 runs/backend (× 2 backends = 72).
@@ -59,7 +77,13 @@
 # Columns: backend, arity, num_buckets, bucket_size, value_bits, plaintext_bits,
 #   lwe_dim, mean_setup_ms, min_setup_ms, max_setup_ms, stddev_setup_ms,
 #   setup_bundle_bytes, hint_bytes_per_segment, server_params_bytes_per_segment,
-#   cells_per_slot, row_width, segment_rows, db_rows, db_cols, load_factor
+#   cells_per_slot, row_width, segment_rows, db_rows, db_cols, load_factor,
+#   setup_mode, measured_ms
+#
+# mean/min/max/stddev_setup_ms always carry the full single-threaded time. The
+# trailing columns are traceability: setup_mode = full|per_segment, measured_ms
+# = raw per-call time before the arity× scaling (= mean_setup_ms on the full
+# path; the one-segment time on the estimate path).
 
 set -euo pipefail
 
@@ -93,10 +117,12 @@ backend_note() { echo -e "${MAGENTA}▶ backend=$1${RESET}"; }
 MAX_MEM_GB=${MAX_MEM_GB:-85.0}
 MAX_MEM_BYTES=$(awk "BEGIN { printf \"%d\", $MAX_MEM_GB * 1e9 }")
 
-# Warmup/trials per (config, value_bits, backend). Single-threaded setup is
-# expensive, so these default low; raise for a tighter mean/stddev.
-TRIALS=${TRIALS:-3}
-WARMUP=${WARMUP:-1}
+# One measurement per config, no warmup, by default (override via env).
+TRIALS=${TRIALS:-1}; WARMUP=${WARMUP:-0}
+
+# Per-segment estimate vs full ground truth (see scripts/configs.sh).
+EST_FLAG=()
+if [ "$IKPIR_SETUP_ESTIMATE" = 1 ]; then EST_FLAG=(--estimate); fi
 
 # Resume point (see header). Empty => run the full sweep. Non-empty => skip
 # every iteration up to AND INCLUDING this CSV key, then run the rest.
@@ -134,8 +160,9 @@ for backend in "${BACKENDS_ARR[@]}"; do
                 continue
             fi
 
-            # Memory guard: peak = server (A) + bundle (A) = 2 × num_buckets × lwe × 4 B.
-            # FrodoPIR-shaped (no SimplePIR √N reshape divisor); see header.
+            # Memory guard: full-path peak = server (A, all segments) + clone =
+            # 2 × num_buckets × lwe × 4 B. FrodoPIR-shaped; conservative for the
+            # estimate path (one segment's A) and SimplePIR. See header.
             peak_bytes=$(( nb * lwe * 4 * 2 ))
             if (( peak_bytes > MAX_MEM_BYTES )); then
                 peak_gb=$(awk "BEGIN { printf \"%.1f\", $peak_bytes / 1e9 }")
@@ -144,7 +171,11 @@ for backend in "${BACKENDS_ARR[@]}"; do
                 continue
             fi
 
-            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb"
+            if [ "$IKPIR_SETUP_ESTIMATE" = 1 ]; then
+                note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb | per-segment estimate (1 seg × arity)"
+            else
+                note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb | full ground truth"
+            fi
             "${CARGO[@]}" -- \
                 --backend         "$backend" \
                 --arity           "$arity"   \
@@ -153,6 +184,7 @@ for backend in "${BACKENDS_ARR[@]}"; do
                 --value-bits      "$vb"      \
                 --plaintext-bits  "$pb"      \
                 --lwe-dim         "$lwe"     \
+                "${EST_FLAG[@]+"${EST_FLAG[@]}"}" \
                 --trials "$TRIALS" --warmup "$WARMUP"
         done
     done

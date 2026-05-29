@@ -147,6 +147,31 @@ backend_lwe_dim() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Setup-bench timing mode (server_setup only).
+#
+# IkpirServer::new computes, for each of the `arity` segments, the per-segment
+# hint H_j = A_jᵀ · D_j in an independent sequential loop. Every segment has
+# the same shape (segment_rows × row_width), so timing ONE segment's hint and
+# multiplying by `arity` recovers the full single-threaded time exactly:
+#   full = arity × time(B::server_setup over one segment).
+# This computes 1/arity of the work, so it is ~arity× faster than timing the
+# full IkpirServer::new while staying single-threaded / non-SIMD. See
+# ikpir-server/benches/server_setup.rs for the derivation.
+#
+# Tunable (consumed by run_server_setup.sh and ikpir-server/scripts/run_benches.sh):
+#   IKPIR_SETUP_ESTIMATE  1 (default) = pass --estimate to the bench
+#                         (one segment × arity). 0 = time the full
+#                         IkpirServer::new over all segments (the slower
+#                         ground truth, e.g. for validating the estimate).
+# ─────────────────────────────────────────────────────────────────────────────
+IKPIR_SETUP_ESTIMATE=${IKPIR_SETUP_ESTIMATE:-1}
+
+case "$IKPIR_SETUP_ESTIMATE" in
+    0|1) ;;
+    *) echo "[configs.sh] ERROR: IKPIR_SETUP_ESTIMATE must be 0 or 1 (got '$IKPIR_SETUP_ESTIMATE')" >&2; exit 1 ;;
+esac
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Plaintext-bits table — pb_max per (backend, DB size) at q = 2^32.
 #
 # DB size = num_buckets × bucket_size  (total cuckoo capacity, keyed by
@@ -251,3 +276,8 @@ _pb_self_check || exit 1
 unset -f _pb_self_check
 
 echo "[configs.sh] backends=${IKPIR_BENCH_BACKENDS} | ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) classical runs/bench/backend | mutation: ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits × lf=${MUTATION_LOAD_FACTOR} × N=1% capacity = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/bench/backend | head-to-head: ${#HEADTOHEAD_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#HEADTOHEAD_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/backend | pb=max-per-(backend,m_label)"
+if [ "$IKPIR_SETUP_ESTIMATE" = 1 ]; then
+    echo "[configs.sh] server_setup: per-segment estimate ON (--estimate; full = arity × one-segment time) → ~arity× faster; set IKPIR_SETUP_ESTIMATE=0 for the full IkpirServer::new ground truth"
+else
+    echo "[configs.sh] server_setup: per-segment estimate OFF (IKPIR_SETUP_ESTIMATE=0) → full single-threaded IkpirServer::new ground truth"
+fi

@@ -7,9 +7,10 @@
 #   IKPIR_BENCH_BACKENDS=frodo                  # default: FrodoPIR only
 #   IKPIR_BENCH_BACKENDS=simple                 # SimplePIR only
 #   IKPIR_BENCH_BACKENDS=frodo,simple           # both backends (~2× runtime)
+#   IKPIR_SETUP_ESTIMATE=0                      # server_setup: full IkpirServer::new ground truth (default 1 = one segment × arity); see scripts/configs.sh
 #
 # Config matrix (scripts/configs.sh):
-#   server_setup    12 cfgs × 3 value_bits = 36 runs/backend
+#   server_setup    12 cfgs × 3 value_bits = 36 runs/backend  (per-segment estimate; see configs.sh)
 #   server_answer   12 cfgs × 3 value_bits = 36 runs/backend
 #   server_mutation 12 cfgs × 3 value_bits × N=1% capacity = 36 runs/backend
 # (All three sweeps now share BENCH_CONFIGS — the historical separate
@@ -75,18 +76,27 @@ run_server_setup() {
     step "server_setup"
     rm -f "$RESULTS_DIR/ikpir_server_setup.csv"
 
+    # Per-segment estimate vs full ground truth (see scripts/configs.sh).
+    local est_flag=()
+    if [ "$IKPIR_SETUP_ESTIMATE" = 1 ]; then est_flag=(--estimate); fi
+
     for backend in "${BACKENDS_ARR[@]}"; do
         backend_note "$backend"
         local lwe pb; lwe=$(backend_lwe_dim "$backend")
         _setup_one() {
             local arity=$1 bs=$2 nb=$3 n_label=$4 m_label=$5 vb=$6 w=$7
-            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb"
+            # server_setup timing mode (see scripts/configs.sh): IKPIR_SETUP_ESTIMATE=1
+            # times one segment × arity (default); =0 times the full IkpirServer::new.
+            # mean_setup_ms is the full single-threaded time either way.
+            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb estimate=$IKPIR_SETUP_ESTIMATE"
             "${CARGO[@]}" server_setup -- \
                 --backend "$backend" \
                 --arity "$arity" --num-buckets "$nb" \
                 --bucket-size "$bs" --value-bits "$vb" \
                 --plaintext-bits "$pb" \
-                --lwe-dim "$lwe" --trials 5 --warmup 2
+                --lwe-dim "$lwe" \
+                "${est_flag[@]+"${est_flag[@]}"}" \
+                --trials 1 --warmup 0
         }
         for_each_bench_config _setup_one
     done
