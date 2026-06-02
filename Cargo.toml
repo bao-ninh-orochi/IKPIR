@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "segmented-cuckoo",
+    "ikpir-common",
+    "ikpir-server",
+    "ikpir-client",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"
+authors      = ["<TODO-AUTHOR> <<TODO-EMAIL>>"]
+repository   = "https://github.com/<TODO-GITHUB-USER>/incremental-keyword-pir"
+license      = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+segmented-cuckoo = { path = "segmented-cuckoo", version = "0.1" }
+ikpir-common     = { path = "ikpir-common",     version = "0.1", default-features = false }
+ikpir-server     = { path = "ikpir-server",     version = "0.1", default-features = false }
+ikpir-client     = { path = "ikpir-client",     version = "0.1", default-features = false }
+clap         = { version = "4", features = ["derive"] }
+criterion    = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+rand         = "0.9"
+rand_chacha  = "0.9"
+xxhash-rust  = { version = "0.8", features = ["xxh3"] }
+proptest     = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# `missing_docs` is opt-in per crate (see each `lib.rs`). Enforcing it at the
+# workspace level warns on tests, examples, and Phase B/C stubs, which adds
+# noise during scaffolding. Each library re-enables it locally.
+
+[workspace.lints.clippy]
+todo      = "warn"
+dbg_macro = "warn"
+# `unwrap_used`, `expect_used`, and `panic` are intentionally left at default
+# level: they fire extensively in benches, tests, and examples where panics on
+# invariant violations are idiomatic. Individual library modules can opt in
+# locally with `#![warn(clippy::unwrap_used)]` if stricter hygiene is needed.
+#
+# `clippy::nursery` is not enabled by default. A handful of nursery lints are
+# intentional patterns / false-positives here; they are silenced with scoped
+# `#![allow(...)]` attributes (which outrank a CLI `-W clippy::nursery`, unlike
+# Cargo `[lints]` entries) at each site — see `segmented-cuckoo/src/lib.rs`
+# (while_float, option_if_let_else) and the bench files (significant_drop_
+# tightening, cognitive_complexity).
+
+[profile.release]
+lto           = "fat"
+codegen-units = 1
+debug         = false
+
+[profile.bench]
+inherits = "release"
+debug    = true
