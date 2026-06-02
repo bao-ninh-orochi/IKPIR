@@ -148,6 +148,9 @@ macro_rules! bench_kv_insert {
 }
 
 fn main() {
+    if helpers::skip_when_cargo_test() {
+        return;
+    }
     let mut csv = helpers::csv_writer(
         "kv_store_insert_throughput.csv",
         "scheme,arity,num_buckets,bucket_size,value_bits,mean_inserted,mean_lf,mean_mops",

@@ -102,6 +102,9 @@ macro_rules! bench_load_factor {
 
 #[allow(clippy::cognitive_complexity)] // bench main(): linear CLI-parse + dispatch plumbing
 fn main() {
+    if helpers::skip_when_cargo_test() {
+        return;
+    }
     let mut csv = helpers::csv_writer(
         "load_factor.csv",
         "scheme,arity,num_buckets,bucket_size,fingerprint_bits,max_kicks,mean_lf,min_lf,max_lf,stddev_lf",

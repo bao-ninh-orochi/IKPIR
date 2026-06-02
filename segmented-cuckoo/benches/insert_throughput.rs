@@ -130,6 +130,9 @@ macro_rules! bench_insert {
 
 #[allow(clippy::cognitive_complexity)] // bench main(): linear CLI-parse + dispatch plumbing
 fn main() {
+    if helpers::skip_when_cargo_test() {
+        return;
+    }
     let mut csv = helpers::csv_writer(
         "insert_throughput.csv",
         "scheme,arity,num_buckets,bucket_size,mean_inserted,mean_lf,mean_duration_ns,mean_mops,min_mops,max_mops,stddev_mops",

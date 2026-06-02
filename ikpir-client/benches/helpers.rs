@@ -678,3 +678,11 @@ impl CloneStore for segmented_cuckoo::Segmented4aryScheme {
         segmented_cuckoo::CuckooKVStore::<Self>::from_cells(c, p, n)
     }
 }
+
+/// `true` unless started by `cargo bench` (the only invocation where cargo
+/// passes `--bench`). Bench `main()`s early-return on this so
+/// `cargo test --all-targets` builds them without running the full sweep.
+#[allow(dead_code)]
+pub fn skip_when_cargo_test() -> bool {
+    !std::env::args().any(|a| a == "--bench")
+}

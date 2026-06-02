@@ -213,6 +213,9 @@ macro_rules! run_degree_hist {
 }
 
 fn main() {
+    if helpers::skip_when_cargo_test() {
+        return;
+    }
     let mut csv_bucket = helpers::csv_writer(
         "degree_per_bucket.csv",
         "scheme,arity,num_buckets,bucket_size,bucket_index,degree",

@@ -135,6 +135,9 @@ macro_rules! bench_delete {
 
 #[allow(clippy::cognitive_complexity)] // bench main(): linear CLI-parse + dispatch plumbing
 fn main() {
+    if helpers::skip_when_cargo_test() {
+        return;
+    }
     let mut csv = helpers::csv_writer(
         "delete_throughput.csv",
         "scheme,arity,num_buckets,bucket_size,deleted,mean_lf,mean_duration_ns,mean_mops,min_mops,max_mops,stddev_mops",

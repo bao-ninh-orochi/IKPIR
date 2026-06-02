@@ -126,6 +126,9 @@ macro_rules! bench_lookup {
 
 #[allow(clippy::cognitive_complexity)] // bench main(): linear CLI-parse + dispatch plumbing
 fn main() {
+    if helpers::skip_when_cargo_test() {
+        return;
+    }
     let mut csv = helpers::csv_writer(
         "lookup_throughput.csv",
         "scheme,arity,num_buckets,bucket_size,hit_rate_pct,load_factor,num_queries,mean_mops,min_mops,max_mops,stddev_mops",

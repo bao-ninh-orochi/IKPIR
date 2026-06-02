@@ -107,6 +107,9 @@ macro_rules! run_fpr {
 
 #[allow(clippy::cognitive_complexity)] // bench main(): linear CLI-parse + dispatch plumbing
 fn main() {
+    if helpers::skip_when_cargo_test() {
+        return;
+    }
     println!("=== False Positive Rate (insert until full, sweep fingerprint_bits) ===");
     println!("Config: max_kicks={}", MAX_KICKS);
 

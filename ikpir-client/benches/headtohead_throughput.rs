@@ -447,6 +447,9 @@ fn dispatch_backend<S: MakeStore>(
 }
 
 fn main() {
+    if helpers::skip_when_cargo_test() {
+        return;
+    }
     let (cli, matches) = helpers::parse_cli_with_matches::<Cli>();
     let num_buckets =
         if matches.value_source("num_buckets") == Some(clap::parser::ValueSource::CommandLine) {
