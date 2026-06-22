@@ -1046,6 +1046,9 @@ impl<S: IndexScheme> CuckooKVStore<S> {
     ///   slot write is appended (kicks first, final placement last).
     /// - `Err(CuckooError::TableFull)` if the kick budget is exhausted;
     ///   store is unchanged and no mutations are logged.
+    /// - `Err(CuckooError::InvalidParams)` if `value.len()` does not equal
+    ///   [`value_size_in_bytes()`](Self::value_size_in_bytes); store is
+    ///   unchanged.
     ///
     /// # Complexity
     ///
@@ -1053,11 +1056,12 @@ impl<S: IndexScheme> CuckooKVStore<S> {
     /// case `O(max_kicks · value_size_in_cells())` on a long kick chain.
     pub fn insert<K: AsRef<[u8]>>(&mut self, key: K, value: &[u8]) -> Result<(), CuckooError> {
         let vbytes = self.value_size_in_bytes();
-        assert_eq!(
-            value.len(),
-            vbytes,
-            "value buffer length must equal value_size_in_bytes ({vbytes})"
-        );
+        if value.len() != vbytes {
+            return Err(CuckooError::InvalidParams(format!(
+                "value buffer length ({}) must equal value_size_in_bytes ({vbytes})",
+                value.len()
+            )));
+        }
 
         let vcells = self.value_size_in_cells();
         let vbits = self.table.value_bits();
@@ -1390,10 +1394,6 @@ impl<S: IndexScheme> CuckooKVStore<S> {
     /// - `new_value` — replacement bytes. Length must equal
     ///   [`value_size_in_bytes()`](Self::value_size_in_bytes).
     ///
-    /// # Constraints
-    ///
-    /// Panics if `new_value.len() != value_size_in_bytes()`.
-    ///
     /// # Rationale
     ///
     /// First-match-wins (matches [`get`](Self::get) /
@@ -1408,6 +1408,9 @@ impl<S: IndexScheme> CuckooKVStore<S> {
     ///   appended.
     /// - `Err(CuckooError::NotFound)` if no matching fingerprint is found;
     ///   store is unchanged and no mutation is logged.
+    /// - `Err(CuckooError::InvalidParams)` if `new_value.len()` does not
+    ///   equal [`value_size_in_bytes()`](Self::value_size_in_bytes); store
+    ///   is unchanged.
     ///
     /// # Complexity
     ///
@@ -1416,11 +1419,12 @@ impl<S: IndexScheme> CuckooKVStore<S> {
     /// the value-only write.
     pub fn update<K: AsRef<[u8]>>(&mut self, key: K, new_value: &[u8]) -> Result<(), CuckooError> {
         let vbytes = self.value_size_in_bytes();
-        assert_eq!(
-            new_value.len(),
-            vbytes,
-            "new_value buffer length must equal value_size_in_bytes ({vbytes})"
-        );
+        if new_value.len() != vbytes {
+            return Err(CuckooError::InvalidParams(format!(
+                "new_value buffer length ({}) must equal value_size_in_bytes ({vbytes})",
+                new_value.len()
+            )));
+        }
         let vbits = self.table.value_bits();
         let pb = self.table.plaintext_bits();
         pack_value_bytes_to_cells(new_value, &mut self.cur_value, vbits, pb);
@@ -2240,21 +2244,29 @@ mod tests {
         assert!((store.load_factor() - unit).abs() < f64::EPSILON);
     }
 
-    /// `insert` panics if the value buffer is the wrong length.
+    /// `insert` returns `InvalidParams` (rather than panicking) if the value
+    /// buffer is the wrong length, and leaves the store unchanged.
     #[test]
-    #[should_panic(expected = "value_size_in_bytes")]
-    fn insert_panics_on_wrong_value_length() {
+    fn insert_rejects_wrong_value_length() {
         let mut store = CuckooKVStore::<Segmented2aryScheme>::new(64, 4, 12, 16, 8).unwrap();
-        let _ = store.insert("k", &[0u8]); // value_size = 2 bytes; 1 byte is wrong
+        // value_size = 2 bytes; 1 byte is wrong.
+        assert!(matches!(
+            store.insert("k", &[0u8]),
+            Err(CuckooError::InvalidParams(_))
+        ));
+        assert_eq!(store.num_items(), 0);
     }
 
-    /// `update` panics if the value buffer is the wrong length.
+    /// `update` returns `InvalidParams` (rather than panicking) if the value
+    /// buffer is the wrong length.
     #[test]
-    #[should_panic(expected = "value_size_in_bytes")]
-    fn update_panics_on_wrong_value_length() {
+    fn update_rejects_wrong_value_length() {
         let mut store = CuckooKVStore::<Segmented2aryScheme>::new(64, 4, 12, 16, 8).unwrap();
         store.insert("k", &[0u8, 0]).unwrap();
-        let _ = store.update("k", &[0u8]); // wrong length
+        assert!(matches!(
+            store.update("k", &[0u8]), // wrong length
+            Err(CuckooError::InvalidParams(_))
+        ));
     }
 
     /// `from_num_items` succeeds for the 2-ary scheme at a realistic size.
