@@ -1163,7 +1163,7 @@ impl<S: IndexScheme> CuckooKVStore<S> {
                 {
                     self.num_items += 1;
                     // Add the final placement mutation and flush all pending to the log.
-                    if self.mutation_log.is_some() {
+                    if let Some(log) = &mut self.mutation_log {
                         let new_val = self.cur_value.clone().into_boxed_slice();
                         self.pending_mutations.push(SlotMutation {
                             bucket: all[p],
@@ -1174,7 +1174,7 @@ impl<S: IndexScheme> CuckooKVStore<S> {
                             new_value_cells: new_val,
                         });
                         let pending = std::mem::take(&mut self.pending_mutations);
-                        self.mutation_log.as_mut().unwrap().extend(pending);
+                        log.extend(pending);
                     }
                     placed = true;
                     break;
