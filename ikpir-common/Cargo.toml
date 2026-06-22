@@ -1,0 +1,27 @@
+[package]
+name        = "ikpir-common"
+description = "Shared IKPIR primitives: backend traits, FrodoPIR backend, wire bundles, and the IkpirError enum"
+keywords    = ["pir", "keyword-pir", "frodopir", "lwe"]
+categories  = ["cryptography", "data-structures"]
+readme      = "README.md"
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+autobenches = false
+
+[lints]
+workspace = true
+
+[dependencies]
+segmented-cuckoo = { workspace = true }
+rand             = { workspace = true }
+rand_chacha      = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -1,0 +1,65 @@
+[package]
+name        = "segmented-cuckoo"
+description = "Segmented Cuckoo Filter and key-value store primitives for Incremental Keyword PIR"
+keywords    = ["cuckoo", "probabilistic", "membership", "segmented", "pir"]
+categories  = ["data-structures", "algorithms"]
+readme      = "README.md"
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+autobenches = false
+
+[lints]
+workspace = true
+
+[dependencies]
+xxhash-rust = { workspace = true }
+rand        = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name    = "load_factor"
+harness = false
+
+[[bench]]
+name    = "insert_throughput"
+harness = false
+
+[[bench]]
+name    = "lookup_throughput"
+harness = false
+
+[[bench]]
+name    = "fpr"
+harness = false
+
+[[bench]]
+name    = "degree_distribution"
+harness = false
+
+[[bench]]
+name    = "delete_throughput"
+harness = false
+
+[[bench]]
+name    = "kv_store_insert_throughput"
+harness = false
+
+[[bench]]
+name    = "kv_store_lookup_throughput"
+harness = false
+
+[[bench]]
+name    = "kv_store_delete_throughput"
+harness = false

@@ -1,0 +1,56 @@
+[package]
+name        = "ikpir-client"
+description = "Client-side IKPIR protocol: PIR query construction, response decoding, incremental hint sync"
+keywords    = ["pir", "keyword-pir", "frodopir", "lwe", "incremental"]
+categories  = ["cryptography", "data-structures"]
+readme      = "README.md"
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+autobenches = false
+
+[lints]
+workspace = true
+
+[dependencies]
+segmented-cuckoo = { workspace = true }
+ikpir-common     = { workspace = true }
+
+[dev-dependencies]
+ikpir-server = { workspace = true }
+proptest     = { workspace = true }
+clap         = { workspace = true }
+criterion    = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name    = "client_query"
+harness = false
+
+[[bench]]
+name    = "client_decode"
+harness = false
+
+[[bench]]
+name    = "client_mutation"
+harness = false
+
+[[bench]]
+name    = "classical_throughput"
+harness = false
+
+[[bench]]
+name    = "headtohead_throughput"
+harness = false
+
+[[bench]]
+name    = "mutation_throughput"
+harness = false

@@ -1,0 +1,75 @@
+#![warn(missing_docs)]
+//! Server side of the **Incremental Keyword PIR** (IKPIR) protocol.
+//!
+//! Wraps a [`segmented_cuckoo::CuckooKVStore`] in per-segment Index-PIR
+//! sub-databases and exposes the full server protocol — `setup`, `answer`,
+//! `insert`, `update`, `delete`, and `full_rebuild`.
+//!
+//! # Design at a glance
+//!
+//! An arity-`k` Segmented Cuckoo Filter splits the underlying KV store into
+//! `k` independent Index-PIR sub-databases. A query for a key targets row
+//! `indices[j] % segment_size` in segment `j`, so `k` Index-PIR queries
+//! suffice to recover the slot — for any arity. The filter geometry is in
+//! [`segmented_cuckoo::CuckooParams`]; the per-segment dispatch lives in
+//! [`IkpirServer`].
+//!
+//! # Incremental hint patching
+//!
+//! After every successful `insert` / `update` / `delete`, the server drains
+//! the [`segmented_cuckoo::SlotMutation`] log and folds the entries into a
+//! sparse [`HintDeltaBundle`]. The active backend's
+//! [`IncrementalPirBackend::server_patch_hint`] applies the same delta to
+//! its own preprocessing matrix, so the wire bandwidth is proportional to
+//! the mutation footprint, not the database size.
+//!
+//! Each successful mutation strictly increments the server `epoch`. The
+//! client uses the epoch monotonicity to ensure deltas are applied in
+//! order; see [`ikpir_client`](https://docs.rs/ikpir-client) for the
+//! corresponding state machine.
+//!
+//! # Backend selection
+//!
+//! Two backends ship today, both LWE-based and post-quantum:
+//! [`FrodoPirBackend`] (ternary errors, tall-skinny per-segment matrix,
+//! default `lwe_dim = 1566`) and [`SimplePirBackend`] (discrete-Gaussian
+//! errors, square-ish reshape, default `lwe_dim = 1275`). They are
+//! drop-in alternatives at the `B: IndexPirBackend` type parameter on
+//! [`IkpirServer`]. New backends implement [`IndexPirBackend`] and
+//! optionally [`IncrementalPirBackend`]; see the trait docs for the
+//! contract.
+//!
+//! # Quick start
+//!
+//! ```
+//! use ikpir_server::{FrodoConfig, FrodoPirBackend, Segmented2aryIkpirServer};
+//! use segmented_cuckoo::Segmented2aryCuckooKVStore;
+//!
+//! let mut store = Segmented2aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap();
+//! store.insert(b"alice", &[0xAB]).unwrap();
+//!
+//! let mut server: Segmented2aryIkpirServer<FrodoPirBackend> =
+//!     Segmented2aryIkpirServer::new(store, FrodoConfig::default());
+//! let bundle = server.setup();
+//! assert_eq!(bundle.epoch, 0);
+//! ```
+//!
+//! For systematic measurement of setup / answer / incremental-vs-rebuild
+//! across parameter ranges, see `benches/{setup,answer,incremental_vs_rebuild}_throughput.rs`
+//! and the matching `scripts/plot.py`.
+
+mod hint_patch;
+mod server;
+
+// Re-export the shared protocol surface from ikpir-common so existing
+// `use ikpir_server::{IndexPirBackend, FrodoConfig, ServerSetupBundle, ...}`
+// call sites continue to resolve unchanged.
+pub use ikpir_common::{
+    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirError,
+    IncrementalPirBackend, IndexPirBackend, PirQueryBundle, PirResponseBundle,
+    PrecomputingPirBackend, ServerSetupBundle, SimpleConfig, SimplePirBackend,
+};
+
+pub use server::{
+    IkpirServer, Segmented2aryIkpirServer, Segmented3aryIkpirServer, Segmented4aryIkpirServer,
+};

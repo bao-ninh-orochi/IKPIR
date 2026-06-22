@@ -1,0 +1,46 @@
+[package]
+name        = "ikpir-server"
+description = "Server-side IKPIR protocol: per-segment Index-PIR setup, answer, incremental hint patching, and full rebuild"
+keywords    = ["pir", "keyword-pir", "frodopir", "lwe", "incremental"]
+categories  = ["cryptography", "data-structures"]
+readme      = "README.md"
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+authors.workspace      = true
+repository.workspace   = true
+license.workspace      = true
+
+autobenches = false
+
+[lints]
+workspace = true
+
+[dependencies]
+segmented-cuckoo = { workspace = true }
+ikpir-common     = { workspace = true }
+rand             = { workspace = true }
+rand_chacha      = { workspace = true }
+
+[dev-dependencies]
+proptest     = { workspace = true }
+ikpir-client = { workspace = true }
+clap         = { workspace = true }
+criterion    = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name    = "server_setup"
+harness = false
+
+[[bench]]
+name    = "server_answer"
+harness = false
+
+[[bench]]
+name    = "server_mutation"
+harness = false
