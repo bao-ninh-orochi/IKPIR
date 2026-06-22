@@ -391,10 +391,15 @@ impl IndexPirBackend for SimplePirBackend {
         let plaintext_bits = state.params.params.plaintext_bits;
         debug_assert_eq!(response.a.len(), reshape_row_width);
 
+        // PROTOCOL INVARIANT (internal): `in_flight` is populated by the
+        // matching `client_query`. `IkpirClient::decode` always issues a
+        // query before decoding, so a `None` here is an unreachable backend
+        // bug, never reachable from user input; there is no `IkpirError`
+        // variant for it and this trait method is infallible by contract.
         let inflight = state
             .in_flight
             .as_ref()
-            .expect("client_decode called without a matching client_query");
+            .expect("client_decode invariant: in_flight set by matching client_query");
         let slot = &inflight.slot;
         let bucket_within = inflight.bucket_within as usize;
         debug_assert!(

@@ -107,6 +107,63 @@ fn mutation_log_drained_inner<S>(
     );
 }
 
+/// Success-after-failure leakage guard. Fill to `TableFull`; confirm a
+/// further failed `insert` does not advance the epoch; then `delete` an
+/// existing key and re-`insert` it. Each successful mutation must advance
+/// the epoch by exactly one, proving the mutation log was drained on the
+/// `TableFull` failure and that neither the delete nor the
+/// success-after-failure insert leaks rolled-back deltas.
+fn success_after_failure_advances_once_inner<S>(mut server: IkpirServer<S, SimplePirBackend>)
+where
+    S: IndexScheme + SchemeMeta + 'static,
+{
+    // Fill to TableFull, remembering the last key that was inserted OK.
+    let mut last_ok: Option<u32> = None;
+    for k in 0u32..2000 {
+        match server.insert(&k.to_le_bytes(), &[k as u8]) {
+            Ok(_) => last_ok = Some(k),
+            Err(IkpirError::TableFull) => break,
+            Err(other) => panic!("unexpected {other:?}"),
+        }
+    }
+    let key = last_ok.expect("at least one insert must succeed before TableFull");
+    let epoch_full = server.epoch();
+
+    // A further insert must fail and must NOT advance the epoch.
+    match server.insert(&999_999u32.to_le_bytes(), &[0]) {
+        Err(IkpirError::TableFull) => {}
+        Err(other) => panic!("expected TableFull, got {other:?}"),
+        Ok(_) => panic!("expected TableFull, got Ok"),
+    }
+    assert_eq!(
+        server.epoch(),
+        epoch_full,
+        "failed insert must not advance epoch"
+    );
+
+    // Delete a key that is provably present: epoch advances exactly once.
+    let del = server
+        .delete(&key.to_le_bytes())
+        .expect("delete of a present key must succeed");
+    assert_eq!(
+        del.epoch,
+        epoch_full + 1,
+        "delete must advance epoch by exactly one"
+    );
+
+    // Re-insert the SAME key. Its candidate slot was just freed, so the
+    // insert is guaranteed to fit; success-after-failure must advance the
+    // epoch by exactly one more.
+    let ins = server
+        .insert(&key.to_le_bytes(), &[key as u8])
+        .expect("re-insert into the freed slot must succeed");
+    assert_eq!(
+        ins.epoch,
+        epoch_full + 2,
+        "success-after-failure insert must advance epoch by exactly one"
+    );
+}
+
 /// A single `insert` must produce a sparse delta bundle: exactly one
 /// segment touched (because each key lands in one bucket per scheme)
 /// and at most `cells_per_slot` cell deltas in that segment.
@@ -153,6 +210,23 @@ fn mutation_log_drained_on_failure_3ary() {
 #[test]
 fn mutation_log_drained_on_failure_4ary() {
     mutation_log_drained_inner(build_tiny_4(), build_tiny_4());
+}
+
+/// A delete then a success-after-failure insert each advance the epoch
+/// exactly once on a 2-ary server.
+#[test]
+fn success_after_failure_advances_once() {
+    success_after_failure_advances_once_inner(build_tiny_2());
+}
+/// Same, on the 3-ary server.
+#[test]
+fn success_after_failure_advances_once_3ary() {
+    success_after_failure_advances_once_inner(build_tiny_3());
+}
+/// Same, on the 4-ary server.
+#[test]
+fn success_after_failure_advances_once_4ary() {
+    success_after_failure_advances_once_inner(build_tiny_4());
 }
 
 #[test]

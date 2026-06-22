@@ -160,6 +160,13 @@ pub trait IndexPirBackend {
 
     /// Decode a response into the cell row that the matching `client_query`
     /// targeted. Output length is `row_width` cells.
+    ///
+    /// # Panics
+    ///
+    /// May panic if called without a preceding `client_query` on the same
+    /// `state`. This is an internal protocol invariant: the public
+    /// `IkpirClient` API always queries before decoding, so it is never
+    /// reachable from user input.
     fn client_decode(state: &Self::ClientState, response: &Self::Response) -> Vec<u32>;
 }
 

@@ -308,10 +308,13 @@ impl IndexPirBackend for FrodoPirBackend {
         let plaintext_bits = state.params.params.plaintext_bits;
         debug_assert_eq!(response.a.len(), row_width);
 
+        // PROTOCOL INVARIANT (internal): see SimplePirBackend::client_decode.
+        // `in_flight` is set by the matching `client_query`; a `None` here is
+        // an unreachable backend bug, not a user-input error.
         let slot = state
             .in_flight
             .as_ref()
-            .expect("client_decode called without a matching client_query");
+            .expect("client_decode invariant: in_flight set by matching client_query");
 
         // residual = response - c, where c = sᵀ·H (precomputed if present,
         // otherwise materialised on the fly). The two paths are arithmetically
