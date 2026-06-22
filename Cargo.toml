@@ -11,8 +11,8 @@ members = [
 version      = "0.1.0"
 edition      = "2021"
 rust-version = "1.85"
-authors      = ["<TODO-AUTHOR> <<TODO-EMAIL>>"]
-repository   = "https://github.com/<TODO-GITHUB-USER>/incremental-keyword-pir"
+authors      = ["Bao Ninh <bao.ninh@orochi.network>"]
+repository   = "https://github.com/orochi-network/IKPIR"
 license      = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
