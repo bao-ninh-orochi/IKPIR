@@ -16,7 +16,8 @@
 //! - [`IncrementalPirBackend`] adds two extension methods
 //!   ([`server_patch_hint`] / [`client_patch_state`]) that let the
 //!   server keep its preprocessing matrix in sync with the database
-//!   without a full recompute.
+//!   without a full recompute. Both take a [`HintPatchMode`] selecting
+//!   the row-level or entry-level realization of the patch.
 //! - [`PrecomputingPirBackend`] adds two further extension methods
 //!   ([`client_precompute_queries`] / [`client_precompute_decodes`])
 //!   that let the client amortise per-query LWE work across a batch of
@@ -28,8 +29,9 @@
 //!
 //! # Related files
 //!
-//! - `frodo/` — the sole shipped backend implementation.
-//! - `ikpir-server::IkpirServer` — sole consumer of `IndexPirBackend` /
+//! - `frodo/`, `simple/` — the two shipped backend implementations.
+//! - `ikpir-server::IkpirServer` / `ikpir-client::IkpirClient` — the
+//!   two protocol-level consumers of `IndexPirBackend` /
 //!   `IncrementalPirBackend`.
 //! - `wire.rs` in `ikpir-common` — `wire_byte_size` helpers consume `BackendWireSize`.
 //!
@@ -170,6 +172,46 @@ pub trait IndexPirBackend {
     fn client_decode(state: &Self::ClientState, response: &Self::Response) -> Vec<u32>;
 }
 
+/// Granularity at which an [`IncrementalPirBackend`] realizes a hint
+/// patch.
+///
+/// Both realizations consume the same sparse `(row, [(cell, Δ)])`
+/// transcript and leave the hint equal to `A · D` for the post-mutation
+/// database — the wire format and the resulting state are identical (all
+/// arithmetic is mod `2³²`); only the arithmetic schedule, and therefore
+/// the patch cost, differs. Server and client may even run different
+/// modes without ever diverging.
+///
+/// With `n` the LWE dimension and `ω` the width of the (possibly
+/// backend-reshaped) database matrix `D`:
+///
+/// - [`RowLevel`](Self::RowLevel) — the row-granular patch of SimplePIR:
+///   for each touched (reshaped) row `r`, densify its edits into a
+///   full-width delta vector `δ ∈ Z_q^ω` and apply the dense rank-one
+///   update `H[k'][c] += A[r][k'] · δ_c` for all `k' ∈ [n]`, `c ∈ [ω]` —
+///   `Θ(n·ω)` per touched row.
+/// - [`EntryLevel`](Self::EntryLevel) — the per-cell sharpening of
+///   iSimplePIR: for each touched cell `(r, c, γ)`, patch column `c`
+///   alone, `H[k'][c] += A[r][k'] · γ` for all `k' ∈ [n]` — `Θ(n)` per
+///   cell.
+///
+/// For a FrodoPIR-shaped (tall) database a mutation rewrites a few cells
+/// of one row, so the two modes differ by a constant factor
+/// (`ω / touched cells` per row). For a SimplePIR-shaped (near-square)
+/// database `ω` grows with the database size, so only the entry-level
+/// patch keeps the per-mutation cost independent of the database size.
+/// The default is [`EntryLevel`](Self::EntryLevel).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HintPatchMode {
+    /// Dense per-row rank-one update, `Θ(n·ω)` per touched row — the
+    /// row-level patch of SimplePIR.
+    RowLevel,
+    /// Sparse per-cell column update, `Θ(n)` per touched cell — the
+    /// entry-level patch of iSimplePIR.
+    #[default]
+    EntryLevel,
+}
+
 /// Extension of [`IndexPirBackend`] for backends that support sparse
 /// hint updates without a full recompute.
 ///
@@ -177,7 +219,9 @@ pub trait IndexPirBackend {
 /// edit is `(cell_offset_within_row, signed_delta_mod_2^plaintext_bits)`.
 /// Both methods must apply the *same* mathematical change to their
 /// respective state, so the client and server stay in lock-step after the
-/// patch.
+/// patch. `mode` selects the [`HintPatchMode`] realization; every mode
+/// must produce the same post-patch state, so mode choices are local and
+/// never need to be coordinated across the wire.
 pub trait IncrementalPirBackend: IndexPirBackend {
     /// Apply `row_deltas` to the server-held [`Hint`](IndexPirBackend::Hint).
     ///
@@ -192,6 +236,7 @@ pub trait IncrementalPirBackend: IndexPirBackend {
         material: &Self::HintMaterial,
         hint: &mut Self::Hint,
         row_deltas: &[(u32, Vec<(u16, i64)>)],
+        mode: HintPatchMode,
     );
 
     /// Apply `row_deltas` to the client-held
@@ -216,7 +261,11 @@ pub trait IncrementalPirBackend: IndexPirBackend {
     /// `params` or `material` argument through, since
     /// [`client_setup`](IndexPirBackend::client_setup) already stashes
     /// both at setup time.
-    fn client_patch_state(state: &mut Self::ClientState, row_deltas: &[(u32, Vec<(u16, i64)>)]);
+    fn client_patch_state(
+        state: &mut Self::ClientState,
+        row_deltas: &[(u32, Vec<(u16, i64)>)],
+        mode: HintPatchMode,
+    );
 }
 
 /// Extension of [`IndexPirBackend`] for backends that can report the wire

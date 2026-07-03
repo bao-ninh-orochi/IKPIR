@@ -20,7 +20,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/lib.rs` | Top-level re-exports of `backend`, `wire`, and `error` |
 | `src/error.rs` | `IkpirError` enum (5 variants) — returned by server methods, wrapped by `IkpirClientError::Server` on the client side |
 | `src/wire.rs` | Wire-format bundles `ServerSetupBundle / PirQueryBundle / PirResponseBundle / HintDeltaBundle`, the `SegmentRowDeltas` type alias, and per-bundle `wire_byte_size` helpers |
-| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 5 methods), `IncrementalPirBackend` (+2 methods), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods) |
+| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 5 methods), `IncrementalPirBackend` (+2 methods, both taking a `HintPatchMode`), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods); `HintPatchMode` enum (`RowLevel` / `EntryLevel`, default `EntryLevel`) |
 | `src/backend/frodo/mod.rs` | Re-exports the FrodoPIR backend's public surface |
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
@@ -56,6 +56,20 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
   per-type byte sizes for wire-size benches. A backend that doesn't
   implement an optional extension is simply unavailable on the
   corresponding code path.
+
+- **Two hint-patch realizations, one wire format** — both
+  `IncrementalPirBackend` methods take a `HintPatchMode` selecting the
+  realization of the patch: `RowLevel` (the SimplePIR row-granular
+  patch — densify each touched row's edits and apply a dense rank-one
+  update, `Θ(n·ω)` per touched row) or `EntryLevel` (the iSimplePIR
+  sharpening — patch only touched columns, `Θ(n)` per touched cell;
+  the default). Either mode leaves the hint equal to `A·D mod 2³²` and
+  consumes the same `HintDeltaBundle`, so the mode is a purely local
+  compute choice: server and client may run different modes and never
+  diverge. The mutation benches sweep both to isolate the granularity
+  cost — the two mutation-phase columns of the paper's asymptotic
+  table. `patch_slot_c` (Phase-C maintenance) is deliberately
+  mode-independent: it is inherently sparse and identical either way.
 
 - **No I/O, no serialisation in the wire types** — bundles are plain
   data crossing process boundaries by value within tests and examples.
@@ -96,8 +110,9 @@ IndexPirBackend (mandatory)
 │   client_decode(state, response) -> Vec<u32>
 │
 ├── IncrementalPirBackend
-│   server_patch_hint(params, material, hint, row_deltas)
-│   client_patch_state(state, row_deltas)
+│   server_patch_hint(params, material, hint, row_deltas, mode)
+│   client_patch_state(state, row_deltas, mode)
+│       mode: HintPatchMode = RowLevel | EntryLevel (default EntryLevel)
 │
 ├── PrecomputingPirBackend
 │   client_precompute_queries(state, count)        — Phase B
@@ -199,10 +214,13 @@ composition.
 6. The triple `(client_query, server_answer, client_decode)` must satisfy:
    `client_decode(server_answer(client_query(state, row))) == db[row*row_width..(row+1)*row_width]`.
 7. If implementing `IncrementalPirBackend`: `server_patch_hint(params,
-   material, hint, row_deltas)` and `client_patch_state(state,
-   row_deltas)` must keep `Hint` and `ClientState` consistent with the
-   updated DB for **all** future queries. `client_patch_state` reads
-   `HintMaterial` from the stashed `ClientState`.
+   material, hint, row_deltas, mode)` and `client_patch_state(state,
+   row_deltas, mode)` must keep `Hint` and `ClientState` consistent with
+   the updated DB for **all** future queries. `client_patch_state` reads
+   `HintMaterial` from the stashed `ClientState`. Every `HintPatchMode`
+   must produce the same post-patch state — the mode may only change the
+   arithmetic schedule (row-level dense pass vs entry-level per-cell
+   pass), never the result.
 8. If implementing `PrecomputingPirBackend`: prepared slots are consumed
    FIFO segment-locally; `client_patch_state` must also update
    already-prepared Phase-C material (see the trait's contract block).

@@ -1,11 +1,14 @@
 //! Integration test: `IkpirServer` composed with `SimplePirBackend`.
 //!
 //! Verifies that the client's per-segment hint state stays in lock-step
-//! with the server's after a sequence of insert / update / delete mutations.
+//! with the server's after a sequence of insert / update / delete
+//! mutations — under **both** [`HintPatchMode`] realizations, which must
+//! produce bit-identical state from the same delta stream.
 
 use ikpir_common::backend::simple::SimpleClientState;
 use ikpir_server::{
-    IkpirServer, IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
+    HintPatchMode, IkpirServer, IncrementalPirBackend, IndexPirBackend, SimpleConfig,
+    SimplePirBackend,
 };
 use segmented_cuckoo::{Segmented2aryCuckooKVStore, Segmented2aryScheme};
 
@@ -21,12 +24,16 @@ fn smoke_ikpir_server_compose_with_simple() {
     );
 
     let setup = server.setup();
-    let mut states: Vec<SimpleClientState> = setup
-        .backend_params
-        .iter()
-        .zip(setup.hints.iter())
-        .map(|(p, h)| SimplePirBackend::client_setup(p, h))
-        .collect();
+    let make_states = || -> Vec<SimpleClientState> {
+        setup
+            .backend_params
+            .iter()
+            .zip(setup.hints.iter())
+            .map(|(p, h)| SimplePirBackend::client_setup(p, h))
+            .collect()
+    };
+    let mut states_entry = make_states();
+    let mut states_row = make_states();
 
     let bundles = vec![
         server.insert(b"k1", b"a").unwrap(),
@@ -38,16 +45,33 @@ fn smoke_ikpir_server_compose_with_simple() {
     for bundle in &bundles {
         for (j, deltas) in bundle.per_segment_row_deltas.iter().enumerate() {
             if !deltas.is_empty() {
-                SimplePirBackend::client_patch_state(&mut states[j], deltas);
+                SimplePirBackend::client_patch_state(
+                    &mut states_entry[j],
+                    deltas,
+                    HintPatchMode::EntryLevel,
+                );
+                SimplePirBackend::client_patch_state(
+                    &mut states_row[j],
+                    deltas,
+                    HintPatchMode::RowLevel,
+                );
             }
         }
     }
 
     let final_setup = server.setup();
-    for (st, srv) in states.iter().zip(final_setup.hints.iter()) {
+    for ((entry, row), srv) in states_entry
+        .iter()
+        .zip(states_row.iter())
+        .zip(final_setup.hints.iter())
+    {
         assert_eq!(
-            st.hint.data, srv.data,
-            "client patched state diverged from server hint"
+            entry.hint.data, srv.data,
+            "entry-level patched state diverged from server hint"
+        );
+        assert_eq!(
+            row.hint.data, srv.data,
+            "row-level patched state diverged from server hint"
         );
     }
 }

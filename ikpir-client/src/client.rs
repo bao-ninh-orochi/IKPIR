@@ -31,8 +31,8 @@
 //! - `ikpir-server::IkpirServer` — counterpart on the server side.
 
 use ikpir_common::{
-    HintDeltaBundle, IncrementalPirBackend, IndexPirBackend, PirQueryBundle, PirResponseBundle,
-    PrecomputingPirBackend, ServerSetupBundle,
+    HintDeltaBundle, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PirQueryBundle,
+    PirResponseBundle, PrecomputingPirBackend, ServerSetupBundle,
 };
 use segmented_cuckoo::{unpack_slot_cells, CuckooParams};
 
@@ -61,6 +61,11 @@ pub struct IkpirClient<B: IndexPirBackend> {
     params: CuckooParams,
     states: Vec<B::ClientState>,
     epoch: u64,
+    /// Realization used by [`Self::apply_delta`] — see [`HintPatchMode`].
+    /// A purely local compute choice: the accepted [`HintDeltaBundle`]
+    /// and the resulting state are identical under either mode, so the
+    /// client's mode never needs to match the server's.
+    hint_patch_mode: HintPatchMode,
 }
 
 /// Outcome of [`IkpirClient::try_apply_delta_or_resync`].
@@ -124,6 +129,7 @@ impl<B: IndexPirBackend> IkpirClient<B> {
             params: bundle.params,
             states,
             epoch: bundle.epoch,
+            hint_patch_mode: HintPatchMode::default(),
         }
     }
 
@@ -144,9 +150,13 @@ impl<B: IndexPirBackend> IkpirClient<B> {
     /// # Rationale
     ///
     /// Equivalent to `*self = Self::from_setup(bundle)` — implemented
-    /// as a swap so existing callers don't need to take ownership.
+    /// as a swap so existing callers don't need to take ownership. The
+    /// configured [`HintPatchMode`] is a client preference, not server
+    /// state, so it survives the reset.
     pub fn reset_from(&mut self, bundle: ServerSetupBundle<B>) {
+        let mode = self.hint_patch_mode;
         *self = Self::from_setup(bundle);
+        self.hint_patch_mode = mode;
     }
 
     /// Current client epoch. Strictly monotone across `apply_delta`
@@ -158,6 +168,29 @@ impl<B: IndexPirBackend> IkpirClient<B> {
     /// SCF geometry parameters in use.
     pub const fn params(&self) -> CuckooParams {
         self.params
+    }
+
+    /// Realization used by [`Self::apply_delta`] for incremental hint
+    /// patches. Defaults to [`HintPatchMode::EntryLevel`].
+    pub const fn hint_patch_mode(&self) -> HintPatchMode {
+        self.hint_patch_mode
+    }
+
+    /// Select the [`HintPatchMode`] realization for future
+    /// [`Self::apply_delta`] calls.
+    ///
+    /// # Rationale
+    ///
+    /// The mode is a **local compute choice**: either realization leaves
+    /// the per-segment state identical (all arithmetic mod `2³²`), so
+    /// the client's mode never needs to match the server's and may be
+    /// switched between deltas at will. Entry-level is the default (and
+    /// the cheaper realization — `Θ(n)` per touched cell instead of
+    /// `Θ(n·ω)` per touched row); row-level exists as the
+    /// SimplePIR-style baseline the benches compare against. Survives
+    /// [`Self::reset_from`].
+    pub fn set_hint_patch_mode(&mut self, mode: HintPatchMode) {
+        self.hint_patch_mode = mode;
     }
 }
 
@@ -422,7 +455,7 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
         }
         for (j, deltas) in delta.per_segment_row_deltas.iter().enumerate() {
             if !deltas.is_empty() {
-                B::client_patch_state(&mut self.states[j], deltas);
+                B::client_patch_state(&mut self.states[j], deltas, self.hint_patch_mode);
             }
         }
         self.epoch = delta.epoch;

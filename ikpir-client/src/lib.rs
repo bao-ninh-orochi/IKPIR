@@ -53,8 +53,11 @@
 //! ```
 //!
 //! For systematic measurement of build_query / decode / apply_delta
-//! across parameter ranges, see `benches/{query,decode,apply_delta}_throughput.rs`
-//! and the matching `scripts/plot.py`.
+//! across parameter ranges, see
+//! `benches/{client_query,client_decode,client_mutation}.rs`, the fused
+//! `benches/{classical,mutation,headtohead}_throughput.rs`, and the
+//! sweep orchestrators under `scripts/` (workspace root and
+//! `ikpir-client/scripts/run_benches.sh`).
 
 mod client;
 mod error;
@@ -63,7 +66,7 @@ pub use client::{DeltaApplyOutcome, IkpirClient};
 pub use error::IkpirClientError;
 
 pub use ikpir_common::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirError,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError,
     IncrementalPirBackend, IndexPirBackend, PirQueryBundle, PirResponseBundle,
     PrecomputingPirBackend, ServerSetupBundle, SimpleConfig, SimplePirBackend,
 };

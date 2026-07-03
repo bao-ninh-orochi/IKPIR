@@ -125,6 +125,56 @@ pub const fn backend_default_lwe_dim(b: Backend) -> u32 {
     }
 }
 
+// ── Hint-patch mode selection ───────────────────────────────────────────────
+
+/// Hint-patch realization selector for the mutation benches.
+///
+/// `entry` → [`ikpir_common::HintPatchMode::EntryLevel`] (the library
+/// default; iSimplePIR per-cell patch, `Θ(n)` per touched cell).
+/// `row` → [`ikpir_common::HintPatchMode::RowLevel`] (the SimplePIR
+/// dense per-row baseline, `Θ(n·ω)` per touched row). Both realizations
+/// produce identical state and identical delta wire bytes; the mutation
+/// benches sweep them to isolate the patch-granularity cost — the two
+/// mutation-phase columns of the paper's asymptotic table.
+#[allow(dead_code)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatchMode {
+    /// Entry-level realization (iSimplePIR): patch only touched columns.
+    Entry,
+    /// Row-level realization (SimplePIR): dense rank-one update per row.
+    Row,
+}
+
+impl std::fmt::Display for PatchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Entry => write!(f, "entry"),
+            Self::Row => write!(f, "row"),
+        }
+    }
+}
+
+impl PatchMode {
+    /// Library-level [`ikpir_common::HintPatchMode`] equivalent.
+    #[allow(dead_code)]
+    pub const fn to_hint_patch_mode(self) -> ikpir_common::HintPatchMode {
+        match self {
+            Self::Entry => ikpir_common::HintPatchMode::EntryLevel,
+            Self::Row => ikpir_common::HintPatchMode::RowLevel,
+        }
+    }
+}
+
+/// Render a `--patch-mode` list for the bench preamble (e.g. `entry,row`).
+#[allow(dead_code)]
+pub fn patch_modes_label(modes: &[PatchMode]) -> String {
+    modes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Per-segment database matrix `D` shape `(rows, row_width)` for the
 /// given backend, given the original `(n_rows_per_seg, row_width)`.
 ///

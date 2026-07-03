@@ -54,9 +54,11 @@
 //! assert_eq!(bundle.epoch, 0);
 //! ```
 //!
-//! For systematic measurement of setup / answer / incremental-vs-rebuild
-//! across parameter ranges, see `benches/{setup,answer,incremental_vs_rebuild}_throughput.rs`
-//! and the matching `scripts/plot.py`.
+//! For systematic measurement of setup / answer / mutation throughput
+//! across parameter ranges, see
+//! `benches/{server_setup,server_answer,server_mutation}.rs` and the
+//! sweep orchestrators under `scripts/` (workspace root and
+//! `ikpir-server/scripts/run_benches.sh`).
 
 mod hint_patch;
 mod server;
@@ -65,7 +67,7 @@ mod server;
 // `use ikpir_server::{IndexPirBackend, FrodoConfig, ServerSetupBundle, ...}`
 // call sites continue to resolve unchanged.
 pub use ikpir_common::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirError,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError,
     IncrementalPirBackend, IndexPirBackend, PirQueryBundle, PirResponseBundle,
     PrecomputingPirBackend, ServerSetupBundle, SimpleConfig, SimplePirBackend,
 };

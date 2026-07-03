@@ -25,7 +25,7 @@
 //! single-arity tests pin the wire-byte accounting helpers
 //! (`wire_byte_size`) and the constant-time-decode last-slot probe.
 
-use ikpir_client::{FrodoConfig, FrodoPirBackend, IkpirClient, IkpirClientError};
+use ikpir_client::{FrodoConfig, FrodoPirBackend, HintPatchMode, IkpirClient, IkpirClientError};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
     IndexScheme, SchemeMeta, Segmented2aryCuckooKVStore, Segmented2aryScheme,
@@ -455,4 +455,28 @@ fn decode_visits_all_candidate_slots() {
         let got = client.decode(key, &resp).expect("no error").expect("found");
         assert_eq!(got, val.to_vec(), "value mismatch for key {key:?}");
     }
+}
+
+/// The hint-patch mode defaults to entry-level, is a client-side
+/// preference that survives `reset_from`, and a row-level client stays
+/// consistent with the server across subsequent deltas.
+#[test]
+fn hint_patch_mode_defaults_and_survives_reset() {
+    let mut server = build_server_2();
+    server.insert(b"alice", &[0xAB]).unwrap();
+
+    let mut client = fresh_client(&server);
+    assert_eq!(client.hint_patch_mode(), HintPatchMode::EntryLevel);
+    client.set_hint_patch_mode(HintPatchMode::RowLevel);
+
+    // `reset_from` replaces all protocol state but keeps the preference.
+    client.reset_from(server.setup());
+    assert_eq!(client.hint_patch_mode(), HintPatchMode::RowLevel);
+
+    // The row-level client still tracks the server across deltas.
+    let d = server.insert(b"bob", &[0xCD]).unwrap();
+    client.apply_delta(d).unwrap();
+    let q = client.build_query(b"bob");
+    let r = server.answer(&q).unwrap();
+    assert_eq!(client.decode(b"bob", &r).unwrap(), Some(vec![0xCD]));
 }

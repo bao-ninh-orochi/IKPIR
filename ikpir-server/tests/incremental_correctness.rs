@@ -21,7 +21,9 @@
 //! failure pins which arity broke.
 
 use ikpir_client::IkpirClient;
-use ikpir_server::{FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirError, IkpirServer};
+use ikpir_server::{
+    FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError, IkpirServer,
+};
 use segmented_cuckoo::{
     IndexScheme, SchemeMeta, Segmented2aryCuckooKVStore, Segmented2aryScheme,
     Segmented3aryCuckooKVStore, Segmented3aryScheme, Segmented4aryCuckooKVStore,
@@ -317,4 +319,86 @@ fn many_mutations_with_warm_queue_3ary() {
 #[test]
 fn many_mutations_with_warm_queue_4ary() {
     many_mutations_with_warm_queue_inner(build_empty_4());
+}
+
+/// Cross-mode lock-step: a server realizing its hint patches with one
+/// [`HintPatchMode`] stays consistent with a client realizing them with
+/// the other — including a mid-stream swap of both sides. Either
+/// realization leaves the hint equal to `A·D` for the post-mutation
+/// database, so the mode is a purely local choice and every
+/// insert / update / delete class must decode correctly afterwards.
+fn cross_mode_lock_step_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
+where
+    S: IndexScheme + SchemeMeta + 'static,
+{
+    assert_eq!(
+        server.hint_patch_mode(),
+        HintPatchMode::EntryLevel,
+        "server default mode must be entry-level"
+    );
+
+    for k in 0u32..20 {
+        server.insert(&k.to_le_bytes(), &[k as u8]).unwrap();
+    }
+
+    // Server realizes patches row-level; client entry-level (its default).
+    server.set_hint_patch_mode(HintPatchMode::RowLevel);
+    let mut client: IkpirClient<FrodoPirBackend> = IkpirClient::from_setup(server.setup());
+    assert_eq!(
+        client.hint_patch_mode(),
+        HintPatchMode::EntryLevel,
+        "client default mode must be entry-level"
+    );
+
+    for k in 20u32..25 {
+        let d = server.insert(&k.to_le_bytes(), &[k as u8]).unwrap();
+        client.apply_delta(d).unwrap();
+    }
+
+    // Swap both sides mid-stream: server entry-level, client row-level.
+    server.set_hint_patch_mode(HintPatchMode::EntryLevel);
+    client.set_hint_patch_mode(HintPatchMode::RowLevel);
+    for k in 0u32..10 {
+        let d = server.update(&k.to_le_bytes(), &[k as u8 ^ 0x5A]).unwrap();
+        client.apply_delta(d).unwrap();
+    }
+    for k in 15u32..20 {
+        let d = server.delete(&k.to_le_bytes()).unwrap();
+        client.apply_delta(d).unwrap();
+    }
+
+    // Behavioural check across every mutation class the stream produced.
+    let expect = |k: u32| -> Option<Vec<u8>> {
+        match k {
+            0..=9 => Some(vec![k as u8 ^ 0x5A]), // updated
+            10..=14 => Some(vec![k as u8]),      // untouched
+            15..=19 => None,                     // deleted
+            20..=24 => Some(vec![k as u8]),      // inserted post-setup
+            _ => None,                           // never inserted
+        }
+    };
+    for k in [0u32, 4, 9, 10, 14, 15, 19, 20, 24, 999] {
+        let key = k.to_le_bytes();
+        let q = client.build_query(&key);
+        let r = server.answer(&q).unwrap();
+        let v = client.decode(&key, &r).unwrap();
+        assert_eq!(v, expect(k), "cross-mode decode mismatch on key {k}");
+    }
+}
+
+/// Server and client in opposite patch modes (with a mid-stream swap)
+/// stay in lock-step on a 2-ary server.
+#[test]
+fn cross_mode_lock_step() {
+    cross_mode_lock_step_inner(build_empty_2());
+}
+/// Same as 2-ary, on the 3-ary server.
+#[test]
+fn cross_mode_lock_step_3ary() {
+    cross_mode_lock_step_inner(build_empty_3());
+}
+/// Same as 2-ary, on the 4-ary server.
+#[test]
+fn cross_mode_lock_step_4ary() {
+    cross_mode_lock_step_inner(build_empty_4());
 }

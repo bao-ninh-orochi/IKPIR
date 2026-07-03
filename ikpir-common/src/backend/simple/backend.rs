@@ -45,7 +45,7 @@
 //! - `sampler.rs` — `sample_a` / `sample_uniform_zq_into`
 //!   / `sample_discrete_gaussian_into`.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use rand::RngCore;
 
@@ -54,7 +54,7 @@ use super::{
     SimpleConfig, SimpleParams,
 };
 use crate::backend::{
-    BackendWireSize, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
+    BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
 };
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
@@ -113,7 +113,8 @@ pub struct SimpleServerParams {
 
 /// Server-local working state: the LWE public matrix `A` in row-major
 /// shape `reshape_rows × lwe_dim`, expanded deterministically from
-/// [`SimpleServerParams::params`]`.seed` via [`sample_a`].
+/// [`SimpleServerParams::params`]`.seed` via `sample_a` (private to this
+/// module).
 ///
 /// # Purpose
 ///
@@ -687,6 +688,7 @@ impl IncrementalPirBackend for SimplePirBackend {
         material: &SimpleHintMaterial,
         hint: &mut SimpleHint,
         row_deltas: &[(u32, Vec<(u16, i64)>)],
+        mode: HintPatchMode,
     ) {
         apply_patch(
             &material.a,
@@ -698,10 +700,15 @@ impl IncrementalPirBackend for SimplePirBackend {
             params.reshape_row_width,
             &mut hint.data,
             row_deltas,
+            mode,
         );
     }
 
-    fn client_patch_state(state: &mut SimpleClientState, row_deltas: &[(u32, Vec<(u16, i64)>)]) {
+    fn client_patch_state(
+        state: &mut SimpleClientState,
+        row_deltas: &[(u32, Vec<(u16, i64)>)],
+        mode: HintPatchMode,
+    ) {
         // Pull params + hint_material snapshots out of the state —
         // `client_setup` already stashed both, so no separate arguments
         // are threaded through.
@@ -722,6 +729,7 @@ impl IncrementalPirBackend for SimplePirBackend {
             params.reshape_row_width,
             &mut hint.data,
             row_deltas,
+            mode,
         );
         // Slots that already carry `c = sᵀ·H` need their `c` patched in
         // lock-step. Slots with `c == None` are skipped — they will lazily
@@ -801,7 +809,60 @@ fn patch_slot_c<'a, I>(
 }
 
 /// Apply sparse cell deltas to a hint laid out as
-/// `lwe_dim × reshape_row_width` row-major.
+/// `lwe_dim × reshape_row_width` row-major, using the realization
+/// selected by `mode`.
+///
+/// # Rationale
+///
+/// Dispatches to [`apply_patch_entry_level`] or
+/// [`apply_patch_row_level`]; the two realizations produce
+/// bit-identical hints (all arithmetic mod `2³²`) and differ only in
+/// cost — see [`HintPatchMode`]. The distinction matters most for this
+/// backend: the reshape makes the hint width `reshape_row_width ≈
+/// √(segment cells)` grow with the database, so the dense row-level
+/// pass grows with the database size while the entry-level pass stays
+/// proportional to the touched cells.
+#[allow(clippy::too_many_arguments)]
+fn apply_patch(
+    a: &[u32],
+    lwe_dim: u32,
+    n_rows: u32,
+    row_width: u32,
+    k: u32,
+    reshape_rows: u32,
+    reshape_row_width: u32,
+    hint: &mut [u32],
+    row_deltas: &[(u32, Vec<(u16, i64)>)],
+    mode: HintPatchMode,
+) {
+    match mode {
+        HintPatchMode::EntryLevel => apply_patch_entry_level(
+            a,
+            lwe_dim,
+            n_rows,
+            row_width,
+            k,
+            reshape_rows,
+            reshape_row_width,
+            hint,
+            row_deltas,
+        ),
+        HintPatchMode::RowLevel => apply_patch_row_level(
+            a,
+            lwe_dim,
+            n_rows,
+            row_width,
+            k,
+            reshape_rows,
+            reshape_row_width,
+            hint,
+            row_deltas,
+        ),
+    }
+}
+
+/// Entry-level realization (iSimplePIR): patch only the touched hint
+/// columns.
 ///
 /// # Rationale
 ///
@@ -814,10 +875,10 @@ fn patch_slot_c<'a, I>(
 ///
 /// # Complexity
 ///
-/// `O(Σ row_deltas · lwe_dim)` wrapping multiply-add — sparse in the
-/// mutation footprint, dense in `lwe_dim`.
+/// `O(touched_cells · lwe_dim)` wrapping multiply-add — `Θ(n)` per
+/// touched cell, independent of the reshape width.
 #[allow(clippy::too_many_arguments)]
-fn apply_patch(
+fn apply_patch_entry_level(
     a: &[u32],
     lwe_dim: u32,
     n_rows: u32,
@@ -860,6 +921,84 @@ fn apply_patch(
                 }
                 let idx = k_idx * reshape_row_width_us + cell_us;
                 hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
+            }
+        }
+    }
+}
+
+/// Row-level realization (SimplePIR): refresh the full reshape width for
+/// every touched **reshape** row.
+///
+/// # Rationale
+///
+/// The paper's row-level patch operates on rows of the reshaped matrix
+/// `D`, and the reshape packs `k` original (bucket) rows into each
+/// reshape row — so edits from different original rows can land in the
+/// same reshape row and must share **one** dense rank-one update. The
+/// edits are therefore grouped by reshape row first, densified into a
+/// full `reshape_row_width`-wide delta vector (zero at untouched
+/// columns), and applied as
+/// `H[k_idx, ·] += A[reshape_row, k_idx] · δ[·] mod 2³²` across the
+/// entire hint width. `BTreeMap` keeps the update order deterministic.
+/// The `aik == 0` early-exit matches [`apply_patch_entry_level`] so the
+/// two realizations share the same micro-optimisation policy (on the
+/// uniform-`Z_q` `A` it fires with probability `2⁻³²` — kept for parity
+/// with FrodoPIR).
+///
+/// # Complexity
+///
+/// `O(touched_reshape_rows · lwe_dim · reshape_row_width)` wrapping
+/// multiply-add — `Θ(n·ω)` per touched reshape row with
+/// `ω = reshape_row_width ≈ √(segment cells)`, the paper's row-level
+/// cost. This is the term that grows with the database size and that
+/// the entry-level realization avoids.
+#[allow(clippy::too_many_arguments)]
+fn apply_patch_row_level(
+    a: &[u32],
+    lwe_dim: u32,
+    n_rows: u32,
+    row_width: u32,
+    k: u32,
+    reshape_rows: u32,
+    reshape_row_width: u32,
+    hint: &mut [u32],
+    row_deltas: &[(u32, Vec<(u16, i64)>)],
+) {
+    let lwe_dim_us = lwe_dim as usize;
+    let reshape_row_width_us = reshape_row_width as usize;
+    debug_assert_eq!(a.len(), (reshape_rows as usize) * lwe_dim_us);
+    debug_assert_eq!(hint.len(), lwe_dim_us * reshape_row_width_us);
+
+    let mut dense_by_reshape_row: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (orig_row, cells) in row_deltas {
+        debug_assert!(
+            *orig_row < n_rows,
+            "orig_row {orig_row} out of range (n_rows={n_rows})",
+        );
+        for (orig_off, delta) in cells {
+            debug_assert!(
+                (*orig_off as u32) < row_width,
+                "orig_off {orig_off} out of range (row_width={row_width})",
+            );
+            let (reshape_row, reshape_off) = translate(*orig_row, *orig_off, k, row_width);
+            let dense = dense_by_reshape_row
+                .entry(reshape_row)
+                .or_insert_with(|| vec![0u32; reshape_row_width_us]);
+            let cell_us = reshape_off as usize;
+            dense[cell_us] = dense[cell_us].wrapping_add(*delta as u32);
+        }
+    }
+
+    for (reshape_row, dense) in &dense_by_reshape_row {
+        let a_row =
+            &a[(*reshape_row as usize) * lwe_dim_us..(*reshape_row as usize + 1) * lwe_dim_us];
+        for (k_idx, &aik) in a_row.iter().enumerate() {
+            if aik == 0 {
+                continue;
+            }
+            let h_row = &mut hint[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
+            for (h, &d) in h_row.iter_mut().zip(dense.iter()) {
+                *h = h.wrapping_add(aik.wrapping_mul(d));
             }
         }
     }
@@ -1072,7 +1211,13 @@ mod tests {
 
         let actual_dlt = apply_cell_delta(&mut db, 1, 2, 1, row_width, pb);
         let row_deltas = vec![(1u32, vec![(2u16, actual_dlt)])];
-        SimplePirBackend::server_patch_hint(&sp, &mat, &mut hint, &row_deltas);
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
 
         let expected = compute_hint(
             &mat.a,
@@ -1104,7 +1249,13 @@ mod tests {
             .map(|&(off, dlt)| (off, apply_cell_delta(&mut db, 2, off, dlt, row_width, pb)))
             .collect();
         let row_deltas = vec![(2u32, cells)];
-        SimplePirBackend::server_patch_hint(&sp, &mat, &mut hint, &row_deltas);
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
 
         let expected = compute_hint(
             &mat.a,
@@ -1148,7 +1299,13 @@ mod tests {
                 (row, actual)
             })
             .collect();
-        SimplePirBackend::server_patch_hint(&sp, &mat, &mut hint, &row_deltas);
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
 
         let expected = compute_hint(
             &mat.a,
@@ -1176,7 +1333,13 @@ mod tests {
         let hint_before = hint.data.clone();
 
         let row_deltas = vec![(2u32, vec![(1u16, 0i64)])];
-        SimplePirBackend::server_patch_hint(&sp, &mat, &mut hint, &row_deltas);
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
         assert_eq!(hint.data, hint_before);
     }
 
@@ -1199,8 +1362,14 @@ mod tests {
         let row_deltas = vec![(target_row, vec![(1u16, dlt1), (2u16, dlt2)])];
 
         let mut server_hint = hint;
-        SimplePirBackend::server_patch_hint(&sp, &_mat, &mut server_hint, &row_deltas);
-        SimplePirBackend::client_patch_state(&mut state, &row_deltas);
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut server_hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
+        SimplePirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::EntryLevel);
         assert_eq!(
             state.hint.data, server_hint.data,
             "server and client patched hints must be identical"
@@ -1346,7 +1515,7 @@ mod tests {
             .collect();
 
         let secrets: Vec<Vec<u32>> = state.prepared.iter().map(|s| s.secret.clone()).collect();
-        SimplePirBackend::client_patch_state(&mut state, &row_deltas);
+        SimplePirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::EntryLevel);
 
         let h_patched = compute_hint(
             &mat.a,
@@ -1452,5 +1621,208 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -------- row-level vs entry-level patch realizations --------
+
+    /// The two [`HintPatchMode`] realizations must produce bit-identical
+    /// hints across random multi-row bursts, and both must match the
+    /// recomputed oracle at the end of the run. With `k = 2` here, random
+    /// bursts regularly touch original rows that share a reshape row, so
+    /// the row-level grouping is exercised throughout.
+    #[test]
+    fn row_level_patch_matches_entry_level_and_oracle() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let pb = 8u32;
+        let n_rows = 16u32;
+        let row_width = 4u32;
+        let cfg = SimpleConfig {
+            lwe_dim: 256,
+            sigma: 6.4,
+        };
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, hint0) = SimplePirBackend::server_setup(&cfg, &db, n_rows, row_width, pb);
+        assert!(sp.k > 1, "test intends k > 1 so reshape rows are shared");
+        let mut hint_entry = hint0.clone();
+        let mut hint_row = hint0;
+        let mask = (1u32 << pb) - 1;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0xB0B5_CAFE);
+        for _iter in 0..50 {
+            let n_rows_in_batch = rng.random_range(1..=4u32);
+            let mut row_deltas: Vec<(u32, Vec<(u16, i64)>)> = Vec::new();
+            for _ in 0..n_rows_in_batch {
+                let row = rng.random_range(0..n_rows);
+                let n_cells = rng.random_range(1..=row_width);
+                let mut cells: Vec<(u16, i64)> = Vec::new();
+                for _ in 0..n_cells {
+                    let off = rng.random_range(0..row_width) as u16;
+                    let new_val: u32 = rng.random_range(0..=mask);
+                    let idx = row as usize * row_width as usize + off as usize;
+                    let actual_dlt = new_val as i64 - db[idx] as i64;
+                    db[idx] = new_val;
+                    cells.push((off, actual_dlt));
+                }
+                row_deltas.push((row, cells));
+            }
+            SimplePirBackend::server_patch_hint(
+                &sp,
+                &mat,
+                &mut hint_entry,
+                &row_deltas,
+                HintPatchMode::EntryLevel,
+            );
+            SimplePirBackend::server_patch_hint(
+                &sp,
+                &mat,
+                &mut hint_row,
+                &row_deltas,
+                HintPatchMode::RowLevel,
+            );
+            assert_eq!(
+                hint_entry.data, hint_row.data,
+                "realizations diverged at iter {_iter}"
+            );
+        }
+
+        let expected = compute_hint(
+            &mat.a,
+            &db,
+            n_rows,
+            row_width,
+            sp.k,
+            sp.params.lwe_dim,
+            sp.reshape_row_width,
+        );
+        assert_eq!(hint_row.data, expected, "row-level diverged from oracle");
+    }
+
+    /// Edits to two original rows that share one reshape row must fold
+    /// into a single dense rank-one update and still match the oracle.
+    #[test]
+    fn row_level_groups_rows_sharing_reshape_row() {
+        let pb = 8u32;
+        let n_rows = 16u32;
+        let row_width = 4u32;
+        let cfg = SimpleConfig {
+            lwe_dim: 256,
+            sigma: 6.4,
+        };
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, mut hint) = SimplePirBackend::server_setup(&cfg, &db, n_rows, row_width, pb);
+        assert_eq!(
+            sp.k, 2,
+            "fixture intends orig rows 4 and 5 to share reshape row 2"
+        );
+
+        // Orig rows 4 and 5 → same reshape row (4/2 == 5/2 == 2).
+        let d4 = apply_cell_delta(&mut db, 4, 1, 7, row_width, pb);
+        let d5 = apply_cell_delta(&mut db, 5, 3, -2, row_width, pb);
+        let row_deltas = vec![(4u32, vec![(1u16, d4)]), (5u32, vec![(3u16, d5)])];
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+
+        let expected = compute_hint(
+            &mat.a,
+            &db,
+            n_rows,
+            row_width,
+            sp.k,
+            sp.params.lwe_dim,
+            sp.reshape_row_width,
+        );
+        assert_eq!(hint.data, expected);
+    }
+
+    /// Row-level patch on the zero-padded final reshape row of a
+    /// non-divisible reshape (17 rows, k = 2 → last reshape row holds a
+    /// single original row) must match the oracle.
+    #[test]
+    fn row_level_patch_on_padded_tail_row_matches_oracle() {
+        let pb = 8u32;
+        let n_rows = 17u32;
+        let row_width = 4u32;
+        let cfg = SimpleConfig {
+            lwe_dim: 256,
+            sigma: 6.4,
+        };
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, mut hint) = SimplePirBackend::server_setup(&cfg, &db, n_rows, row_width, pb);
+        assert_eq!(sp.k, 2);
+        assert_eq!(sp.reshape_rows, 9, "17 rows at k=2 pad the 9th reshape row");
+
+        let d = apply_cell_delta(&mut db, 16, 2, 5, row_width, pb);
+        let row_deltas = vec![(16u32, vec![(2u16, d)])];
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+
+        let expected = compute_hint(
+            &mat.a,
+            &db,
+            n_rows,
+            row_width,
+            sp.k,
+            sp.params.lwe_dim,
+            sp.reshape_row_width,
+        );
+        assert_eq!(hint.data, expected);
+    }
+
+    /// Decode after a row-level `client_patch_state` recovers the patched
+    /// plaintext, and the client hint equals the server's row-level hint.
+    #[test]
+    fn decode_after_row_level_patch_returns_patched_value() {
+        let pb = 8u32;
+        let n_rows = 16u32;
+        let row_width = 4u32;
+        let cfg = SimpleConfig {
+            lwe_dim: 256,
+            sigma: 6.4,
+        };
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, _mat, hint) = SimplePirBackend::server_setup(&cfg, &db, n_rows, row_width, pb);
+        let mut state = SimplePirBackend::client_setup(&sp, &hint);
+
+        let target_row = 3u32;
+        let dlt1 = apply_cell_delta(&mut db, target_row, 1, 7, row_width, pb);
+        let dlt2 = apply_cell_delta(&mut db, target_row, 2, -3, row_width, pb);
+        let row_deltas = vec![(target_row, vec![(1u16, dlt1), (2u16, dlt2)])];
+
+        let mut server_hint = hint;
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut server_hint,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+        SimplePirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::RowLevel);
+        assert_eq!(
+            state.hint.data, server_hint.data,
+            "server and client row-level patched hints must be identical"
+        );
+
+        let q = SimplePirBackend::client_query(&mut state, target_row);
+        let r = SimplePirBackend::server_answer(&sp, &db, n_rows, row_width, &q);
+        let decoded = SimplePirBackend::client_decode(&state, &r);
+        let expected = db[target_row as usize * row_width as usize
+            ..(target_row as usize + 1) * row_width as usize]
+            .to_vec();
+        assert_eq!(
+            decoded, expected,
+            "decode after row-level patch did not recover patched row"
+        );
     }
 }
