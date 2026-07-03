@@ -80,7 +80,8 @@ pub struct FrodoServerParams {
 
 /// Server-local working state: the LWE public matrix `A` in row-major
 /// shape `n_rows × lwe_dim`, expanded deterministically from
-/// [`FrodoServerParams::params`]`.seed` via [`sample_a`].
+/// [`FrodoServerParams::params`]`.seed` via `sample_a` (private to this
+/// module).
 ///
 /// # Purpose
 ///

@@ -113,7 +113,8 @@ pub struct SimpleServerParams {
 
 /// Server-local working state: the LWE public matrix `A` in row-major
 /// shape `reshape_rows × lwe_dim`, expanded deterministically from
-/// [`SimpleServerParams::params`]`.seed` via [`sample_a`].
+/// [`SimpleServerParams::params`]`.seed` via `sample_a` (private to this
+/// module).
 ///
 /// # Purpose
 ///
