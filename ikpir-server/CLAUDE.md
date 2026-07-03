@@ -56,6 +56,15 @@ without a full rebuild.
   `client_patch_state`. No full-matrix recompute; bandwidth scales with
   the mutation footprint, not DB size.
 
+- **Selectable hint-patch realization** — `commit_mutations` realizes
+  the patch at the granularity in `hint_patch_mode`
+  (`set_hint_patch_mode`; default `HintPatchMode::EntryLevel`).
+  Entry-level is the iSimplePIR per-cell patch (`Θ(n)` per touched
+  cell); row-level is the SimplePIR dense per-row baseline (`Θ(n·ω)`
+  per touched row) that the mutation benches compare against. The
+  emitted `HintDeltaBundle` is byte-identical under either mode, and
+  the server's mode never needs to match its clients'.
+
 - **Droppable `HintMaterial`** — the per-segment LWE matrix `A` (or any
   analogous backend-local material) lives in `B::HintMaterial`, **not**
   in `ServerParams`. `IkpirServer` carries a
@@ -122,6 +131,7 @@ without a full rebuild.
 |---|---|
 | Setup + answer flow | `server.rs::IkpirServer::{new, setup, answer}` |
 | Mutation + incremental hint | `server.rs::commit_mutations` → `hint_patch.rs::fold_mutations_into_row_deltas` |
+| Hint-patch realization knob | `server.rs::IkpirServer::{hint_patch_mode, set_hint_patch_mode}` + `ikpir-common::HintPatchMode` |
 | Backend trait contract | `ikpir-common/src/backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` + `PrecomputingPirBackend` + `BackendWireSize` |
 | FrodoPIR config knobs | `ikpir-common/src/backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
 | FrodoPIR backend implementation | `ikpir-common/src/backend/frodo/backend.rs` |
@@ -155,9 +165,11 @@ without a full rebuild.
    `server_answer` is permitted **not** to read the `HintMaterial` — this
    is what makes read-only `drop_hint_material` deployments work.
 7. If implementing `IncrementalPirBackend`: `server_patch_hint(params,
-   material, hint, row_deltas)` and `client_patch_state(state,
-   row_deltas)` must keep `Hint` and `ClientState` consistent with the
-   updated DB for all future queries.
+   material, hint, row_deltas, mode)` and `client_patch_state(state,
+   row_deltas, mode)` must keep `Hint` and `ClientState` consistent with
+   the updated DB for all future queries — and must produce the same
+   post-patch state under every `HintPatchMode` (the mode may only
+   change the arithmetic schedule, never the result).
 
 ### Bench layer (under `benches/`)
 
@@ -167,7 +179,7 @@ Three focused benches covering classical and incremental server criteria for the
 |---|---|---|---|
 | `server_setup` | `TableFull` | setup wall-clock (default trials=1, warmup=0): full `IkpirServer::new`, or `--estimate` = time one segment's `B::server_setup` × `arity`; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR matvec answer rate (queries/sec, criterion); query_bytes, response_bytes | `ikpir_server_answer.csv` |
-| `server_mutation` | `--load-factor` (0.90) | Per-kind (insert/update/delete) throughput, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
+| `server_mutation` | `--load-factor` (0.90) | Per-(kind, patch-mode) throughput (insert/update/delete × entry/row), wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
 
 - Each bench is `harness = false` and parses CLI via `clap` (see helpers
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
@@ -185,6 +197,12 @@ Three focused benches covering classical and incremental server criteria for the
   at the largest `pb` admitted by the backend's correctness bound at
   `q = 2^32`. The chosen value is written to every CSV row as the
   `plaintext_bits` column.
+- **Patch modes.** `server_mutation` accepts `--patch-mode entry|row`
+  (comma-separated list, default `entry`) and emits one CSV row per
+  `(patch mode, kind)` pair — the `patch_mode` column records which
+  `HintPatchMode` realization the timed loop used. The orchestrators
+  forward `IKPIR_BENCH_PATCH_MODES` (default `entry,row`) so the sweep
+  produces both mutation-phase columns of the paper's asymptotic table.
 - **Script-level sweep.** The orchestrator reads `IKPIR_BENCH_BACKENDS`
   (default `frodo`) and re-runs every bench once per backend. Set
   `IKPIR_BENCH_BACKENDS=frodo,simple` to cover both (~2× runtime).

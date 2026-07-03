@@ -62,7 +62,10 @@ for the trait family overview and backend-author checklist.
 
 Wraps a `CuckooKVStore` in per-segment Index-PIR sub-databases; exposes
 setup, answer, insert, update, delete, and full_rebuild. Incremental
-hint patching keeps the client in sync without a full rebuild. Backend
+hint patching keeps the client in sync without a full rebuild; the
+patch is realized at a selectable `HintPatchMode` granularity
+(row-level à la SimplePIR or entry-level à la iSimplePIR, default
+entry-level — identical state and wire bytes either way). Backend
 tunables are passed via the `IndexPirBackend::Config` associated type
 (e.g. `FrodoConfig { lwe_dim }`, defined in `ikpir-common`); see
 [`ikpir-server/CLAUDE.md`](ikpir-server/CLAUDE.md) for the full
@@ -98,10 +101,18 @@ lives in `scripts/configs.sh::backend_plaintext_bits` and is passed
 to every bench as `--plaintext-bits`. Each CSV row carries its
 `plaintext_bits` so analyses can match results to operating points.
 
+The mutation benches (`server_mutation`, `client_mutation`,
+`mutation_throughput`) additionally sweep the hint-patch realization via
+`--patch-mode entry|row` (orchestrator env `IKPIR_BENCH_PATCH_MODES`,
+default `entry,row`), emitting one CSV row per `(patch mode, kind)`
+pair with a `patch_mode` column — the empirical counterpart of the
+paper's row-level vs entry-level mutation columns.
+
 ```bash
 # Full sweep (server then client), FrodoPIR only (default).
 ./scripts/run_all.sh
 IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh  # both backends (~2× runtime)
+IKPIR_BENCH_PATCH_MODES=entry ./scripts/run_mutation.sh # one hint-patch realization
 
 # One bench at one config (manual). When omitted, --plaintext-bits
 # defaults to 8 — safe for every backend / DB size combination but
@@ -111,6 +122,9 @@ cargo bench -p ikpir-server --bench server_answer -- \
     --num-buckets 65536 --bucket-size 4 --value-bits 256 --plaintext-bits 10
 cargo bench -p ikpir-client --bench client_query -- \
     --num-buckets 65536 --bucket-size 4 --value-bits 256 --plaintext-bits 10
+cargo bench -p ikpir-client --bench client_mutation -- \
+    --num-buckets 65536 --bucket-size 4 --value-bits 256 --plaintext-bits 10 \
+    --patch-mode entry,row
 ```
 
 ## Design principles

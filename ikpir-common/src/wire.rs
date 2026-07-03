@@ -237,6 +237,13 @@ where
 /// [`ServerSetupBundle`] they patch; `plaintext_bits` (and the rest of
 /// the SCF geometry) must remain constant across the bundle stream. See
 /// [`ServerSetupBundle`] for the invariant statement and upgrade path.
+///
+/// The bundle does **not** encode a
+/// [`HintPatchMode`](crate::HintPatchMode): the transcript is the same
+/// sparse cell-delta set under either realization, and either
+/// realization folds it into the same post-patch state — so the
+/// row-level vs entry-level choice stays local to each side and never
+/// crosses the wire.
 pub struct HintDeltaBundle<B: IndexPirBackend> {
     /// Server epoch *after* the mutation that produced this delta. Strictly
     /// `previous_epoch + 1`.

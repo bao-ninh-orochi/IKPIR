@@ -76,6 +76,7 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 | Client protocol (from_setup / build_query / decode / apply_delta / reset_from) | Shipped (`ikpir-client`) |
 | FrodoPIR backend | Shipped (`ikpir-common`) — ternary errors, tall-skinny matrix, default `lwe_dim = 1566` |
 | SimplePIR backend | Shipped (`ikpir-common`) — discrete-Gaussian errors (σ = 6.4), √N×√N reshape, default `lwe_dim = 1275` |
+| Hint-patch realizations (`HintPatchMode`) | Shipped (`ikpir-common`) — entry-level (iSimplePIR, default) and row-level (SimplePIR baseline); identical state + wire bytes, selectable per side |
 
 ## Repository tour
 
@@ -138,6 +139,11 @@ cargo bench -p ikpir-client --bench client_mutation -- --n-mutations 64
 # Backend selection: every bench accepts --backend frodo|simple (default frodo).
 cargo bench -p ikpir-server --bench server_answer  -- --backend simple
 cargo bench -p ikpir-client --bench client_query   -- --backend simple
+
+# Hint-patch realization: the mutation benches accept --patch-mode entry|row
+# (comma-separated, default entry) and emit one CSV row per (mode, kind) pair.
+cargo bench -p ikpir-server --bench server_mutation -- --patch-mode entry,row
+cargo bench -p ikpir-client --bench client_mutation -- --patch-mode entry,row
 
 # Override plaintext_bits explicitly (defaults to 8).
 cargo bench -p ikpir-server --bench server_answer -- --plaintext-bits 10

@@ -24,7 +24,7 @@ under all three paths.
 
 | Module | Items |
 |---|---|
-| `backend` | `IndexPirBackend`, `IncrementalPirBackend`, `PrecomputingPirBackend`, `BackendWireSize` traits |
+| `backend` | `IndexPirBackend`, `IncrementalPirBackend`, `PrecomputingPirBackend`, `BackendWireSize` traits + the `HintPatchMode` realization selector |
 | `backend::frodo` | `FrodoPirBackend`, `FrodoConfig`, `FrodoParams`, plus the associated `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` types (ternary LWE, tall-skinny `n_rows × row_width` matrix; default `lwe_dim = 1566`) |
 | `backend::simple` | `SimplePirBackend`, `SimpleConfig`, `SimpleParams`, plus the associated `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` types (discrete-Gaussian LWE with σ = 6.4, internal `√N × √N` reshape; default `lwe_dim = 1275`) |
 | `wire` | `ServerSetupBundle`, `PirQueryBundle`, `PirResponseBundle`, `HintDeltaBundle`, `SegmentRowDeltas` type alias |
@@ -37,7 +37,10 @@ IndexPirBackend (mandatory)
 │   server_setup / client_setup / client_query / server_answer / client_decode
 │
 ├── IncrementalPirBackend           (sparse hint patching, no full recompute)
-│   server_patch_hint / client_patch_state
+│   server_patch_hint / client_patch_state   — both take a HintPatchMode:
+│   RowLevel  = SimplePIR dense rank-one update, Θ(n·ω) per touched row
+│   EntryLevel = iSimplePIR per-cell patch, Θ(n) per touched cell (default)
+│   (identical post-patch state and wire bytes either way)
 │
 ├── PrecomputingPirBackend          (FrodoPIR Fig. 1 amortisation)
 │   client_precompute_queries (Phase B: A·s + e)

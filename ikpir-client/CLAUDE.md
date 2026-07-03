@@ -52,6 +52,15 @@ setup bundle.
   monotone epoch+1 patch), `reset_from` after `full_rebuild` or after a
   `FutureDelta` gap that cannot be bridged incrementally.
 
+- **Selectable hint-patch realization** — `apply_delta` realizes the
+  patch at the client's `hint_patch_mode` (`set_hint_patch_mode`;
+  default `HintPatchMode::EntryLevel`, the iSimplePIR per-cell patch;
+  `RowLevel` is the SimplePIR dense per-row baseline the mutation
+  benches compare against). Purely local: any mode combination between
+  server and client yields bit-identical state from the same delta
+  stream. The preference is client-side state, so it survives
+  `reset_from`.
+
 ## 4. Epoch state machine
 
 ```
@@ -87,6 +96,7 @@ setup bundle.
 | Issue a query | `client.rs::IkpirClient::build_query` |
 | Decode a response | `client.rs::IkpirClient::decode` |
 | Apply an incremental delta | `client.rs::IkpirClient::apply_delta` |
+| Hint-patch realization knob | `client.rs::IkpirClient::{hint_patch_mode, set_hint_patch_mode}` + `ikpir-common::HintPatchMode` |
 | Recover from a gap | `client.rs::IkpirClient::reset_from` |
 | Debug a fingerprint mismatch | `client.rs::IkpirClient::decode` — check `candidate_buckets` + `unpack_slot_cells` |
 | Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`) |
@@ -101,7 +111,7 @@ Three focused benches covering classical and incremental client criteria for the
 |---|---|---|---|
 | `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
 | `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
-| `client_mutation` | `--load-factor` (0.90) | `apply_delta` throughput per kind (insert/update/delete), wall-clock, empty queue (isolates hint-patch cost) | `ikpir_client_mutation.csv` |
+| `client_mutation` | `--load-factor` (0.90) | `apply_delta` throughput per (kind, patch mode) pair (insert/update/delete × entry/row), wall-clock, empty queue (isolates hint-patch cost) | `ikpir_client_mutation.csv` |
 
 `client_query` and `client_decode` use **warm-bc** mode (precompute the
 prepared-query queue + decode material before the timed loop), so the
@@ -130,6 +140,13 @@ in isolation, without warm-bc queue-maintenance overhead mixed in.
   at the largest `pb` admitted by the backend's correctness bound at
   `q = 2^32`. The chosen value is written to every CSV row as the
   `plaintext_bits` column.
+- **Patch modes.** `client_mutation` and the fused `mutation_throughput`
+  bench accept `--patch-mode entry|row` (comma-separated list, default
+  `entry`) and emit one CSV row per `(patch mode, kind)` pair; the
+  `patch_mode` column records which `HintPatchMode` realization the
+  timed `apply_delta` loop used. Deltas are collected once per kind
+  (they are identical under either mode) and replayed per mode. The
+  orchestrators forward `IKPIR_BENCH_PATCH_MODES` (default `entry,row`).
 - One invocation = one CSV row (append-mode writer); the orchestrator
   is responsible for `rm`-ing the CSV before sweeping. The orchestrator
   also reads `IKPIR_BENCH_BACKENDS` (default `frodo`) and re-runs every
