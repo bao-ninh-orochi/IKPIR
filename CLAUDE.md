@@ -80,17 +80,25 @@ state machine, failure-mode table, and entry-point map.
 
 ## Benches
 
-Six focused `clap`-parsed benches (3 server + 3 client) emit CSV under
-`results/`. Each invocation = one config = one CSV row; sweeping across
+Six focused `clap`-parsed benches (3 server + 3 client) plus three fused
+orchestration benches in `ikpir-client` (`classical_throughput`,
+`mutation_throughput`, `headtohead_throughput` — each shares one
+expensive populate + setup across several measurements) emit CSV under
+`results/`. Each invocation = one config = one CSV row (the fused and
+mutation benches emit one row per measured pair); sweeping across
 configs is the orchestrator's job — `rm` the CSV first, then loop.
 
-The canonical sweep is `scripts/run_all.sh`, which iterates every bench
-over the full paper config matrix (12 configs × 3 value\_bits = 36 runs
-per bench; mutation benches reuse the same 12 `BENCH_CONFIGS` entries
-× 3 value\_bits = 36 runs per bench with `n_mutations = capacity/100`
-per config; the historical separate `MUTATION_CONFIGS` array has been
-unified into `BENCH_CONFIGS`; see `scripts/configs.sh`). Per-crate
-orchestrators (`<crate>/scripts/run_benches.sh`) run just that crate.
+The canonical sweep is `scripts/run_all.sh`, which chains the fused
+sweeps (`run_classical.sh` → `run_mutation.sh` → `run_server_setup.sh`;
+`--headtohead` appends the fixed-N matrix, `--skip-setup` /
+`--*-only` select subsets) over the full paper config matrix
+(12 configs × 3 value\_bits = 36 runs per sweep; the mutation sweep
+reuses the same 12 `BENCH_CONFIGS` entries × 3 value\_bits with
+`n_mutations = capacity/100` per config; the historical separate
+`MUTATION_CONFIGS` array has been unified into `BENCH_CONFIGS`; see
+`scripts/configs.sh`). Per-crate orchestrators
+(`<crate>/scripts/run_benches.sh`) run the individual benches for just
+that crate.
 
 `plaintext_bits` is **not fixed across configs**. For each
 `(backend, DB size)` pair, the orchestrator picks the maximum `pb` whose

@@ -93,24 +93,29 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 ## Benches
 
 Six focused `clap`-parsed CSV-emitting benches (3 server + 3 client) cover
-the classical and incremental PIR criteria needed for the paper. Each
-invocation runs one config and appends one row; sweeping across configs is
-the orchestrator's job.
+the classical and incremental PIR criteria needed for the paper, plus three
+fused orchestration benches in `ikpir-client`
+(`classical_throughput`, `mutation_throughput`, `headtohead_throughput`)
+that share one expensive populate + setup across several measurements. Each
+invocation runs one config and appends its row(s); sweeping across configs
+is the orchestrator's job.
 
-The canonical sweep is **`./scripts/run_all.sh`**, which iterates every
-bench over the full paper config matrix (12 configs × 3 value\_bits = 36
-runs per bench; mutation benches reuse the same 12 configs × 3 value\_bits
-= 36 runs per bench, with N\_mutations derived per config as
-capacity / 100):
+The canonical sweep is **`./scripts/run_all.sh`**, which chains the fused
+sweeps (`run_classical.sh` → `run_mutation.sh` → `run_server_setup.sh`)
+over the full paper config matrix (12 configs × 3 value\_bits = 36 runs
+per sweep; the mutation sweep reuses the same 12 configs × 3 value\_bits,
+with N\_mutations derived per config as capacity / 100 and one row per
+(patch mode, kind) pair):
 
 ```bash
 ./scripts/run_all.sh                                  # FrodoPIR only (default)
 IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh  # both backends (~2× runtime)
 IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh      # SimplePIR only
 
-./scripts/run_all.sh --server-only                    # server benches only
-./scripts/run_all.sh --client-only                    # client benches only
-./ikpir-server/scripts/run_benches.sh server_answer   # one bench only
+./scripts/run_all.sh --skip-setup                     # classical + mutation only
+./scripts/run_all.sh --mutation-only                  # one sweep only (also --classical-only, --setup-only)
+./scripts/run_all.sh --headtohead                     # additionally run the fixed-N head-to-head matrix
+./ikpir-server/scripts/run_benches.sh server_answer   # one individual bench, full matrix
 ```
 
 **Plaintext bits per config.** The orchestrator selects the largest
