@@ -11,7 +11,7 @@ Target Index-PIR backends: **FrodoPIR** and **SimplePIR** (LWE-based, post-quant
 ## Workspace structure
 
 ```
-Incremental-Keywork-PIR/          ← workspace root
+Incremental-Keyword-PIR/          ← workspace root
 ├── Cargo.toml                    ← workspace manifest
 ├── CLAUDE.md
 ├── README.md
