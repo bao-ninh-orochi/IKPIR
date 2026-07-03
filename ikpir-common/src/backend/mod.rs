@@ -29,8 +29,9 @@
 //!
 //! # Related files
 //!
-//! - `frodo/` — the sole shipped backend implementation.
-//! - `ikpir-server::IkpirServer` — sole consumer of `IndexPirBackend` /
+//! - `frodo/`, `simple/` — the two shipped backend implementations.
+//! - `ikpir-server::IkpirServer` / `ikpir-client::IkpirClient` — the
+//!   two protocol-level consumers of `IndexPirBackend` /
 //!   `IncrementalPirBackend`.
 //! - `wire.rs` in `ikpir-common` — `wire_byte_size` helpers consume `BackendWireSize`.
 //!

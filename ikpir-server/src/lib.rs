@@ -54,9 +54,11 @@
 //! assert_eq!(bundle.epoch, 0);
 //! ```
 //!
-//! For systematic measurement of setup / answer / incremental-vs-rebuild
-//! across parameter ranges, see `benches/{setup,answer,incremental_vs_rebuild}_throughput.rs`
-//! and the matching `scripts/plot.py`.
+//! For systematic measurement of setup / answer / mutation throughput
+//! across parameter ranges, see
+//! `benches/{server_setup,server_answer,server_mutation}.rs` and the
+//! sweep orchestrators under `scripts/` (workspace root and
+//! `ikpir-server/scripts/run_benches.sh`).
 
 mod hint_patch;
 mod server;
