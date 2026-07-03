@@ -41,7 +41,7 @@ use rand::RngCore;
 
 use super::{round_p_to_q, round_q_to_p, sample_a, sample_ternary_into, FrodoConfig, FrodoParams};
 use crate::backend::{
-    BackendWireSize, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
+    BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
 };
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
@@ -525,6 +525,7 @@ impl IncrementalPirBackend for FrodoPirBackend {
         material: &FrodoHintMaterial,
         hint: &mut FrodoHint,
         row_deltas: &[(u32, Vec<(u16, i64)>)],
+        mode: HintPatchMode,
     ) {
         apply_patch(
             &material.a,
@@ -533,10 +534,15 @@ impl IncrementalPirBackend for FrodoPirBackend {
             params.row_width,
             &mut hint.data,
             row_deltas,
+            mode,
         );
     }
 
-    fn client_patch_state(state: &mut FrodoClientState, row_deltas: &[(u32, Vec<(u16, i64)>)]) {
+    fn client_patch_state(
+        state: &mut FrodoClientState,
+        row_deltas: &[(u32, Vec<(u16, i64)>)],
+        mode: HintPatchMode,
+    ) {
         // Pull params + hint_material snapshots out of the state —
         // `client_setup` already stashed both, so no separate arguments
         // are threaded through.
@@ -554,6 +560,7 @@ impl IncrementalPirBackend for FrodoPirBackend {
             params.row_width,
             &mut hint.data,
             row_deltas,
+            mode,
         );
         // Slots that already carry `c = sᵀ·H` need their `c` patched in
         // lock-step. Slots with `c == None` are skipped — they will lazily
@@ -576,6 +583,13 @@ impl IncrementalPirBackend for FrodoPirBackend {
 /// Keeps the Phase-C precomputation consistent with the patched hint —
 /// without it, `client_decode` on a precomputed slot would return
 /// garbage after any mutation.
+///
+/// Deliberately **independent of [`HintPatchMode`]**: the `c`-patch is
+/// inherently sparse (`dot · Δ` per touched cell, with the `lwe_dim`-long
+/// `dot` shared per row), and a dense per-row variant would compute the
+/// same values while only inflating the Phase-C maintenance cost. The
+/// mode knob governs the hint-matrix patch — the paper's `HintUpdate` —
+/// not this bookkeeping.
 ///
 /// # Rationale
 ///
@@ -632,27 +646,53 @@ fn patch_slot_c<'a, I>(
 }
 
 /// Apply sparse cell deltas to a hint laid out as
-/// `lwe_dim × row_width` row-major.
+/// `lwe_dim × row_width` row-major, using the realization selected by
+/// `mode`.
 ///
 /// # Purpose
 ///
 /// Core of incremental hint patching for both server
 /// (`server_patch_hint`) and client (`client_patch_state`); both
-/// delegate here so the two paths cannot diverge.
+/// delegate here so the two paths cannot diverge. Dispatches to
+/// [`apply_patch_entry_level`] or [`apply_patch_row_level`]; the two
+/// realizations produce bit-identical hints (all arithmetic mod `2³²`)
+/// and differ only in cost — see [`HintPatchMode`].
+fn apply_patch(
+    a: &[u32],
+    lwe_dim: u32,
+    n_rows: u32,
+    row_width: u32,
+    hint: &mut [u32],
+    row_deltas: &[(u32, Vec<(u16, i64)>)],
+    mode: HintPatchMode,
+) {
+    match mode {
+        HintPatchMode::EntryLevel => {
+            apply_patch_entry_level(a, lwe_dim, n_rows, row_width, hint, row_deltas);
+        }
+        HintPatchMode::RowLevel => {
+            apply_patch_row_level(a, lwe_dim, n_rows, row_width, hint, row_deltas);
+        }
+    }
+}
+
+/// Entry-level realization (iSimplePIR): patch only the touched hint
+/// columns.
 ///
 /// # Rationale
 ///
 /// Math: `H[k, cell] += A[row_idx, k] · Δ mod 2³²`. Iterates touched
 /// `(row, cell, Δ)` triples and slides `A`'s `row_idx`-th column
-/// against the hint column at `cell`. The `aik == 0` early-exit
-/// captures sparsity in the random ternary `A`.
+/// against the hint column at `cell`; untouched columns are never read
+/// or written. The `aik == 0` early-exit captures sparsity in the
+/// random ternary `A` (public, so the branch leaks nothing secret).
 ///
 /// # Complexity
 ///
-/// `O(Σ row_deltas · lwe_dim)` wrapping multiply-add — sparse in the
-/// mutation footprint, dense in `lwe_dim`. Vastly cheaper than a full
-/// `compute_hint` when the mutation count is small.
-fn apply_patch(
+/// `O(touched_cells · lwe_dim)` wrapping multiply-add — `Θ(n)` per
+/// touched cell, the paper's entry-level cost. Vastly cheaper than a
+/// full `compute_hint` when the mutation count is small.
+fn apply_patch_entry_level(
     a: &[u32],
     lwe_dim: u32,
     n_rows: u32,
@@ -689,6 +729,68 @@ fn apply_patch(
                 }
                 let idx = k * row_width_us + cell_us;
                 hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
+            }
+        }
+    }
+}
+
+/// Row-level realization (SimplePIR): refresh the full hint width for
+/// every touched row.
+///
+/// # Rationale
+///
+/// For each touched row, densify its sparse edits into a full
+/// `row_width`-wide delta vector `δ` (zero at untouched columns) and
+/// apply the dense rank-one update
+/// `H[k, ·] += A[row_idx, k] · δ[·] mod 2³²` across the entire hint
+/// width. Columns with `δ = 0` are still multiplied — that is the
+/// point: this is the row-granular patch of SimplePIR, kept as the
+/// baseline the entry-level sharpening is measured against. The
+/// `aik == 0` early-exit matches [`apply_patch_entry_level`] so the two
+/// realizations share the same micro-optimisation policy on the public
+/// ternary `A`.
+///
+/// # Complexity
+///
+/// `O(touched_rows · lwe_dim · row_width)` wrapping multiply-add —
+/// `Θ(n·ω)` per touched row, the paper's row-level cost.
+fn apply_patch_row_level(
+    a: &[u32],
+    lwe_dim: u32,
+    n_rows: u32,
+    row_width: u32,
+    hint: &mut [u32],
+    row_deltas: &[(u32, Vec<(u16, i64)>)],
+) {
+    let lwe_dim_us = lwe_dim as usize;
+    let row_width_us = row_width as usize;
+    debug_assert_eq!(a.len(), (n_rows as usize) * lwe_dim_us);
+    debug_assert_eq!(hint.len(), lwe_dim_us * row_width_us);
+
+    let mut delta_row = vec![0u32; row_width_us];
+    for (row_idx, cells) in row_deltas {
+        debug_assert!(
+            (*row_idx as usize) < n_rows as usize,
+            "row_idx {row_idx} out of range (n_rows={n_rows})",
+        );
+        delta_row.fill(0);
+        for (cell_offset, delta) in cells {
+            debug_assert!(
+                (*cell_offset as usize) < row_width_us,
+                "cell_offset {cell_offset} out of range (row_width={row_width})",
+            );
+            let cell_us = *cell_offset as usize;
+            delta_row[cell_us] = delta_row[cell_us].wrapping_add(*delta as u32);
+        }
+        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
+
+        for (k, &aik) in a_row.iter().enumerate() {
+            if aik == 0 {
+                continue;
+            }
+            let h_row = &mut hint[k * row_width_us..(k + 1) * row_width_us];
+            for (h, &d) in h_row.iter_mut().zip(delta_row.iter()) {
+                *h = h.wrapping_add(aik.wrapping_mul(d));
             }
         }
     }
@@ -862,7 +964,13 @@ mod tests {
 
         let actual_dlt = apply_cell_delta(&mut db, 1, 2, 1, row_width, pb);
         let row_deltas = vec![(1u32, vec![(2u16, actual_dlt)])];
-        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -885,7 +993,13 @@ mod tests {
             .map(|&(off, dlt)| (off, apply_cell_delta(&mut db, 2, off, dlt, row_width, pb)))
             .collect();
         let row_deltas = vec![(2u32, cells)];
-        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -919,7 +1033,13 @@ mod tests {
                 (row, actual)
             })
             .collect();
-        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -938,7 +1058,13 @@ mod tests {
         let hint_before = hint.data.clone();
 
         let row_deltas = vec![(2u32, vec![(1u16, 0i64)])];
-        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
 
         assert_eq!(hint.data, hint_before);
     }
@@ -955,7 +1081,13 @@ mod tests {
         // Row 2, off 0: make_db value is 72 (≥ 5), so delta = −5 gives actual change = −5.
         let actual_dlt = apply_cell_delta(&mut db, 2, 0, -5, row_width, pb);
         let row_deltas = vec![(2u32, vec![(0u16, actual_dlt)])];
-        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
 
         let lwe_dim = sp.params.lwe_dim;
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -994,7 +1126,13 @@ mod tests {
                 }
                 row_deltas.push((row, cells));
             }
-            FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut hint, &row_deltas);
+            FrodoPirBackend::server_patch_hint(
+                &sp,
+                &_mat,
+                &mut hint,
+                &row_deltas,
+                HintPatchMode::EntryLevel,
+            );
 
             let lwe_dim = sp.params.lwe_dim;
             let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
@@ -1019,8 +1157,14 @@ mod tests {
         let row_deltas = vec![(target_row, vec![(1u16, dlt1), (2u16, dlt2)])];
 
         let mut server_hint = hint;
-        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut server_hint, &row_deltas);
-        FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut server_hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::EntryLevel);
 
         assert_eq!(
             state.hint.data, server_hint.data,
@@ -1068,8 +1212,14 @@ mod tests {
             .collect();
 
         let mut server_hint = hint;
-        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut server_hint, &row_deltas);
-        FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut server_hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::EntryLevel);
 
         assert_eq!(
             state.hint.data, server_hint.data,
@@ -1215,7 +1365,7 @@ mod tests {
 
         // Snapshot the secrets so we can recompute c against the patched hint.
         let secrets: Vec<Vec<u32>> = state.prepared.iter().map(|s| s.secret.clone()).collect();
-        FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::EntryLevel);
 
         // Oracle: compute c = sᵀ · patched_hint directly from H.
         let lwe_dim = sp.params.lwe_dim;
@@ -1258,8 +1408,14 @@ mod tests {
             })
             .collect();
 
-        FrodoPirBackend::server_patch_hint(&sp, &_mat, &mut server_hint, &row_deltas);
-        FrodoPirBackend::client_patch_state(&mut state, &row_deltas);
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &_mat,
+            &mut server_hint,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::EntryLevel);
 
         for &(target_row, _) in raw {
             let q = FrodoPirBackend::client_query(&mut state, target_row);
@@ -1321,5 +1477,189 @@ mod tests {
         let decoded = FrodoPirBackend::client_decode(&state, &r);
         let expected = db[row_width as usize..2 * row_width as usize].to_vec();
         assert_eq!(decoded, expected);
+    }
+
+    // -------- row-level vs entry-level patch realizations --------
+
+    /// The two [`HintPatchMode`] realizations must produce bit-identical
+    /// hints across random multi-row bursts, and both must match the
+    /// recomputed `Aᵀ·D` oracle at the end of the run.
+    #[test]
+    fn row_level_patch_matches_entry_level_and_oracle() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let pb = 8u32;
+        let n_rows = 32u32;
+        let row_width = 8u32;
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, hint0) =
+            FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let mut hint_entry = hint0.clone();
+        let mut hint_row = hint0;
+        let mask = (1u32 << pb) - 1;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(0xB0B5_CAFE);
+        for _iter in 0..50 {
+            let n_rows_in_batch = rng.random_range(1..=4u32);
+            let mut row_deltas: Vec<(u32, Vec<(u16, i64)>)> = Vec::new();
+            for _ in 0..n_rows_in_batch {
+                let row = rng.random_range(0..n_rows);
+                let n_cells = rng.random_range(1..=row_width);
+                let mut cells: Vec<(u16, i64)> = Vec::new();
+                for _ in 0..n_cells {
+                    let off = rng.random_range(0..row_width) as u16;
+                    let new_val: u32 = rng.random_range(0..=mask);
+                    let idx = row as usize * row_width as usize + off as usize;
+                    let actual_dlt = new_val as i64 - db[idx] as i64;
+                    db[idx] = new_val;
+                    cells.push((off, actual_dlt));
+                }
+                row_deltas.push((row, cells));
+            }
+            FrodoPirBackend::server_patch_hint(
+                &sp,
+                &mat,
+                &mut hint_entry,
+                &row_deltas,
+                HintPatchMode::EntryLevel,
+            );
+            FrodoPirBackend::server_patch_hint(
+                &sp,
+                &mat,
+                &mut hint_row,
+                &row_deltas,
+                HintPatchMode::RowLevel,
+            );
+            assert_eq!(
+                hint_entry.data, hint_row.data,
+                "realizations diverged at iter {_iter}"
+            );
+        }
+
+        let lwe_dim = sp.params.lwe_dim;
+        let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
+        let expected = compute_hint(&a, &db, n_rows, lwe_dim, row_width);
+        assert_eq!(hint_row.data, expected, "row-level diverged from oracle");
+    }
+
+    /// A zero delta is a no-op under the row-level realization too (the
+    /// dense pass multiplies a zero delta vector into the hint).
+    #[test]
+    fn row_level_patch_zero_delta_is_noop() {
+        let pb = 8u32;
+        let n_rows = 4u32;
+        let row_width = 4u32;
+        let db = make_db(n_rows, row_width, pb);
+        let (sp, mat, mut hint) =
+            FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let hint_before = hint.data.clone();
+
+        let row_deltas = vec![(2u32, vec![(1u16, 0i64)])];
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+
+        assert_eq!(hint.data, hint_before);
+    }
+
+    /// Duplicate edits to the same `(row, cell)` within one call must
+    /// accumulate identically under both realizations: entry-level applies
+    /// them one by one, row-level sums them while densifying.
+    #[test]
+    fn duplicate_cell_edits_accumulate_identically() {
+        let pb = 8u32;
+        let n_rows = 4u32;
+        let row_width = 4u32;
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, hint0) =
+            FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+
+        let d1 = apply_cell_delta(&mut db, 1, 2, 3, row_width, pb);
+        let d2 = apply_cell_delta(&mut db, 1, 2, 2, row_width, pb);
+        let row_deltas = vec![(1u32, vec![(2u16, d1), (2u16, d2)])];
+
+        let mut hint_entry = hint0.clone();
+        let mut hint_row = hint0;
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint_entry,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint_row,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+        assert_eq!(hint_entry.data, hint_row.data);
+
+        let lwe_dim = sp.params.lwe_dim;
+        let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
+        let expected = compute_hint(&a, &db, n_rows, lwe_dim, row_width);
+        assert_eq!(hint_row.data, expected);
+    }
+
+    /// Full round-trip under `RowLevel`: precompute Phase B + C, patch via
+    /// `client_patch_state(.., RowLevel)`, then decode — exercises the
+    /// mode-independent `patch_slot_c` interplay and recovers the patched
+    /// plaintext exactly.
+    #[test]
+    fn decode_after_row_level_patch_with_precomputed_c() {
+        let pb = 8u32;
+        let n_rows = 16u32;
+        let row_width = 8u32;
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, hint) =
+            FrodoPirBackend::server_setup(&FrodoConfig::default(), &db, n_rows, row_width, pb);
+        let mut state = FrodoPirBackend::client_setup(&sp, &hint);
+        let mut server_hint = hint;
+
+        FrodoPirBackend::client_precompute_queries(&mut state, 4);
+        FrodoPirBackend::client_precompute_decodes(&mut state);
+
+        let raw: &[(u32, &[(u16, i64)])] = &[(2, &[(0, 5), (3, -2)]), (11, &[(2, -4), (6, 1)])];
+        let row_deltas: Vec<(u32, Vec<(u16, i64)>)> = raw
+            .iter()
+            .map(|&(row, cells)| {
+                let actual: Vec<(u16, i64)> = cells
+                    .iter()
+                    .map(|&(off, dlt)| {
+                        (off, apply_cell_delta(&mut db, row, off, dlt, row_width, pb))
+                    })
+                    .collect();
+                (row, actual)
+            })
+            .collect();
+
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut server_hint,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+        FrodoPirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::RowLevel);
+        assert_eq!(
+            state.hint.data, server_hint.data,
+            "server and client row-level patched hints must be identical"
+        );
+
+        for &(target_row, _) in raw {
+            let q = FrodoPirBackend::client_query(&mut state, target_row);
+            let r = FrodoPirBackend::server_answer(&sp, &db, n_rows, row_width, &q);
+            let decoded = FrodoPirBackend::client_decode(&state, &r);
+            let expected = db[target_row as usize * row_width as usize
+                ..(target_row as usize + 1) * row_width as usize]
+                .to_vec();
+            assert_eq!(decoded, expected, "decode failed for row {target_row}");
+        }
     }
 }

@@ -40,8 +40,8 @@ use segmented_cuckoo::{
 
 use crate::hint_patch::fold_mutations_into_row_deltas;
 use ikpir_common::{
-    HintDeltaBundle, IkpirError, IncrementalPirBackend, IndexPirBackend, PirQueryBundle,
-    PirResponseBundle, ServerSetupBundle,
+    HintDeltaBundle, HintPatchMode, IkpirError, IncrementalPirBackend, IndexPirBackend,
+    PirQueryBundle, PirResponseBundle, ServerSetupBundle,
 };
 
 /// Server-side IKPIR engine, generic over the SCF scheme `S` and PIR
@@ -77,6 +77,10 @@ pub struct IkpirServer<S: IndexScheme + SchemeMeta, B: IndexPirBackend> {
     backend_hint_material: Vec<Option<B::HintMaterial>>,
     hints: Vec<B::Hint>,
     epoch: u64,
+    /// Realization used for incremental hint patches — see
+    /// [`HintPatchMode`]. A purely local compute choice: the emitted
+    /// [`HintDeltaBundle`] is identical under either mode.
+    hint_patch_mode: HintPatchMode,
 }
 
 impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
@@ -165,6 +169,7 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
             backend_hint_material,
             hints,
             epoch: 0,
+            hint_patch_mode: HintPatchMode::default(),
         };
         s.store.enable_mutation_log();
         let _ = s.store.drain_mutations();
@@ -370,6 +375,28 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         self.epoch
     }
 
+    /// Realization currently used for incremental hint patches.
+    /// Defaults to [`HintPatchMode::EntryLevel`].
+    pub const fn hint_patch_mode(&self) -> HintPatchMode {
+        self.hint_patch_mode
+    }
+
+    /// Select the [`HintPatchMode`] realization for future mutations.
+    ///
+    /// # Rationale
+    ///
+    /// The mode is a **local compute choice**: either realization leaves
+    /// the hint equal to `A·D` for the post-mutation database and the
+    /// emitted [`HintDeltaBundle`] is byte-identical, so the server's
+    /// mode never needs to match its clients' and may be switched
+    /// between mutations at will. Entry-level is the default (and the
+    /// cheaper realization — `Θ(n)` per touched cell instead of
+    /// `Θ(n·ω)` per touched row); row-level exists as the
+    /// SimplePIR-style baseline the benches compare against.
+    pub fn set_hint_patch_mode(&mut self, mode: HintPatchMode) {
+        self.hint_patch_mode = mode;
+    }
+
     /// SCF geometry parameters of the wrapped store. Same shape as
     /// `ServerSetupBundle::params`.
     pub const fn params(&self) -> CuckooParams {
@@ -549,6 +576,7 @@ where
                     material,
                     &mut self.hints[j],
                     deltas,
+                    self.hint_patch_mode,
                 );
             }
         }

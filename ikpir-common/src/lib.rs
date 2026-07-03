@@ -15,8 +15,8 @@ mod error;
 pub mod wire;
 
 pub use backend::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, IncrementalPirBackend, IndexPirBackend,
-    PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, HintPatchMode, IncrementalPirBackend,
+    IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
 };
 pub use error::IkpirError;
 pub use wire::{
