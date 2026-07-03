@@ -1,7 +1,8 @@
 //! **Intent:** Measure server-side `insert / update / delete` throughput
 //! *and* client-side `apply_delta` throughput in a single bench process so
 //! the expensive `populate_to_load` and `IkpirServer::new` are paid once
-//! per (config, backend) and shared across both sides and all three kinds.
+//! per (config, backend) and shared across both sides, all three kinds,
+//! and every requested hint-patch realization (`--patch-mode entry,row`).
 //!
 //! **Motivation:** Today `server_mutation` and `client_mutation` each
 //! independently populate the KV store and construct a fresh
@@ -52,7 +53,10 @@
 //! Criterion's cycling pattern is not meaningful.
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
-//! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
+//! default frodo), `--patch-mode` (entry|row, comma-separated list,
+//! default entry — one server + one client CSV row per (mode, kind)
+//! pair, all sharing the single populate + setup), `--num-buckets`,
+//! `--bucket-size`, `--value-bits`,
 //! `--lwe-dim` (backend-dependent default), `--n-mutations` (default
 //! 1024), `--load-factor` (default 0.90, matches
 //! `MUTATION_LOAD_FACTOR` in `scripts/configs.sh`),
@@ -76,7 +80,7 @@
 
 mod helpers;
 
-use helpers::{Backend, CloneStore};
+use helpers::{Backend, CloneStore, PatchMode};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient,
     IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
@@ -87,13 +91,13 @@ use std::io::Write;
 use std::time::Instant;
 
 const HEADER_SERVER: &str =
-    "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
-     n_mutations,load_factor,n_attempted,n_succeeded,total_ms,ops_per_s,delta_bytes_total,\
+    "backend,mutation_kind,patch_mode,arity,num_buckets,bucket_size,value_bits,plaintext_bits,\
+     lwe_dim,n_mutations,load_factor,n_attempted,n_succeeded,total_ms,ops_per_s,delta_bytes_total,\
      cells_per_slot,row_width,segment_rows,db_rows,db_cols";
 
 const HEADER_CLIENT: &str =
-    "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
-     n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
+    "backend,mutation_kind,patch_mode,arity,num_buckets,bucket_size,value_bits,plaintext_bits,\
+     lwe_dim,n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
      cells_per_slot,row_width,segment_rows,db_rows,db_cols";
 
 #[derive(Clone, Copy, Debug)]
@@ -122,6 +126,12 @@ struct Cli {
     arity: u32,
     #[arg(long, value_enum, default_value_t = Backend::Frodo)]
     backend: Backend,
+    /// Hint-patch realization(s) to sweep, comma-separated (entry|row).
+    /// The expensive populate + `IkpirServer::new` are still paid once;
+    /// every (mode, kind) pair replays against the same epoch-0 snapshot
+    /// via `reset_for_replay`. One server + one client CSV row per pair.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "entry")]
+    patch_mode: Vec<PatchMode>,
     #[arg(long, default_value_t = 16_384)]
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
@@ -376,6 +386,11 @@ fn run_one<S, B>(
                 is_default: matches.value_source("backend") != Some(ValueSource::CommandLine),
             },
             helpers::Knob {
+                name: "patch_mode",
+                value: helpers::patch_modes_label(&cli.patch_mode),
+                is_default: matches.value_source("patch_mode") != Some(ValueSource::CommandLine),
+            },
+            helpers::Knob {
                 name: "arity",
                 value: arity.to_string(),
                 is_default: matches.value_source("arity") != Some(ValueSource::CommandLine),
@@ -421,22 +436,37 @@ fn run_one<S, B>(
     }
 
     // ── 3. Phase 1: server mutation loops (one resident `A`) ───────────────────
-    // Run every kind's mutation loop on the single server, resetting to
-    // epoch 0 between kinds. Keeping one server alive (rather than building
-    // a fresh one per kind) holds peak coexisting `A` copies at 1 for the
-    // whole server phase. Deltas are collected per kind for the client
-    // phase; with the `--n-mutations` cap they total well under 1 GB.
+    // Run every (patch mode, kind) pair's mutation loop on the single
+    // server, resetting to epoch 0 between pairs. Keeping one server alive
+    // (rather than building a fresh one per pair) holds peak coexisting `A`
+    // copies at 1 for the whole server phase. Deltas are collected per pair
+    // for the client phase; with the `--n-mutations` cap they total well
+    // under 1 GB even with both modes swept.
     let kinds = MutationKind::all();
-    let mut results: Vec<KindResult<B>> = Vec::with_capacity(kinds.len());
-    for (idx, &kind) in kinds.iter().enumerate() {
-        if idx != 0 {
-            // Return the server to epoch 0 with a fresh snapshot store and
-            // the captured epoch-0 hints — no `A` / `H` recompute.
-            let mut store = S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
-            store.set_max_kicks(2_500);
-            server.reset_for_replay(store, hints0.clone());
+    let mut modes = cli.patch_mode.clone();
+    modes.dedup();
+    let mut results: Vec<(PatchMode, MutationKind, KindResult<B>)> =
+        Vec::with_capacity(modes.len() * kinds.len());
+    let mut first = true;
+    for &mode in &modes {
+        server.set_hint_patch_mode(mode.to_hint_patch_mode());
+        for &kind in kinds {
+            if !first {
+                // Return the server to epoch 0 with a fresh snapshot store and
+                // the captured epoch-0 hints — no `A` / `H` recompute. The
+                // patch mode survives the reset (it is plain server state).
+                let mut store =
+                    S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
+                store.set_max_kicks(2_500);
+                server.reset_for_replay(store, hints0.clone());
+            }
+            first = false;
+            results.push((
+                mode,
+                kind,
+                run_kind_loop::<S, B>(&mut server, cli, n_seed, kind),
+            ));
         }
-        results.push(run_kind_loop::<S, B>(&mut server, cli, n_seed, kind));
     }
     // Free the server (its `A`), the snapshot cells, and the epoch-0 hint
     // clone before the client phase so the client's freshly re-expanded
@@ -446,11 +476,12 @@ fn run_one<S, B>(
     drop(hints0);
 
     // ── 4. Phase 2: client apply_delta (one resident `A` at a time) ────────────
-    // Each kind builds a fresh empty-queue client from the shared epoch-0
-    // bundle and times apply_delta over that kind's collected deltas. The
+    // Each (mode, kind) pair builds a fresh empty-queue client from the
+    // shared epoch-0 bundle, sets the client's patch mode to the pair's
+    // mode, and times apply_delta over that pair's collected deltas. The
     // server-side CSV row (timed in Phase 1) is also written here via
     // `measure_and_write`, alongside the client-side row.
-    for (&kind, result) in kinds.iter().zip(results) {
+    for (mode, kind, result) in results {
         measure_and_write::<B>(
             csv_server,
             csv_client,
@@ -459,6 +490,7 @@ fn run_one<S, B>(
             num_buckets,
             lwe_dim_eff,
             kind,
+            mode,
             result,
             &bundle,
         );
@@ -474,6 +506,7 @@ fn measure_and_write<B>(
     num_buckets: u32,
     lwe_dim_eff: u32,
     kind: MutationKind,
+    mode: PatchMode,
     result: KindResult<B>,
     bundle: &ikpir_client::ServerSetupBundle<B>,
 ) where
@@ -504,7 +537,7 @@ fn measure_and_write<B>(
     // Server-side row.
     writeln!(
         csv_server,
-        "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{},{:.3},{:.2},{},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+        "{},{},{mode},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{},{:.3},{:.2},{},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
         cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
         cli.n_mutations, cli.load_factor,
         cli.n_mutations, n_succeeded, server_total_ms, server_ops_per_s, delta_bytes_total,
@@ -512,11 +545,11 @@ fn measure_and_write<B>(
 
     if deltas.is_empty() {
         eprintln!(
-            "  Skip client side kind={}: no deltas collected",
+            "  Skip client side kind={} mode={mode}: no deltas collected",
             kind.as_csv()
         );
         println!(
-            "  backend={} kind={:<6} arity={arity} nb={num_buckets:<7} N={:<4} | \
+            "  backend={} kind={:<6} mode={mode:<5} arity={arity} nb={num_buckets:<7} N={:<4} | \
              server: succ={}/{} total={:.1}ms ops/s={:.0} delta={}B | client: SKIPPED",
             cli.backend,
             kind.as_csv(),
@@ -534,8 +567,10 @@ fn measure_and_write<B>(
     // prepared-query queue (no precompute_queries / precompute_decodes).
     // Each apply_delta then patches only the hint H; the queue iteration
     // inside `client_patch_state` is a no-op when the queue is empty, so
-    // the timing reflects the "compute new hint" cost in isolation.
+    // the timing reflects the "compute new hint" cost in isolation —
+    // realized at this row's patch mode.
     let mut client = IkpirClient::<B>::from_setup(bundle.clone());
+    client.set_hint_patch_mode(mode.to_hint_patch_mode());
 
     let t = Instant::now();
     for d in deltas {
@@ -550,13 +585,13 @@ fn measure_and_write<B>(
 
     writeln!(
         csv_client,
-        "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+        "{},{},{mode},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
         cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
         cli.n_mutations, cli.load_factor, n_succeeded, client_total_ms, client_ops_per_s,
     ).unwrap();
 
     println!(
-        "  backend={} kind={:<6} arity={arity} nb={num_buckets:<7} N={:<4} | \
+        "  backend={} kind={:<6} mode={mode:<5} arity={arity} nb={num_buckets:<7} N={:<4} | \
          server: succ={}/{} total={:.1}ms ops/s={:.0} delta={}B | \
          client: total={:.1}ms ops/s={:.0}",
         cli.backend,

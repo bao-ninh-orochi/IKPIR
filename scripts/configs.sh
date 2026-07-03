@@ -135,6 +135,30 @@ for _b in "${BACKENDS_ARR[@]}"; do
 done
 unset _b
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Hint-patch realization selector — `--patch-mode entry|row` on the mutation
+# benches (server_mutation, client_mutation, mutation_throughput) only.
+#
+# entry = the iSimplePIR per-cell patch (library default, Θ(n) per touched
+# cell); row = the SimplePIR dense per-row baseline (Θ(n·ω) per touched
+# row). Both realizations produce identical state and identical delta wire
+# bytes; sweeping both isolates the patch-granularity cost — the two
+# mutation-phase columns of the paper's asymptotic table. The default
+# sweeps both; the fused mutation_throughput bench shares one populate +
+# setup across modes, so the extra mode costs only the additional timed
+# loops. Set IKPIR_BENCH_PATCH_MODES=entry to sweep one mode.
+# ─────────────────────────────────────────────────────────────────────────────
+IKPIR_BENCH_PATCH_MODES=${IKPIR_BENCH_PATCH_MODES:-entry,row}
+IFS=',' read -ra PATCH_MODES_ARR <<< "$IKPIR_BENCH_PATCH_MODES"
+
+for _m in "${PATCH_MODES_ARR[@]}"; do
+    case "$_m" in
+        entry|row) ;;
+        *) echo "[configs.sh] ERROR: unknown patch mode '$_m' (valid: entry, row)" >&2; exit 1 ;;
+    esac
+done
+unset _m
+
 # Backend-appropriate LWE dimension for 128-bit security, estimated via
 # the lattice estimator under the ADPS16 cost model. FrodoPIR uses 1566.
 # SimplePIR uses 1275 (at q=2^32, σ=6.4).
@@ -275,7 +299,7 @@ _pb_self_check() {
 _pb_self_check || exit 1
 unset -f _pb_self_check
 
-echo "[configs.sh] backends=${IKPIR_BENCH_BACKENDS} | ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) classical runs/bench/backend | mutation: ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits × lf=${MUTATION_LOAD_FACTOR} × N=1% capacity = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/bench/backend | head-to-head: ${#HEADTOHEAD_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#HEADTOHEAD_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/backend | pb=max-per-(backend,m_label)"
+echo "[configs.sh] backends=${IKPIR_BENCH_BACKENDS} | ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) classical runs/bench/backend | mutation: ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits × lf=${MUTATION_LOAD_FACTOR} × N=1% capacity = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/bench/backend × patch_modes=${IKPIR_BENCH_PATCH_MODES} | head-to-head: ${#HEADTOHEAD_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#HEADTOHEAD_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/backend | pb=max-per-(backend,m_label)"
 if [ "$IKPIR_SETUP_ESTIMATE" = 1 ]; then
     echo "[configs.sh] server_setup: per-segment estimate ON (--estimate; full = arity × one-segment time) → ~arity× faster; set IKPIR_SETUP_ESTIMATE=0 for the full IkpirServer::new ground truth"
 else

@@ -1,26 +1,30 @@
 //! **Intent:** Measure server-side insert / update / delete throughput and
 //! total delta wire cost for N mutations per kind, across both backends
-//! (FrodoPIR and SimplePIR).
+//! (FrodoPIR and SimplePIR) and both hint-patch realizations
+//! (entry-level and row-level).
 //!
 //! **Method:** Populate to `--load-factor` (default 0.90), snapshot the cell
-//! array, then for each mutation kind clone the snapshot and time N
-//! consecutive mutations with wall-clock. Reports n_succeeded, total_ms,
-//! ops_per_s = n_succeeded / total_ms × 1000, and the total delta bytes
-//! produced by those mutations.
+//! array, then for each (patch mode, mutation kind) pair clone the snapshot
+//! and time N consecutive mutations with wall-clock. Reports n_succeeded,
+//! total_ms, ops_per_s = n_succeeded / total_ms × 1000, and the total delta
+//! bytes produced by those mutations (identical across patch modes — the
+//! wire format does not depend on the realization).
 //!
 //! Wall-clock batch timing is used (not Criterion) because store state
 //! changes between mutations, making cycling meaningless.
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
-//! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
+//! default frodo), `--patch-mode` (entry|row, comma-separated list,
+//! default entry), `--num-buckets`, `--bucket-size`, `--value-bits`,
 //! `--lwe-dim` (backend-dependent default), `--n-mutations` (default 1024),
 //! `--load-factor` (default 0.90).
 //!
 //! **Output:** `results/ikpir_server_mutation.csv`
-//! Columns: backend, mutation_kind, arity, num_buckets, bucket_size,
-//! value_bits, plaintext_bits, lwe_dim, n_mutations, load_factor, n_attempted,
-//! n_succeeded, total_ms, ops_per_s, delta_bytes_total, cells_per_slot,
-//! row_width, segment_rows, db_rows, db_cols
+//! Columns: backend, mutation_kind, patch_mode, arity, num_buckets,
+//! bucket_size, value_bits, plaintext_bits, lwe_dim, n_mutations,
+//! load_factor, n_attempted, n_succeeded, total_ms, ops_per_s,
+//! delta_bytes_total, cells_per_slot, row_width, segment_rows, db_rows,
+//! db_cols
 //!
 //! `db_rows` / `db_cols` report the per-segment PIR matrix shape **after** any
 //! backend-specific reshape. For FrodoPIR this is `(segment_rows, row_width)`;
@@ -28,7 +32,7 @@
 
 mod helpers;
 
-use helpers::{Backend, CloneStore};
+use helpers::{Backend, CloneStore, PatchMode};
 use ikpir_server::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer, IncrementalPirBackend,
     IndexPirBackend, SimpleConfig, SimplePirBackend,
@@ -40,8 +44,8 @@ use std::io::Write;
 use std::time::Instant;
 
 const HEADER: &str =
-    "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
-    n_mutations,load_factor,n_attempted,n_succeeded,total_ms,ops_per_s,delta_bytes_total,\
+    "backend,mutation_kind,patch_mode,arity,num_buckets,bucket_size,value_bits,plaintext_bits,\
+    lwe_dim,n_mutations,load_factor,n_attempted,n_succeeded,total_ms,ops_per_s,delta_bytes_total,\
     cells_per_slot,row_width,segment_rows,db_rows,db_cols";
 
 #[derive(Clone, Copy, Debug)]
@@ -72,6 +76,10 @@ struct Cli {
     arity: u32,
     #[arg(long, value_enum, default_value_t = Backend::Frodo)]
     backend: Backend,
+    /// Hint-patch realization(s) to sweep, comma-separated (entry|row).
+    /// One CSV row per (kind, mode) pair.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "entry")]
+    patch_mode: Vec<PatchMode>,
     #[arg(long, default_value_t = 16_384)]
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
@@ -115,6 +123,7 @@ fn run_kind<S, B>(
     params: CuckooParams,
     n_seed: u64,
     kind: MutationKind,
+    mode: PatchMode,
     make_config: &impl Fn() -> B::Config,
 ) -> KindResult
 where
@@ -130,6 +139,7 @@ where
     // the same cuckoo-eviction headroom as the populate phase.
     store.set_max_kicks(2_500);
     let mut server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
+    server.set_hint_patch_mode(mode.to_hint_patch_mode());
 
     let mut delta_bytes_total = 0usize;
     let mut n_succeeded = 0u32;
@@ -230,6 +240,11 @@ fn run_one<S, B>(
             is_default: matches.value_source("backend") != Some(ValueSource::CommandLine),
         },
         helpers::Knob {
+            name: "patch_mode",
+            value: helpers::patch_modes_label(&cli.patch_mode),
+            is_default: matches.value_source("patch_mode") != Some(ValueSource::CommandLine),
+        },
+        helpers::Knob {
             name: "arity",
             value: arity.to_string(),
             is_default: matches.value_source("arity") != Some(ValueSource::CommandLine),
@@ -272,32 +287,36 @@ fn run_one<S, B>(
     ];
     helpers::print_preamble("server_mutation", &knobs, &store_state, &geom);
 
-    for &kind in MutationKind::all() {
-        let r = run_kind::<S, B>(cli, &cells, params, n_seed, kind, &make_config);
-        let ops_per_s = if r.total_ms > 0.0 {
-            r.n_succeeded as f64 / r.total_ms * 1e3
-        } else {
-            0.0
-        };
-        writeln!(
-            csv,
-            "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{},{:.3},{:.2},{},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
-            cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
-            cli.n_mutations, cli.load_factor,
-            r.n_attempted, r.n_succeeded, r.total_ms, ops_per_s, r.delta_bytes_total,
-        ).unwrap();
-        println!(
-            "  backend={} kind={:<6} arity={arity} nb={num_buckets:<7} N={:<4} | \
-             succ={}/{} total={:.1}ms ops/s={:.0} delta={}B",
-            cli.backend,
-            kind.as_csv(),
-            cli.n_mutations,
-            r.n_succeeded,
-            r.n_attempted,
-            r.total_ms,
-            ops_per_s,
-            r.delta_bytes_total,
-        );
+    let mut modes = cli.patch_mode.clone();
+    modes.dedup();
+    for &mode in &modes {
+        for &kind in MutationKind::all() {
+            let r = run_kind::<S, B>(cli, &cells, params, n_seed, kind, mode, &make_config);
+            let ops_per_s = if r.total_ms > 0.0 {
+                r.n_succeeded as f64 / r.total_ms * 1e3
+            } else {
+                0.0
+            };
+            writeln!(
+                csv,
+                "{},{},{mode},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{},{:.3},{:.2},{},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+                cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
+                cli.n_mutations, cli.load_factor,
+                r.n_attempted, r.n_succeeded, r.total_ms, ops_per_s, r.delta_bytes_total,
+            ).unwrap();
+            println!(
+                "  backend={} kind={:<6} mode={mode:<5} arity={arity} nb={num_buckets:<7} N={:<4} | \
+                 succ={}/{} total={:.1}ms ops/s={:.0} delta={}B",
+                cli.backend,
+                kind.as_csv(),
+                cli.n_mutations,
+                r.n_succeeded,
+                r.n_attempted,
+                r.total_ms,
+                ops_per_s,
+                r.delta_bytes_total,
+            );
+        }
     }
 }
 

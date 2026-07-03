@@ -1,25 +1,31 @@
 //! **Intent:** Measure client-side `apply_delta` throughput for N mutations
 //! per kind (insert / update / delete), in **empty-queue mode** (no
-//! precomputed slots), across both backends. The measurement isolates the
+//! precomputed slots), across both backends and both hint-patch
+//! realizations (entry-level and row-level). The measurement isolates the
 //! cost of patching the hint `H` from any warm-bc queue-maintenance work,
 //! giving a clean number for the "compute new hint" cost reported in the
-//! paper.
+//! paper — the quantity whose granularity the paper's two mutation-phase
+//! columns compare.
 //!
-//! **Method:** Populate to `--load-factor`, build a fresh client with no
-//! precompute (empty prepared-query queue), collect N deltas per kind from
-//! a fresh server clone, then time the full sequence of N apply_delta calls
-//! with wall-clock Instant. The timed loop runs exactly once (state
-//! advances with each mutation, so criterion cycling is not meaningful).
+//! **Method:** Populate to `--load-factor`, collect N deltas per kind from
+//! a fresh server clone (deltas are identical under either patch mode),
+//! then per patch mode build a fresh client with no precompute (empty
+//! prepared-query queue), set the client's `HintPatchMode`, and time the
+//! full sequence of N apply_delta calls with wall-clock Instant. The timed
+//! loop runs exactly once per (kind, mode) (state advances with each
+//! mutation, so criterion cycling is not meaningful).
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
-//! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
+//! default frodo), `--patch-mode` (entry|row, comma-separated list,
+//! default entry), `--num-buckets`, `--bucket-size`, `--value-bits`,
 //! `--lwe-dim` (backend-dependent default), `--n-mutations` (default 1024),
 //! `--load-factor` (default 0.90).
 //!
 //! **Output:** `results/ikpir_client_mutation.csv`
-//! Columns: backend, mutation_kind, arity, num_buckets, bucket_size,
-//! value_bits, plaintext_bits, lwe_dim, n_mutations, load_factor, n_succeeded,
-//! total_ms, ops_per_s, cells_per_slot, row_width, segment_rows, db_rows, db_cols
+//! Columns: backend, mutation_kind, patch_mode, arity, num_buckets,
+//! bucket_size, value_bits, plaintext_bits, lwe_dim, n_mutations,
+//! load_factor, n_succeeded, total_ms, ops_per_s, cells_per_slot,
+//! row_width, segment_rows, db_rows, db_cols
 //!
 //! `db_rows` / `db_cols` report the per-segment PIR matrix shape **after** any
 //! backend-specific reshape. For FrodoPIR this is `(segment_rows, row_width)`;
@@ -27,7 +33,7 @@
 
 mod helpers;
 
-use helpers::{Backend, CloneStore};
+use helpers::{Backend, CloneStore, PatchMode};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient,
     IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
@@ -40,8 +46,8 @@ use std::io::Write;
 use std::time::Instant;
 
 const HEADER: &str =
-    "backend,mutation_kind,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,\
-    n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
+    "backend,mutation_kind,patch_mode,arity,num_buckets,bucket_size,value_bits,plaintext_bits,\
+    lwe_dim,n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
     cells_per_slot,row_width,segment_rows,db_rows,db_cols";
 
 #[derive(Clone, Copy, Debug)]
@@ -72,6 +78,10 @@ struct Cli {
     arity: u32,
     #[arg(long, value_enum, default_value_t = Backend::Frodo)]
     backend: Backend,
+    /// Hint-patch realization(s) to sweep, comma-separated (entry|row).
+    /// One CSV row per (kind, mode) pair.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "entry")]
+    patch_mode: Vec<PatchMode>,
     #[arg(long, default_value_t = 16_384)]
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
@@ -213,6 +223,11 @@ fn run_one<S, B>(
             is_default: matches.value_source("backend") != Some(ValueSource::CommandLine),
         },
         helpers::Knob {
+            name: "patch_mode",
+            value: helpers::patch_modes_label(&cli.patch_mode),
+            is_default: matches.value_source("patch_mode") != Some(ValueSource::CommandLine),
+        },
+        helpers::Knob {
             name: "arity",
             value: arity.to_string(),
             is_default: matches.value_source("arity") != Some(ValueSource::CommandLine),
@@ -255,6 +270,8 @@ fn run_one<S, B>(
     ];
     helpers::print_preamble("client_mutation", &knobs, &store_state, &geom);
 
+    let mut modes = cli.patch_mode.clone();
+    modes.dedup();
     for &kind in MutationKind::all() {
         let (deltas, n_succeeded) =
             collect_deltas_for_kind::<S, B>(&cells, params, n_seed, cli, kind, &make_config);
@@ -263,36 +280,44 @@ fn run_one<S, B>(
             continue;
         }
 
-        // Build a fresh client with an empty prepared-query queue. No
-        // precompute_queries / precompute_decodes — every apply_delta
-        // patches only the hint H (the queue iteration in
-        // `client_patch_state` is a no-op when the queue is empty), so
-        // the timing reflects the "compute new hint" cost in isolation.
-        let mut client = IkpirClient::<B>::from_setup(bundle.clone());
+        // The deltas are identical under either patch mode (the wire
+        // format does not depend on the realization), so they are
+        // collected once per kind and replayed per mode.
+        for &mode in &modes {
+            // Build a fresh client with an empty prepared-query queue. No
+            // precompute_queries / precompute_decodes — every apply_delta
+            // patches only the hint H (the queue iteration in
+            // `client_patch_state` is a no-op when the queue is empty), so
+            // the timing reflects the "compute new hint" cost in isolation.
+            let mut client = IkpirClient::<B>::from_setup(bundle.clone());
+            client.set_hint_patch_mode(mode.to_hint_patch_mode());
 
-        // Wall-clock time the full N apply_delta sequence.
-        let t = Instant::now();
-        for d in deltas {
-            client.apply_delta(d).expect("apply_delta");
+            // Clone outside the timed bracket, then wall-clock time the
+            // full N apply_delta sequence.
+            let replay = deltas.clone();
+            let t = Instant::now();
+            for d in replay {
+                client.apply_delta(d).expect("apply_delta");
+            }
+            let total_ms = t.elapsed().as_secs_f64() * 1e3;
+            let ops_per_s = n_succeeded as f64 / total_ms * 1e3;
+
+            writeln!(
+                csv,
+                "{},{},{mode},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+                cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
+                cli.n_mutations, cli.load_factor, n_succeeded, total_ms, ops_per_s,
+            ).unwrap();
+            println!(
+                "  backend={} kind={:<6} mode={mode:<5} arity={arity} nb={num_buckets:<7} N={:<4} | \
+                 {:.2} apply_delta/s (total={:.1}ms)",
+                cli.backend,
+                kind.as_csv(),
+                cli.n_mutations,
+                ops_per_s,
+                total_ms,
+            );
         }
-        let total_ms = t.elapsed().as_secs_f64() * 1e3;
-        let ops_per_s = n_succeeded as f64 / total_ms * 1e3;
-
-        writeln!(
-            csv,
-            "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
-            cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
-            cli.n_mutations, cli.load_factor, n_succeeded, total_ms, ops_per_s,
-        ).unwrap();
-        println!(
-            "  backend={} kind={:<6} arity={arity} nb={num_buckets:<7} N={:<4} | \
-             {:.2} apply_delta/s (total={:.1}ms)",
-            cli.backend,
-            kind.as_csv(),
-            cli.n_mutations,
-            ops_per_s,
-            total_ms,
-        );
     }
 }
 

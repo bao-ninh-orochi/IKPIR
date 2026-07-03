@@ -10,6 +10,7 @@
 #   ./scripts/run_mutation.sh                                    # FrodoPIR only (default)
 #   IKPIR_BENCH_BACKENDS=simple       ./scripts/run_mutation.sh
 #   IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_mutation.sh  # both backends
+#   IKPIR_BENCH_PATCH_MODES=entry ./scripts/run_mutation.sh      # one realization (default entry,row)
 #   MAX_MEM_GB=20.0 ./scripts/run_mutation.sh   # override OOM guard (default 85 GB)
 #
 # Memory: dominant allocation is the per-segment LWE public matrix A (in
@@ -37,6 +38,10 @@
 #   separate MUTATION_CONFIGS array was unified into BENCH_CONFIGS.)
 #   n_mutations = min(capacity / 100, N_MUTATIONS_CAP)  (see below).
 #   load_factor = MUTATION_LOAD_FACTOR (0.90).
+#   patch modes = IKPIR_BENCH_PATCH_MODES (default entry,row): each run
+#   emits one server + one client CSV row per (patch mode, kind) pair,
+#   sharing one populate + IkpirServer::new across all pairs — the extra
+#   mode adds only its timed loops, not another expensive setup.
 #
 # Output (two CSV files in results/):
 #   ikpir-client/results/ikpir_server_mutation.csv
@@ -109,17 +114,18 @@ for backend in "${BACKENDS_ARR[@]}"; do
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
-            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb N=$n_mut lf=$MUTATION_LOAD_FACTOR"
+            note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb N=$n_mut lf=$MUTATION_LOAD_FACTOR modes=$IKPIR_BENCH_PATCH_MODES"
             "${CARGO[@]}" -- \
-                --backend         "$backend"              \
-                --arity           "$arity"                \
-                --num-buckets     "$nb"                   \
-                --bucket-size     "$bs"                   \
-                --value-bits      "$vb"                   \
-                --plaintext-bits  "$pb"                   \
-                --lwe-dim         "$lwe"                  \
-                --n-mutations     "$n_mut"                \
-                --load-factor     "$MUTATION_LOAD_FACTOR" \
+                --backend         "$backend"                 \
+                --patch-mode      "$IKPIR_BENCH_PATCH_MODES" \
+                --arity           "$arity"                   \
+                --num-buckets     "$nb"                      \
+                --bucket-size     "$bs"                      \
+                --value-bits      "$vb"                      \
+                --plaintext-bits  "$pb"                      \
+                --lwe-dim         "$lwe"                     \
+                --n-mutations     "$n_mut"                   \
+                --load-factor     "$MUTATION_LOAD_FACTOR"    \
                 --max-mem-gb      "$MAX_MEM_GB"
         done
     done

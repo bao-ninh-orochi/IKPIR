@@ -7,11 +7,13 @@
 #   IKPIR_BENCH_BACKENDS=frodo                  # default: FrodoPIR only
 #   IKPIR_BENCH_BACKENDS=simple                 # SimplePIR only
 #   IKPIR_BENCH_BACKENDS=frodo,simple           # both backends (~2× runtime)
+#   IKPIR_BENCH_PATCH_MODES=entry               # client_mutation: one hint-patch realization (default entry,row)
 #
 # Config matrix (scripts/configs.sh):
 #   client_query    12 cfgs × 3 value_bits = 36 runs/backend  (warm-bc)
 #   client_decode   12 cfgs × 3 value_bits = 36 runs/backend  (warm-bc)
-#   client_mutation 12 cfgs × 3 value_bits × N=1% capacity = 36 runs/backend (warm-bc)
+#   client_mutation 12 cfgs × 3 value_bits × N=1% capacity = 36 runs/backend (empty-queue)
+#                   (each run emits one CSV row per (patch mode, kind) pair)
 # (All three sweeps now share BENCH_CONFIGS — the historical separate
 # MUTATION_CONFIGS array was unified into BENCH_CONFIGS.)
 #
@@ -134,9 +136,10 @@ run_client_mutation() {
             for i in "${!VALUE_BITS[@]}"; do
                 vb=${VALUE_BITS[$i]}
                 w=${W_LABELS[$i]}
-                note "arity=$arity bs=$bs nb=$nb (m=$m_label) w=$w N=$n_mut lwe=$lwe pb=$pb"
+                note "arity=$arity bs=$bs nb=$nb (m=$m_label) w=$w N=$n_mut lwe=$lwe pb=$pb modes=$IKPIR_BENCH_PATCH_MODES"
                 "${CARGO[@]}" client_mutation -- \
                     --backend "$backend" \
+                    --patch-mode "$IKPIR_BENCH_PATCH_MODES" \
                     --arity "$arity" --num-buckets "$nb" \
                     --bucket-size "$bs" --value-bits "$vb" \
                     --plaintext-bits "$pb" \
