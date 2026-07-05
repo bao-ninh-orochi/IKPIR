@@ -1,8 +1,22 @@
-# Incremental Keyword PIR
+# Incremental Keyword PIR (RisePIR)
 
-A research prototype of **Incremental Keyword PIR** — a single-server keyword-PIR
-construction that supports efficient **insert / update / delete** on the server's
-database, while preserving the one-round structure of state-of-the-art schemes.
+A research prototype of **Incremental Keyword PIR (IKPIR)** — a single-server
+keyword-PIR construction that supports efficient **insert / update / delete** on
+the server's database, while preserving the one-round structure of
+state-of-the-art schemes.
+
+This is the open-source implementation accompanying the paper *"Incremental
+Keyword Private Information Retrieval from d-ary Segmented Cuckoo Filters"*
+(CANS 2026 submission). The paper builds IKPIR generically from any **updatable
+index PIR (UIPIR)** and instantiates the construction over LWE as **RisePIR**,
+in two variants:
+
+- **RisePIR-F** — over FrodoPIR: `IkpirServer<S, FrodoPirBackend>` / `IkpirClient<FrodoPirBackend>`;
+- **RisePIR-S** — over SimplePIR: `IkpirServer<S, SimplePirBackend>` / `IkpirClient<SimplePirBackend>`.
+
+The crates keep the generic names (`ikpir-*`): the code implements the generic
+IKPIR-from-UIPIR construction, and the RisePIR variants are what you get by
+choosing a backend at the `B: IndexPirBackend` type parameter.
 
 > **Status.** Research prototype. Interfaces, parameters, and internals are
 > subject to change.
@@ -62,9 +76,13 @@ Combined with an efficient preprocessing-update technique, SCF yields an
 
 ## Compatibility
 
-The construction is compatible with **any single-server Index-based PIR**.
-This repository targets in particular **FrodoPIR** and **SimplePIR**, two
-LWE-based Index-PIR schemes that offer high server throughput and well-studied post-quantum security.
+The construction is compatible with **any single-server Index-based PIR**
+that supports efficient in-place updates — the paper's **UIPIR** interface,
+realised in code as the `IndexPirBackend` (+ `IncrementalPirBackend`) trait
+family. This repository ships two such backends, **FrodoPIR** and
+**SimplePIR** — LWE-based Index-PIR schemes that offer high server throughput
+and well-studied post-quantum security — yielding the paper's RisePIR-F and
+RisePIR-S.
 
 ## Implementation status
 
@@ -89,6 +107,52 @@ LWE-based Index-PIR schemes that offer high server throughput and well-studied p
 | [`ikpir-server/README.md`](ikpir-server/README.md) | Server quick start and backend implementation guide |
 | [`ikpir-client/CLAUDE.md`](ikpir-client/CLAUDE.md) | Client crate internals, epoch state machine, failure modes |
 | [`ikpir-client/README.md`](ikpir-client/README.md) | Client quick start and lifecycle overview |
+
+## Paper ↔ code notation
+
+The paper's notation maps onto the code as follows.
+
+**Filter layer (SCF / KV-SCF, paper §4–§5.1).**
+
+| Paper | Meaning | Code |
+|---|---|---|
+| `d` | arity: candidate buckets per key = number of segments | `arity`, `CuckooParams::arity()` |
+| `b` | slots per bucket | `bucket_size` |
+| `n_b` | total buckets | `num_buckets` |
+| `s = n_b / d` | buckets per segment (a power of two) | `CuckooParams::segment_size()` |
+| `f` | fingerprint bits (benches fix 32) | `fingerprint_bits` |
+| `ℓ` | value bits | `value_bits` |
+| `fp(k) ‖ v` slot payload | fingerprint-then-value cell packing | `pack_slot_cells` / `unpack_slot_cells` |
+| `MaxKicks` | eviction-walk budget | `MAX_KICKS_DEFAULT` (= 500) |
+| `Candidates(x)` | candidate buckets of a key | `CuckooParams::candidate_buckets()`, `IndexScheme::hash_item` |
+| `AltBuckets(i, φ)` | rebuild candidates from one bucket + fingerprint | `IndexScheme::all_indices` |
+| write log `W` | per-mutation slot-change records | `SlotMutation`, `CuckooKVStore::drain_mutations` |
+| `KV-SCF` | SCF-backed key-value store | `CuckooKVStore<S>` (`Segmented{2,3,4}aryCuckooKVStore`) |
+
+**PIR layer (UIPIR / LWE-PIR, paper §3.1 and Appendix A).**
+
+| Paper | Meaning | Code |
+|---|---|---|
+| `UIPIR.Setup` | preprocess one segment | `IndexPirBackend::server_setup` |
+| `UIPIR.Query / Answer / Recover` | online phase | `client_query` / `server_answer` / `client_decode` |
+| `UIPIR.DBMutation + HintUpdate` | mutation phase | server `insert/update/delete` → `IncrementalPirBackend::server_patch_hint`; client `IkpirClient::apply_delta` → `client_patch_state` |
+| `IKPIR.Setup(DB)` | offline phase, all `d` segments | `IkpirServer::new` + `IkpirServer::setup` → `ServerSetupBundle` |
+| `IKPIR.Query / Answer / Recover` | keyword online phase | `IkpirClient::build_query` / `IkpirServer::answer` / `IkpirClient::decode` |
+| transcript `trans = (S_j)` | sparse per-segment overwrites | `HintDeltaBundle`, `SegmentRowDeltas` |
+| hint `H = A·D` | client preprocessing material | `B::Hint` (`FrodoHint` / `SimpleHint`) |
+| `A` (expanded from seed `β`) | public LWE matrix, never on the wire | `B::HintMaterial`, `expand_hint_material` |
+| `n` | LWE dimension | `lwe_dim` (1566 FrodoPIR / 1275 SimplePIR) |
+| `q = 2³²` | ciphertext modulus | native `u32` wraparound |
+| `p = 2^pb` | plaintext modulus | `plaintext_bits` |
+| `Δ = q/p` | plaintext↔ciphertext scaling | `round_p_to_q` / `round_q_to_p` |
+| `χ_s, χ_e` | secret / error distributions | `sample_ternary_into` (FrodoPIR); `sample_uniform_zq_into` + `sample_discrete_gaussian_into` (SimplePIR) |
+| `(ρ, ω)` reshape | per-segment matrix shape | FrodoPIR: identity `(n_rows, row_width)`; SimplePIR: near-square via `reshape_dims` |
+| row-level / entry-level patch (Fig. 7) | hint-patch realizations | `HintPatchMode::RowLevel` / `HintPatchMode::EntryLevel` (default) |
+
+One caveat on the letter `δ`/`Δ`: the paper uses `Δ = q/p` for the LWE
+scaling, `δ` for correctness-failure probability, and the code additionally
+uses "delta" for sparse hint patches (`HintDeltaBundle`, `row_deltas`). The
+table above is the disambiguation.
 
 ## Benches
 
@@ -119,11 +183,22 @@ IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh      # SimplePIR only
 ```
 
 **Plaintext bits per config.** The orchestrator selects the largest
-`plaintext_bits` whose noise budget admits `q = 2^32` for each
-`(backend, DB size)` pair (FrodoPIR Eq. 8 `q ≥ 8·p²·√m`; SimplePIR App. C.2
-Eq. 2 `⌊q/p⌋ ≥ √2·σ·p·N^{1/4}·√ln(2/δ)` with σ = 6.4, δ = 2⁻⁴⁰).
-The chosen `pb` lands in `scripts/configs.sh::backend_plaintext_bits` and
-appears as a column in every CSV — see `scripts/configs.sh` for the table.
+`plaintext_bits` whose noise budget admits `q = 2^32`, evaluated at the
+**per-segment matrix each backend actually multiplies** (one index-PIR
+instance per SCF segment): FrodoPIR Eq. 8 `q ≥ 8·p²·√m` with
+`m = num_buckets / arity`, and SimplePIR Theorem C.1 adjusted for this
+implementation's uncentered cells and near-square reshape,
+`q/p ≥ 2√2·σ·√ln(2/δ)·p·√R` with σ = 6.4, δ = 2⁻⁴⁰ — which makes the
+SimplePIR operating point depend on `value_bits`. The single source of
+truth is `ikpir_common::pir_params` (invoked by
+`scripts/configs.sh::backend_plaintext_bits` via the `max_plaintext_bits`
+example); the chosen `pb` appears as a column in every CSV. The
+`#[ignore]`d `noise_margin` tests in `ikpir-common` validate the selected
+operating points empirically:
+
+```bash
+cargo test -p ikpir-common --release -- --ignored noise_margin --nocapture
+```
 
 For one-off measurements, invoke `cargo bench` directly. The CLI default
 for `--plaintext-bits` is `8` (safe everywhere, but usually below the max

@@ -28,6 +28,7 @@ under all three paths.
 | `backend::frodo` | `FrodoPirBackend`, `FrodoConfig`, `FrodoParams`, plus the associated `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` types (ternary LWE, tall-skinny `n_rows × row_width` matrix; default `lwe_dim = 1566`) |
 | `backend::simple` | `SimplePirBackend`, `SimpleConfig`, `SimpleParams`, plus the associated `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` types (discrete-Gaussian LWE with σ = 6.4, internal `√N × √N` reshape; default `lwe_dim = 1275`) |
 | `wire` | `ServerSetupBundle`, `PirQueryBundle`, `PirResponseBundle`, `HintDeltaBundle`, `SegmentRowDeltas` type alias |
+| `pir_params` | `frodo_max_plaintext_bits` / `simple_max_plaintext_bits` — largest `plaintext_bits` each backend decodes correctly at `q = 2³²` for a given per-segment geometry (the bench orchestration consumes this via the `max_plaintext_bits` example) |
 | `error` | `IkpirError` enum (`StaleEpoch`, `MalformedQuery`, `TableFull`, `NotFound`, `InvalidInput`) |
 
 ## Trait family at a glance

@@ -31,6 +31,8 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/backend/simple/backend.rs` | `SimplePirBackend` impl of all four traits + `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` + internal `reshape_dims` / `translate` helpers |
 | `src/backend/simple/arith.rs` | Δ-scaling (duplicated from frodo per project rule) |
 | `src/backend/simple/sampler.rs` | `sample_a` + `sample_uniform_zq_into` (secret) + `sample_discrete_gaussian_into` (Box–Muller error) |
+| `src/pir_params.rs` | Operating-point selection: `frodo_max_plaintext_bits` / `simple_max_plaintext_bits` — the largest `plaintext_bits` each backend decodes correctly at `q = 2³²`, evaluated at the per-segment matrix shape (full derivation of both correctness bounds in the module docs) |
+| `examples/max_plaintext_bits.rs` | Dependency-free CLI over `pir_params`, consumed by `scripts/configs.sh::backend_plaintext_bits` |
 
 ## 3. Key design decisions (the WHY)
 
@@ -94,7 +96,11 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
   each segment. The SCF candidate-bucket set is public and
   deterministic; an observer who sees many queries learns which SCF
   buckets were touched, not the slot contents or fingerprint value.
-  Constant-time decode is out of scope.
+  On side channels: the LWE matvecs avoid data-dependent shortcuts on
+  secret values (skips keyed only on the public matrix `A` are fine),
+  and `IkpirClient::decode` scans fingerprints with a branchless
+  compare as best-effort hardening — but a full constant-time-audited
+  decode path is out of scope for this prototype.
 
 ## 4. Trait family
 
@@ -181,6 +187,7 @@ composition.
 | Task | Where to look |
 |---|---|
 | Backend trait contract | `backend/mod.rs::IndexPirBackend` + the three extension traits |
+| Max safe `plaintext_bits` for a geometry | `pir_params.rs` (library) / `examples/max_plaintext_bits.rs` (CLI); empirical validation via the `#[ignore]`d `noise_margin` tests in both `backend/*/backend.rs` |
 | FrodoPIR config knobs | `backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
 | SimplePIR config knobs | `backend/simple/params.rs::SimpleConfig` (`lwe_dim`, `sigma`) |
 | Implement a new backend | mirror `backend/frodo/backend.rs` (tall-skinny) or `backend/simple/backend.rs` (square reshape); see backend-author checklist below |

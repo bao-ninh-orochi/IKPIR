@@ -29,10 +29,6 @@ ikpir-client = { workspace = true }
 clap         = { workspace = true }
 criterion    = { workspace = true }
 
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
 [[bench]]
 name    = "server_setup"
 harness = false

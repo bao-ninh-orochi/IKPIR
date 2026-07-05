@@ -209,7 +209,9 @@ Three focused benches covering classical and incremental server criteria for the
 - One invocation = one CSV row (append-mode writer); the orchestrator
   is responsible for `rm`-ing the CSV before sweeping.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
-  crates — same content lives in `ikpir-client/benches/helpers.rs`):
+  crates — a common core is mirrored in `ikpir-client/benches/helpers.rs`;
+  the client copy additionally carries `verify_decode` and the
+  fused-bench plumbing):
     - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard

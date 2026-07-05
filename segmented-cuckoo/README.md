@@ -20,6 +20,12 @@ computation. A segmented filter additionally gives every item a *deterministic,
 fixed* set of lookup positions — the property IKPIR relies on to keep keyword
 lookups to a single Index-PIR query.
 
+> **Notation.** This README uses `k` for the arity, following the k-ary
+> cuckoo-hashing literature it compares against; the accompanying CANS 2026
+> paper calls the same parameter `d` (the *d-ary Segmented Cuckoo Filter*,
+> SCF) and the code calls it `arity`. `k`, `d`, and `arity` are the same
+> number throughout.
+
 ## Contributions
 
 - **k-ary partial-key cuckoo hashing.** Extends the XOR partial-key scheme of
