@@ -71,10 +71,12 @@ for backend in "${BACKENDS_ARR[@]}"; do
     lwe=$(backend_lwe_dim "$backend")
     for cfg in "${HEADTOHEAD_CONFIGS[@]}"; do
         IFS=':' read -r num_keys arity bs nb m_label <<< "$cfg"
-        pb=$(backend_plaintext_bits "$backend" "$m_label")
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
+            # pb depends on value_bits for the SimplePIR backend, so the
+            # lookup lives inside the value-bits loop.
+            pb=$(backend_plaintext_bits "$backend" "$arity" "$bs" "$nb" "$vb")
             note "N=$num_keys arity=$arity bs=$bs nb=$nb (m=$m_label) w=$w lwe=$lwe pb=$pb"
             "${CARGO[@]}" -- \
                 --backend         "$backend"     \

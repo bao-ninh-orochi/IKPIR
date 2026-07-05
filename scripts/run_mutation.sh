@@ -107,13 +107,15 @@ for backend in "${BACKENDS_ARR[@]}"; do
     lwe=$(backend_lwe_dim "$backend")
     for cfg in "${BENCH_CONFIGS[@]}"; do
         IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
-        pb=$(backend_plaintext_bits "$backend" "$m_label")
         capacity=$(( nb * bs ))
         n_mut=$(( capacity / 100 ))   # 1 % of capacity
         if (( n_mut > N_MUTATIONS_CAP )); then n_mut=$N_MUTATIONS_CAP; fi
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
+            # pb depends on value_bits for the SimplePIR backend, so the
+            # lookup lives inside the value-bits loop.
+            pb=$(backend_plaintext_bits "$backend" "$arity" "$bs" "$nb" "$vb")
             note "arity=$arity bs=$bs nb=$nb (n=$n_label, m=$m_label) w=$w lwe=$lwe pb=$pb N=$n_mut lf=$MUTATION_LOAD_FACTOR modes=$IKPIR_BENCH_PATCH_MODES"
             "${CARGO[@]}" -- \
                 --backend         "$backend"                 \

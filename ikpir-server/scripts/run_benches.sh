@@ -53,7 +53,8 @@ backend_note() { echo -e "${MAGENTA}▶ backend=$1${RESET}"; }
 # Helper: iterate BENCH_CONFIGS × VALUE_BITS (36 pairs).
 # Calls `$1 arity bucket_size num_buckets n_label m_label value_bits w_label`.
 # Each callback also reads `$backend` / `$lwe` / `$pb` from the enclosing scope:
-# `pb` is recomputed per cfg via `backend_plaintext_bits`.
+# `pb` is recomputed per (cfg, value_bits) via `backend_plaintext_bits` —
+# the SimplePIR bound depends on value_bits, so per-cfg is not enough.
 # ─────────────────────────────────────────────────────────────────────────────
 
 for_each_bench_config() {
@@ -62,10 +63,10 @@ for_each_bench_config() {
     local i vb w
     for cfg in "${BENCH_CONFIGS[@]}"; do
         IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
-        pb=$(backend_plaintext_bits "$backend" "$m_label")
         for i in "${!VALUE_BITS[@]}"; do
             vb=${VALUE_BITS[$i]}
             w=${W_LABELS[$i]}
+            pb=$(backend_plaintext_bits "$backend" "$arity" "$bs" "$nb" "$vb")
             "$cb" "$arity" "$bs" "$nb" "$n_label" "$m_label" "$vb" "$w"
         done
     done
@@ -143,11 +144,12 @@ run_server_mutation() {
         local cfg arity bs nb n_label m_label n_mut pb i vb w
         for cfg in "${BENCH_CONFIGS[@]}"; do
             IFS=':' read -r arity bs nb n_label m_label <<< "$cfg"
-            pb=$(backend_plaintext_bits "$backend" "$m_label")
             n_mut=$(( nb * bs / 100 ))
             for i in "${!VALUE_BITS[@]}"; do
                 vb=${VALUE_BITS[$i]}
                 w=${W_LABELS[$i]}
+                # pb depends on value_bits for the SimplePIR backend.
+                pb=$(backend_plaintext_bits "$backend" "$arity" "$bs" "$nb" "$vb")
                 note "arity=$arity bs=$bs nb=$nb (m=$m_label) w=$w N=$n_mut lwe=$lwe pb=$pb modes=$IKPIR_BENCH_PATCH_MODES"
                 "${CARGO[@]}" server_mutation -- \
                     --backend "$backend" \

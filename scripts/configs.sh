@@ -18,8 +18,11 @@
 #  * lwe_dim: 1566 for FrodoPIR, 1275 for SimplePIR (lattice estimator, ADPS16).
 #  * fingerprint_bits=32, q=2^32 — fixed.
 #  * plaintext_bits is the per-config maximum supported by the noise budget
-#    of each backend at q=2^32. Looked up via `backend_plaintext_bits` (see
-#    "Plaintext-bits table" below); maps (backend, m_label) → pb.
+#    of each backend at q=2^32, computed by `backend_plaintext_bits` from
+#    (backend, arity, bucket_size, num_buckets, value_bits) via the
+#    `ikpir-common` selector (see "Plaintext-bits selection" below).
+#    SimplePIR's pb depends on value_bits, so look it up inside the
+#    value-bits loop.
 #
 # Total-entries coverage (all > 1 M; 2 sizes per (arity, bucket_size) pair):
 #   (2,4) (4,1) (4,2): 2^20 (1.05 M), 2^22 (4.19 M).
@@ -37,6 +40,10 @@
 #                  (also the key into the plaintext-bits table below)
 # 12 tuples: 6 (arity, bucket_size) pairs × 2 DB sizes, all > 1 M.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Workspace root (configs.sh lives in <root>/scripts) — used to anchor the
+# `cargo run` invocation in backend_plaintext_bits regardless of caller cwd.
+IKPIR_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BENCH_CONFIGS=(
     # arity=2, bucket_size=4 — total_entries ∈ {2^20, 2^22}
@@ -196,110 +203,92 @@ case "$IKPIR_SETUP_ESTIMATE" in
 esac
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plaintext-bits table — pb_max per (backend, DB size) at q = 2^32.
+# Plaintext-bits selection — pb_max per (backend, SCF geometry, value_bits)
+# at q = 2^32.
 #
-# DB size = num_buckets × bucket_size  (total cuckoo capacity, keyed by
-# m_label). For each unique m_label across BENCH_CONFIGS, the table below
-# encodes the largest plaintext_bits value satisfying each backend's
-# correctness equation; this is the "smallest cells_per_slot" / "fastest
-# PIR" operating point each backend supports.
+# Single source of truth: `ikpir-common/src/pir_params.rs`, invoked through
+# the `max_plaintext_bits` example. Each backend's own correctness equation
+# is evaluated at the **per-segment** matrix it actually multiplies (one
+# index-PIR instance per SCF segment), not at the total store capacity:
 #
-# FrodoPIR (paper eq. 8 / §5.1):
-#     q ≥ 8 · p^2 · √m          where m = DB size, p = 2^pb
-#   ⇒ p_max = √(2^32 / (8 · √m))
+# FrodoPIR (paper eq. 8 / Theorem 2):
+#     q ≥ 8 · p² · √m       where m = num_buckets / arity  (rows per
+#                           segment; one bucket per matrix row), p = 2^pb.
+#   Independent of value_bits — wider values add columns, not rows.
 #
-#   | DB size       | p_max  | pb | slack vs q=2^32 |
-#   |---------------|--------|----|-----------------|
-#   | 2^18          | 1024   | 10 | 1.00× boundary  |
-#   | 2^20          |  724.1 |  9 | 2.00×           |
-#   | 2^22          |  512.0 |  9 | 1.00× boundary  |
-#   | 3·2^17        |  925.0 |  9 | 3.27×           |
-#   | 3·2^18        |  778.1 |  9 | 2.31×           |
-#   | 3·2^19        |  654.0 |  9 | 1.63×           |
-#   | 3·2^20        |  550.4 |  9 | 1.16×           |
-#   | 9·2^15        |  994.3 |  9 | 3.77×           |
-#   | 9·2^17        |  703.1 |  9 | 1.89×           |
-#   | 9·2^19        |  497.1 |  8 | 3.77×           |
+# SimplePIR (paper Theorem C.1, adjusted for this implementation):
+#     Δ = q/p ≥ 2√2 · σ · √(ln(2/δ)) · p · √R ,   σ = 6.4, δ = 2^-40,
+#   where R is the reshape row count of the per-segment matrix at that
+#   same pb:  R = ⌈s/k⌉, k = max(1, round(√(s/row_width))),
+#   row_width = bucket_size · ⌈(fingerprint_bits + value_bits)/pb⌉.
+#   Two deltas vs the published form √2·σ·p·N^(1/4)·√(ln(2/δ)):
+#   N^(1/4) → √R (the reshape is near-square over the per-segment cells,
+#   so R depends on value_bits), and 2√2 vs √2 (our cells live uncentered
+#   in [0, p), the theorem assumes centered entries ≤ p/2). Because of
+#   the R-dependence, SimplePIR's pb varies with value_bits — the lookup
+#   MUST happen inside the value-bits loop.
 #
-# SimplePIR (paper Appendix C.2, eq. 2):
-#     ⌊q/p⌋ ≥ √2 · σ · p · N^(1/4) · √(ln(2/δ))
-#       where σ = 6.4, δ = 2^-40 ⇒ factor ≈ 48.249
-#   ⇒ p_max = √(2^32 / (48.249 · N^(1/4)))
+# Reference values across BENCH_CONFIGS (fingerprint 32 bits, σ = 6.4),
+# regenerated from the selector; the empirical counterparts are the
+# `#[ignore]`d noise_margin probes in the two backend test suites:
 #
-#   | DB size       | p_max  | pb | slack vs q=2^32 |
-#   |---------------|--------|----|-----------------|
-#   | 2^18          | 1983.6 | 10 | 3.76×           |
-#   | 2^20          | 1668.3 | 10 | 2.65×           |
-#   | 2^22          | 1402.5 | 10 | 1.88×           |
-#   | 3·2^17        | 1885.2 | 10 | 3.39×           |
-#   | 3·2^18        | 1729.1 | 10 | 2.85×           |
-#   | 3·2^19        | 1585.5 | 10 | 2.40×           |
-#   | 3·2^20        | 1453.8 | 10 | 2.02×           |
-#   | 9·2^15        | 1954.7 | 10 | 3.64×           |
-#   | 9·2^17        | 1643.6 | 10 | 2.58×           |
-#   | 9·2^19        | 1382.1 | 10 | 1.82×           |
+#   | (d,b)  num_buckets  m_label | frodo pb     | simple pb 32B/256B/1kB |
+#   |-----------------------------|--------------|------------------------|
+#   | (2,4)    262144 2^20        | 10 (all ℓ)   |  9 /  9 /  9 |
+#   | (2,4)   1048576 2^22        |  9 (all ℓ)   |  9 /  9 /  8 |
+#   | (4,1)   1048576 2^20        | 10 (all ℓ)   |  9 /  9 /  9 |
+#   | (4,1)   4194304 2^22        |  9 (all ℓ)   |  9 /  9 /  8 |
+#   | (4,2)    524288 2^20        | 10 (all ℓ)   |  9 /  9 /  9 |
+#   | (4,2)   2097152 2^22        |  9 (all ℓ)   |  9 /  9 /  8 |
+#   | (3,2)    786432 3x2^19      | 10 (all ℓ)   |  9 /  9 /  9 |
+#   | (3,2)   1572864 3x2^20      |  9 (all ℓ)   |  9 /  9 /  8 |
+#   | (3,3)    393216 9x2^17      | 10 (all ℓ)   |  9 /  9 /  9 |
+#   | (3,3)   1572864 9x2^19      |  9 (all ℓ)   |  9 /  9 /  8 |
+#   | (4,3)    524288 3x2^19      | 10 (all ℓ)   |  9 /  9 /  9 |
+#   | (4,3)   1048576 3x2^20      | 10 (all ℓ)   |  9 /  9 /  9 |
 #
-# Usage: backend_plaintext_bits frodo  3x2^18   →   9
-#        backend_plaintext_bits simple 9x2^19   →  10
+# (History: an earlier table here was keyed on total capacity
+# num_buckets × bucket_size and ignored the SimplePIR value-width
+# dependence; it over-served FrodoPIR pb by one bit at half the configs
+# and picked SimplePIR pb=10 everywhere, an operating point that fails a
+# few percent of decodes at ℓ = 1 kB. See ikpir-common/src/pir_params.rs.)
+#
+# Usage: backend_plaintext_bits <backend> <arity> <bucket_size> <num_buckets> <value_bits>
+#        backend_plaintext_bits frodo  3 3 1572864 256    →   9
+#        backend_plaintext_bits simple 4 1 4194304 8192   →   8
 # ─────────────────────────────────────────────────────────────────────────────
 backend_plaintext_bits() {
-    local backend=$1 m_label=$2 pb
-    case "$backend" in
-        frodo)
-            case "$m_label" in
-                "2^18")    pb=10 ;;
-                "2^20")    pb=9 ;;
-                "2^22")    pb=9 ;;
-                "3x2^17")  pb=9 ;;
-                "3x2^18")  pb=9 ;;
-                "3x2^19")  pb=9 ;;
-                "3x2^20")  pb=9 ;;
-                "9x2^15")  pb=9 ;;
-                "9x2^17")  pb=9 ;;
-                "9x2^19")  pb=8 ;;
-                *) echo "[configs.sh] backend_plaintext_bits: unknown m_label '$m_label' for backend frodo" >&2; return 1 ;;
-            esac
-            ;;
-        simple)
-            # All 10 DB sizes covered by the table below comfortably support
-            # pb=10 (slack ≥ 1.82×); pb=11 would need p_max ≥ 2048 which fails
-            # even at the smallest DB (p_max=1983.6 at 2^18). Entries for
-            # m_labels not currently in BENCH_CONFIGS / HEADTOHEAD_CONFIGS
-            # are kept for documentation / future extension.
-            case "$m_label" in
-                "2^18"|"2^20"|"2^22"|\
-                "3x2^17"|"3x2^18"|"3x2^19"|"3x2^20"|\
-                "9x2^15"|"9x2^17"|"9x2^19") pb=10 ;;
-                *) echo "[configs.sh] backend_plaintext_bits: unknown m_label '$m_label' for backend simple" >&2; return 1 ;;
-            esac
-            ;;
-        *) echo "[configs.sh] backend_plaintext_bits: unknown backend '$backend'" >&2; return 1 ;;
-    esac
+    local backend=$1 arity=$2 bucket_size=$3 num_buckets=$4 value_bits=$5 pb
+    pb=$(cargo run -q --release -p ikpir-common --example max_plaintext_bits \
+             --manifest-path "$IKPIR_ROOT/Cargo.toml" -- \
+             "$backend" --arity "$arity" --num-buckets "$num_buckets" \
+             --bucket-size "$bucket_size" --value-bits "$value_bits") || {
+        echo "[configs.sh] backend_plaintext_bits: selector failed for" \
+             "(backend=$backend arity=$arity bs=$bucket_size nb=$num_buckets vb=$value_bits)" >&2
+        return 1
+    }
     echo "$pb"
 }
 
-# Self-check: every m_label in BENCH_CONFIGS + HEADTOHEAD_CONFIGS must have
-# a pb entry for every selected backend. Fail loudly at sourcing time rather
-# than mid-sweep on a CSV-killing typo.
-#
-# Note: BENCH_CONFIGS m_label is field 5; HEADTOHEAD_CONFIGS m_label is
-# field 5 too (after num_keys:arity:bucket_size:num_buckets).
+# Self-check: run the selector once per selected backend on the first
+# config so a broken toolchain fails loudly at sourcing time rather than
+# mid-sweep, and so the example binary is built before the timed loops.
 _pb_self_check() {
-    local cfg m_label backend
-    for cfg in "${BENCH_CONFIGS[@]}" "${HEADTOHEAD_CONFIGS[@]}"; do
-        m_label=$(echo "$cfg" | cut -d: -f5)
-        for backend in "${BACKENDS_ARR[@]}"; do
-            if ! backend_plaintext_bits "$backend" "$m_label" >/dev/null 2>&1; then
-                echo "[configs.sh] ERROR: no plaintext_bits entry for (backend=$backend, m_label=$m_label)" >&2
-                return 1
-            fi
-        done
+    local backend pb
+    IFS=':' read -r _a _bs _nb _nl _ml <<< "${BENCH_CONFIGS[0]}"
+    for backend in "${BACKENDS_ARR[@]}"; do
+        pb=$(backend_plaintext_bits "$backend" "$_a" "$_bs" "$_nb" "${VALUE_BITS[0]}") || return 1
+        case "$pb" in
+            ''|*[!0-9]*)
+                echo "[configs.sh] ERROR: selector returned non-numeric pb '$pb' for backend=$backend" >&2
+                return 1 ;;
+        esac
     done
 }
 _pb_self_check || exit 1
 unset -f _pb_self_check
 
-echo "[configs.sh] backends=${IKPIR_BENCH_BACKENDS} | ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) classical runs/bench/backend | mutation: ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits × lf=${MUTATION_LOAD_FACTOR} × N=1% capacity = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/bench/backend × patch_modes=${IKPIR_BENCH_PATCH_MODES} | head-to-head: ${#HEADTOHEAD_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#HEADTOHEAD_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/backend | pb=max-per-(backend,m_label)"
+echo "[configs.sh] backends=${IKPIR_BENCH_BACKENDS} | ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) classical runs/bench/backend | mutation: ${#BENCH_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits × lf=${MUTATION_LOAD_FACTOR} × N=1% capacity = $(( ${#BENCH_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/bench/backend × patch_modes=${IKPIR_BENCH_PATCH_MODES} | head-to-head: ${#HEADTOHEAD_CONFIGS[@]} configs × ${#VALUE_BITS[@]} value_bits = $(( ${#HEADTOHEAD_CONFIGS[@]} * ${#VALUE_BITS[@]} )) runs/backend | pb=max-per-(backend,geometry,value_bits)"
 if [ "$IKPIR_SETUP_ESTIMATE" = 1 ]; then
     echo "[configs.sh] server_setup: per-segment estimate ON (--estimate; full = arity × one-segment time) → ~arity× faster; set IKPIR_SETUP_ESTIMATE=0 for the full IkpirServer::new ground truth"
 else
