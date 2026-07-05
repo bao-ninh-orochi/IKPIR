@@ -312,12 +312,14 @@ fn run_one<S, B>(
     // during `from_setup`.
     let mut client_d = IkpirClient::<B>::from_setup(bundle);
 
-    // Once-per-config decode sanity check: run one untimed query/answer/decode
-    // for a known key and verify the recovered bytes equal the value the
-    // populate helper wrote (`fill_value(k, salt=17)`). Catches packing,
-    // cells_per_slot, and hint-mismatch regressions that would otherwise
-    // produce silent garbage decodes with valid `Ok(Some(_))` shape.
-    helpers::verify_decode::<B, _>(&mut client_d, &server, 1u32, cli.value_bits);
+    // Once-per-config decode sanity check: run several untimed
+    // query/answer/decode round trips for known keys and verify the recovered
+    // bytes equal the values the populate helper wrote (`fill_value(k,
+    // salt=17)`). Catches packing, cells_per_slot, and hint-mismatch
+    // regressions that would otherwise produce silent garbage decodes with
+    // valid `Ok(Some(_))` shape — and gives a bad plaintext_bits operating
+    // point (per-query failure at modest probability) a real chance to trip.
+    helpers::verify_decode::<B, _>(&mut client_d, &server, 1u32, 16, cli.value_bits);
 
     let samples_d: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut d_idx = 0usize;

@@ -461,18 +461,22 @@ pub fn populate_value_for_key(key: u32, value_bits: u32) -> Vec<u8> {
 
 /// Once-per-config decode sanity check.
 ///
-/// Runs one untimed `build_query` → `server.answer` → `client.decode` round
-/// trip for `test_key` and panics if the recovered bytes differ from
-/// `populate_value_for_key(test_key, value_bits)`. Catches packing /
+/// Runs `n_keys` untimed `build_query` → `server.answer` → `client.decode`
+/// round trips (keys `first_key..first_key + n_keys`, each drawing a fresh
+/// LWE error vector) and panics if any recovered bytes differ from
+/// `populate_value_for_key(key, value_bits)`. Catches packing /
 /// cells_per_slot / hint-mismatch regressions that would otherwise return
-/// `Ok(Some(garbage))` and silently bias the bench output. The recovered
-/// query slot ends up in `client.in_flight`; the first `build_query` of the
-/// subsequent timed loop discards it (one wasted slot, no timing impact).
+/// `Ok(Some(garbage))` and silently bias the bench output — and, because a
+/// bad `plaintext_bits` operating point fails per *query* with modest
+/// probability (the dominant LWE noise term is shared across a response),
+/// several independent queries are needed for the check to have power.
+/// The cost is negligible next to populate + setup.
 #[allow(dead_code)]
 pub fn verify_decode<B, S>(
     client: &mut IkpirClient<B>,
     server: &IkpirServer<S, B>,
-    test_key: u32,
+    first_key: u32,
+    n_keys: u32,
     value_bits: u32,
 ) where
     S: IndexScheme + SchemeMeta,
@@ -480,40 +484,44 @@ pub fn verify_decode<B, S>(
     B::Query: Clone,
     B::Response: Clone,
 {
-    let key_bytes = test_key.to_le_bytes();
-    let q = client.build_query(&key_bytes);
-    let r = server.answer(&q).expect("verify_decode: server.answer");
-    let decoded = client
-        .decode(&key_bytes, &r)
-        .expect("verify_decode: client.decode");
-    let expected = populate_value_for_key(test_key, value_bits);
-    match decoded {
-        Some(ref v) if v == &expected => {
-            println!(
-                "  decode sanity OK (key={test_key}, vsize={} B)",
-                expected.len()
-            );
+    assert!(n_keys > 0, "verify_decode: n_keys must be positive");
+    let mut vsize = 0usize;
+    for test_key in first_key..first_key + n_keys {
+        let key_bytes = test_key.to_le_bytes();
+        let q = client.build_query(&key_bytes);
+        let r = server.answer(&q).expect("verify_decode: server.answer");
+        let decoded = client
+            .decode(&key_bytes, &r)
+            .expect("verify_decode: client.decode");
+        let expected = populate_value_for_key(test_key, value_bits);
+        vsize = expected.len();
+        match decoded {
+            Some(ref v) if v == &expected => {}
+            Some(v) => {
+                let first_diff = v
+                    .iter()
+                    .zip(expected.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or_else(|| usize::min(v.len(), expected.len()));
+                panic!(
+                    "verify_decode FAILED for key={test_key}: decoded len={} expected len={}; \
+                     first diff at idx={first_diff}: got=0x{:02x} expected=0x{:02x}",
+                    v.len(),
+                    expected.len(),
+                    v.get(first_diff).copied().unwrap_or(0),
+                    expected.get(first_diff).copied().unwrap_or(0),
+                );
+            }
+            None => panic!(
+                "verify_decode FAILED for key={test_key}: decode returned None \
+                 (key missing from store or fingerprint mismatch)"
+            ),
         }
-        Some(v) => {
-            let first_diff = v
-                .iter()
-                .zip(expected.iter())
-                .position(|(a, b)| a != b)
-                .unwrap_or_else(|| usize::min(v.len(), expected.len()));
-            panic!(
-                "verify_decode FAILED for key={test_key}: decoded len={} expected len={}; \
-                 first diff at idx={first_diff}: got=0x{:02x} expected=0x{:02x}",
-                v.len(),
-                expected.len(),
-                v.get(first_diff).copied().unwrap_or(0),
-                expected.get(first_diff).copied().unwrap_or(0),
-            );
-        }
-        None => panic!(
-            "verify_decode FAILED for key={test_key}: decode returned None \
-             (key missing from store or fingerprint mismatch)"
-        ),
     }
+    println!(
+        "  decode sanity OK (keys {first_key}..={}, vsize={vsize} B)",
+        first_key + n_keys - 1
+    );
 }
 
 // ── Criterion throughput helper ──────────────────────────────────────────────
