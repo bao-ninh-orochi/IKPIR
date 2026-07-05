@@ -152,7 +152,9 @@ in isolation, without warm-bc queue-maintenance overhead mixed in.
   also reads `IKPIR_BENCH_BACKENDS` (default `frodo`) and re-runs every
   bench once per backend in that comma-separated list.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
-  crates — same content lives in `ikpir-server/benches/helpers.rs`):
+  crates — a common core is mirrored in `ikpir-server/benches/helpers.rs`,
+  but this copy additionally carries `verify_decode` and the fused-bench
+  plumbing, which would create a dev-dep cycle on the server side):
     - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard

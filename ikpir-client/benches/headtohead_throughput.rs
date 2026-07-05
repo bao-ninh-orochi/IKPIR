@@ -281,8 +281,9 @@ fn run_one<S, B>(
 
     // Once-per-config decode sanity check: same shape as classical_throughput.
     // Catches silent decode regressions (wrong cells_per_slot, packing bug,
-    // hint mismatch) before the long-running timed loops.
-    helpers::verify_decode::<B, _>(&mut client_d, &server, 1u32, cli.value_bits);
+    // hint mismatch, bad plaintext_bits operating point) before the
+    // long-running timed loops.
+    helpers::verify_decode::<B, _>(&mut client_d, &server, 1u32, 16, cli.value_bits);
 
     let samples_d: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut d_idx = 0usize;

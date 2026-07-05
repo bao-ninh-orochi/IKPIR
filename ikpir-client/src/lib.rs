@@ -1,5 +1,7 @@
 #![warn(missing_docs)]
-//! Client side of the **Incremental Keyword PIR** (IKPIR) protocol.
+//! Client side of the **Incremental Keyword PIR** (IKPIR) protocol —
+//! with an LWE backend plugged in, the client half of the paper's
+//! **RisePIR** (RisePIR-F over FrodoPIR, RisePIR-S over SimplePIR).
 //!
 //! Holds [`segmented_cuckoo::CuckooParams`] and per-segment
 //! [`B::ClientState`](IndexPirBackend::ClientState) plus an epoch counter.

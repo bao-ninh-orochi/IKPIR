@@ -16,6 +16,11 @@
 //!
 //! # Notation
 //!
+//! The paper accompanying this workspace calls the segmented variant the
+//! *d-ary Segmented Cuckoo Filter* (SCF) and its key-value upgrade the
+//! *KV-SCF*; this crate's `arity` is the paper's `d`, `num_buckets` is
+//! `n_b`, and `CuckooParams::segment_size()` is `s = n_b / d`.
+//!
 //! In this crate, "2-ary", "3-ary", and "4-ary" refer to the number of candidate buckets per item.
 //! "bucket_size" refers to the number of fingerprint slots per bucket, and "num_buckets" is the total number of buckets.
 //! We support 3 arities (2, 3, 4) and 4 bucket sizes (1, 2, 3, 4) for both standard and segmented

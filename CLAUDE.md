@@ -4,7 +4,9 @@
 
 Research prototype of **Incremental Keyword PIR (IKPIR)**: a single-server keyword-PIR scheme that supports efficient `insert`, `update`, and `delete` on the server database while preserving the one-round, single-Index-PIR-query profile of ChalametPIR-style constructions.
 
-The key novelty is the **Segmented Cuckoo Filter (SCF)**: a dynamic fingerprint-based filter that (a) supports incremental updates like a standard Cuckoo Filter, and (b) makes key lookups read a *deterministic, fixed* set of slots, so the client always needs exactly one Index-PIR query.
+This is the implementation behind the CANS 2026 paper *"Incremental Keyword Private Information Retrieval from d-ary Segmented Cuckoo Filters"*: the paper constructs IKPIR generically from any **updatable index PIR (UIPIR** — the `IndexPirBackend` + `IncrementalPirBackend` trait family**)** and names the LWE instantiation **RisePIR** — **RisePIR-F** with the FrodoPIR backend, **RisePIR-S** with the SimplePIR backend. The root `README.md` carries the full paper ↔ code notation table.
+
+The key novelty is the **Segmented Cuckoo Filter (SCF)**: a dynamic fingerprint-based filter that (a) supports incremental updates like a standard Cuckoo Filter, and (b) makes key lookups read a *deterministic, fixed* set of slots, so the client always needs exactly one Index-PIR query per segment.
 
 Target Index-PIR backends: **FrodoPIR** and **SimplePIR** (LWE-based, post-quantum).
 
@@ -101,13 +103,21 @@ reuses the same 12 `BENCH_CONFIGS` entries × 3 value\_bits with
 that crate.
 
 `plaintext_bits` is **not fixed across configs**. For each
-`(backend, DB size)` pair, the orchestrator picks the maximum `pb` whose
-correctness bound holds at `q = 2^32` — FrodoPIR uses paper Eq. 8
-(`q ≥ 8·p²·√m`), SimplePIR uses paper Appendix C.2 Eq. 2
-(`⌊q/p⌋ ≥ √2·σ·p·N^{1/4}·√ln(2/δ)`, σ = 6.4, δ = 2⁻⁴⁰). The lookup
-lives in `scripts/configs.sh::backend_plaintext_bits` and is passed
-to every bench as `--plaintext-bits`. Each CSV row carries its
-`plaintext_bits` so analyses can match results to operating points.
+`(backend, SCF geometry, value_bits)` triple, the orchestrator picks the
+maximum `pb` whose correctness bound holds at `q = 2^32`, evaluated at
+the **per-segment** matrix each backend actually multiplies — FrodoPIR
+uses paper Eq. 8 (`q ≥ 8·p²·√m` with `m = num_buckets / arity`),
+SimplePIR uses paper Theorem C.1 adjusted for uncentered cells and the
+near-square reshape (`q/p ≥ 2√2·σ·√ln(2/δ)·p·√R`, σ = 6.4, δ = 2⁻⁴⁰,
+`R` = reshape row count — which depends on `value_bits`). The single
+source of truth is `ikpir_common::pir_params` (full derivation in its
+module docs); `scripts/configs.sh::backend_plaintext_bits` shells out to
+the `max_plaintext_bits` example and the result is passed to every bench
+as `--plaintext-bits`. Each CSV row carries its `plaintext_bits` so
+analyses can match results to operating points. The `#[ignore]`d
+`noise_margin` tests in `ikpir-common` (`cargo test -p ikpir-common
+--release -- --ignored noise_margin`) validate the selected operating
+points empirically.
 
 The mutation benches (`server_mutation`, `client_mutation`,
 `mutation_throughput`) additionally sweep the hint-patch realization via
@@ -138,6 +148,6 @@ cargo bench -p ikpir-client --bench client_mutation -- \
 ## Design principles
 
 - Each crate has a single, well-defined responsibility; cross-crate dependencies flow in one direction: `ikpir-server` and `ikpir-client` are siblings that both depend on `ikpir-common` and `segmented-cuckoo`. `ikpir-client` carries `ikpir-server` only as a `[dev-dependency]` for end-to-end tests / benches / doctest.
-- The PIR backend (FrodoPIR vs SimplePIR) should be selectable via Cargo features on the server and client crates.
+- The PIR backend (FrodoPIR vs SimplePIR) is selected at the `B: IndexPirBackend` type parameter on `IkpirServer<S, B>` / `IkpirClient<B>` (monomorphised, no Cargo features involved); the benches expose it as a runtime `--backend frodo|simple` flag.
 - Avoid dynamic dispatch on the hot path; prefer generics.
 - All cryptographic and PIR primitives must be constant-time where relevant to avoid side-channel leakage.

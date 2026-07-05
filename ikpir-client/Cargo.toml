@@ -27,10 +27,6 @@ proptest     = { workspace = true }
 clap         = { workspace = true }
 criterion    = { workspace = true }
 
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
 [[bench]]
 name    = "client_query"
 harness = false

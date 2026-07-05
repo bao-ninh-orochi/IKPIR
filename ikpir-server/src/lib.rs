@@ -1,5 +1,7 @@
 #![warn(missing_docs)]
-//! Server side of the **Incremental Keyword PIR** (IKPIR) protocol.
+//! Server side of the **Incremental Keyword PIR** (IKPIR) protocol —
+//! with an LWE backend plugged in, the server half of the paper's
+//! **RisePIR** (RisePIR-F over FrodoPIR, RisePIR-S over SimplePIR).
 //!
 //! Wraps a [`segmented_cuckoo::CuckooKVStore`] in per-segment Index-PIR
 //! sub-databases and exposes the full server protocol — `setup`, `answer`,
@@ -7,9 +9,9 @@
 //!
 //! # Design at a glance
 //!
-//! An arity-`k` Segmented Cuckoo Filter splits the underlying KV store into
-//! `k` independent Index-PIR sub-databases. A query for a key targets row
-//! `indices[j] % segment_size` in segment `j`, so `k` Index-PIR queries
+//! An arity-`d` Segmented Cuckoo Filter splits the underlying KV store into
+//! `d` independent Index-PIR sub-databases. A query for a key targets row
+//! `indices[j] % segment_size` in segment `j`, so `d` Index-PIR queries
 //! suffice to recover the slot — for any arity. The filter geometry is in
 //! [`segmented_cuckoo::CuckooParams`]; the per-segment dispatch lives in
 //! [`IkpirServer`].
