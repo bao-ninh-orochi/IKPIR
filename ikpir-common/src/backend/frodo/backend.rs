@@ -1663,4 +1663,118 @@ mod tests {
             assert_eq!(decoded, expected, "decode failed for row {target_row}");
         }
     }
+
+    // ── Noise-margin probes (paper-scale, `#[ignore]`d) ─────────────────
+    //
+    // Empirical counterpart of `crate::pir_params`: measure the decode
+    // noise `e·D` at real per-segment row counts with the exact wrapping
+    // arithmetic of `server_answer` and the real ternary sampler,
+    // without paying for the (noise-irrelevant) hint. Decode of a cell
+    // is wrong iff the centered noise coordinate reaches `Δ/2`.
+    //
+    // Run with:  cargo test -p ikpir-common --release -- --ignored noise_margin
+
+    /// Simulate `draws` independent decodes over a `probe_cols`-cell
+    /// window: each draw samples a fresh ternary error vector (as
+    /// `client_query` would) and checks every window cell against
+    /// `Δ/2`.
+    ///
+    /// The dominant noise component `(p/2)·Σᵣ eᵣ` is shared by every
+    /// cell of one response, so decode failures cluster per query —
+    /// many draws (not many columns) is what gives the probe
+    /// statistical power, and a window smaller than a real decode's
+    /// `row_width` only *under*-counts failures. Cells are uniform in
+    /// `[0, 2^pb)` — the distribution `pack_slot_cells` produces for
+    /// random fingerprints and values. Returns
+    /// `(failed_draws, overflowed_cells, max |noise| / (Δ/2))`.
+    fn measure_decode_noise(
+        segment_rows: u32,
+        pb: u32,
+        probe_cols: usize,
+        draws: usize,
+    ) -> (u64, u64, f64) {
+        use rand::SeedableRng;
+        let rows = segment_rows as usize;
+        let mask = (1u32 << pb) - 1;
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([0xA5; 32]);
+        let mut d = vec![0u32; rows * probe_cols];
+        for cell in d.iter_mut() {
+            *cell = rng.next_u32() & mask;
+        }
+        let delta_half = 1i64 << (32 - pb - 1);
+        let mut e = vec![0u32; rows];
+        let mut acc = vec![0u32; probe_cols];
+        let (mut failed_draws, mut overflowed_cells, mut max_abs) = (0u64, 0u64, 0i64);
+        for _ in 0..draws {
+            sample_ternary_into(&mut rng, &mut e);
+            acc.fill(0);
+            for (row, &ei) in e.iter().enumerate() {
+                // Skip the ~1/3 of rows with e_i = 0 — the probe measures
+                // noise, not timing, so the shortcut is safe here.
+                if ei == 0 {
+                    continue;
+                }
+                let off = row * probe_cols;
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a = a.wrapping_add(ei.wrapping_mul(d[off + c]));
+                }
+            }
+            let mut bad = 0u64;
+            for &x in &acc {
+                let mut v = i64::from(x);
+                if v >= 1i64 << 31 {
+                    v -= 1i64 << 32;
+                }
+                let a = v.abs();
+                bad += u64::from(a >= delta_half);
+                max_abs = max_abs.max(a);
+            }
+            overflowed_cells += bad;
+            failed_draws += u64::from(bad > 0);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        (
+            failed_draws,
+            overflowed_cells,
+            max_abs as f64 / delta_half as f64,
+        )
+    }
+
+    /// The operating points `pir_params::frodo_max_plaintext_bits`
+    /// selects — including the exact Eq. 8 equality boundary
+    /// `(s, pb) = (2^18, 10)` where `8·p²·√m = 2^32` — keep the measured
+    /// noise strictly inside `Δ/2`.
+    #[test]
+    #[ignore = "paper-scale probe (~5 s in release; run with --release)"]
+    fn noise_margin_validates_selected_operating_points() {
+        let draws = 32;
+        for s in [1u32 << 18, 1 << 19] {
+            let pb = crate::pir_params::frodo_max_plaintext_bits(s);
+            let (failed, _, ratio) = measure_decode_noise(s, pb, 256, draws);
+            println!(
+                "frodo pb={pb} @ s={s}: failed decodes {failed}/{draws}, \
+                 max|noise|/(Δ/2) = {ratio:.3}"
+            );
+            assert_eq!(failed, 0, "selected pb={pb} must not fail decodes");
+            assert!(ratio < 1.0);
+        }
+    }
+
+    /// One plaintext bit past the Eq. 8 boundary (`pb = 11` at
+    /// `s = 2^18`) overflows `Δ/2` on ordinary random data — the
+    /// equation is tight in practice, not just a safety margin.
+    #[test]
+    #[ignore = "paper-scale probe (~3 s in release; run with --release)"]
+    fn noise_margin_rejects_one_bit_past_boundary() {
+        let draws = 64;
+        let (failed, cells, ratio) = measure_decode_noise(1 << 18, 11, 256, draws);
+        println!(
+            "frodo pb=11 @ s=2^18: failed decodes {failed}/{draws} ({cells} cells), \
+             max|noise|/(Δ/2) = {ratio:.3}"
+        );
+        assert!(
+            failed > 0,
+            "expected failed decodes one bit past the Eq. 8 boundary (got none)"
+        );
+    }
 }

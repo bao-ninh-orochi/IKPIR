@@ -454,7 +454,7 @@ impl IndexPirBackend for SimplePirBackend {
 ///
 /// `O(1)` — one division, one sqrt, one round.
 #[inline]
-fn reshape_dims(n_rows: u32, row_width: u32) -> (u32, u32, u32) {
+pub(crate) fn reshape_dims(n_rows: u32, row_width: u32) -> (u32, u32, u32) {
     debug_assert!(n_rows > 0 && row_width > 0);
     let ratio = (n_rows as f64) / (row_width as f64);
     let k = ratio.sqrt().round().max(1.0) as u32;
@@ -1824,5 +1824,126 @@ mod tests {
             decoded, expected,
             "decode after row-level patch did not recover patched row"
         );
+    }
+
+    // ── Noise-margin probes (paper-scale, `#[ignore]`d) ─────────────────
+    //
+    // Empirical counterpart of `crate::pir_params`: measure the decode
+    // noise `e·D` at real per-segment geometries with the exact wrapping
+    // arithmetic of `server_answer` and the real error sampler, without
+    // paying for the (noise-irrelevant) hint. Decode of a cell is wrong
+    // iff the centered noise coordinate reaches `Δ/2`, so probing
+    // `e·D` alone reproduces the correctness event exactly.
+    //
+    // Run with:  cargo test -p ikpir-common --release -- --ignored noise_margin
+
+    /// Simulate `draws` independent decodes: each draw samples a fresh
+    /// error vector (as `client_query` would) and checks the
+    /// `row_width`-cell window a decode actually reads.
+    ///
+    /// The dominant noise component `(p/2)·Σᵣ eᵣ` is shared by every
+    /// cell of one response, so decode failures cluster per query —
+    /// counting failed *draws* over the real window is the metric that
+    /// matches the protocol, and many draws (not many columns) is what
+    /// gives the probe statistical power. Cells are uniform in
+    /// `[0, 2^pb)` — the distribution `pack_slot_cells` produces for
+    /// random fingerprints and values. Returns
+    /// `(failed_draws, overflowed_cells, max |noise| / (Δ/2))`.
+    fn measure_decode_noise(
+        segment_rows: u32,
+        bucket_size: u32,
+        value_bits: u32,
+        pb: u32,
+        draws: usize,
+    ) -> (u64, u64, f64) {
+        use rand::SeedableRng;
+        let row_width = bucket_size * (32 + value_bits).div_ceil(pb);
+        let (_, reshape_rows, _) = reshape_dims(segment_rows, row_width);
+        let rows = reshape_rows as usize;
+        let window = row_width as usize;
+        let mask = (1u32 << pb) - 1;
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([0x5A; 32]);
+        let mut d = vec![0u32; rows * window];
+        for cell in d.iter_mut() {
+            *cell = rng.next_u32() & mask;
+        }
+        let delta_half = 1i64 << (32 - pb - 1);
+        let mut e = vec![0u32; rows];
+        let mut acc = vec![0u32; window];
+        let (mut failed_draws, mut overflowed_cells, mut max_abs) = (0u64, 0u64, 0i64);
+        for _ in 0..draws {
+            sample_discrete_gaussian_into(&mut rng, 6.4, &mut e);
+            acc.fill(0);
+            for (row, &ei) in e.iter().enumerate() {
+                let off = row * window;
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a = a.wrapping_add(ei.wrapping_mul(d[off + c]));
+                }
+            }
+            let mut bad = 0u64;
+            for &x in &acc {
+                let mut v = i64::from(x);
+                if v >= 1i64 << 31 {
+                    v -= 1i64 << 32;
+                }
+                let a = v.abs();
+                bad += u64::from(a >= delta_half);
+                max_abs = max_abs.max(a);
+            }
+            overflowed_cells += bad;
+            failed_draws += u64::from(bad > 0);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        (
+            failed_draws,
+            overflowed_cells,
+            max_abs as f64 / delta_half as f64,
+        )
+    }
+
+    /// EMPIRICAL EVIDENCE for the `pir_params` history note: the
+    /// pre-fix operating point (`pb = 10` keyed on total capacity) at
+    /// the paper's largest SimplePIR geometry — `(d, b) = (4, 1)`,
+    /// `n_b = 2^22` (per-segment rows `2^20`), 1 KiB values — pushes
+    /// the decode noise past `Δ/2` on a few percent of ordinary
+    /// queries against random data, versus the `δ = 2⁻⁴⁰` the scheme
+    /// promises. The old bench sweep was measuring a scheme that does
+    /// not reliably decode.
+    #[test]
+    #[ignore = "paper-scale probe (~10 s in release; run with --release)"]
+    fn noise_margin_rejects_old_pb10_operating_point() {
+        let draws = 256;
+        let (failed, cells, ratio) = measure_decode_noise(1 << 20, 1, 8192, 10, draws);
+        println!(
+            "simple pb=10 @ (s=2^20, b=1, ℓ=8192): failed decodes {failed}/{draws} \
+             ({cells} cells), max|noise|/(Δ/2) = {ratio:.3}"
+        );
+        assert!(
+            failed > 0,
+            "expected failed decodes at the rejected operating point (got none)"
+        );
+    }
+
+    /// The operating points `pir_params::simple_max_plaintext_bits`
+    /// selects keep the measured noise strictly inside `Δ/2` at the
+    /// same geometries (plus two more from the bench matrix).
+    #[test]
+    #[ignore = "paper-scale probe (~10 s in release; run with --release)"]
+    fn noise_margin_validates_selected_operating_points() {
+        let draws = 128;
+        for (s, b, vb) in [
+            (1u32 << 20, 1u32, 8192u32),
+            (1 << 19, 2, 2048),
+            (1 << 17, 4, 256),
+        ] {
+            let pb = crate::pir_params::simple_max_plaintext_bits(s, b, 32, vb, 6.4);
+            let (failed, _, ratio) = measure_decode_noise(s, b, vb, pb, draws);
+            println!(
+                "simple pb={pb} @ (s={s}, b={b}, ℓ={vb}): failed decodes {failed}/{draws}, \
+                 max|noise|/(Δ/2) = {ratio:.3}"
+            );
+            assert_eq!(failed, 0, "selected pb={pb} must not fail decodes");
+            assert!(ratio < 1.0);
+        }
     }
 }

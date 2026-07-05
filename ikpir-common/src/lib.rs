@@ -1,10 +1,12 @@
 #![warn(missing_docs)]
 //! Shared building blocks of the IKPIR protocol.
 //!
-//! Holds the pluggable Index-PIR backend trait family, the two shipped
-//! LWE backends (FrodoPIR and SimplePIR), the wire-format bundles
-//! exchanged between `IkpirServer` and `IkpirClient`, and the
-//! `IkpirError` enum.
+//! Holds the pluggable Index-PIR backend trait family (the paper's
+//! **UIPIR** interface), the two shipped LWE backends (FrodoPIR and
+//! SimplePIR — instantiating the paper's **RisePIR-F** and
+//! **RisePIR-S**), the wire-format bundles exchanged between
+//! `IkpirServer` and `IkpirClient`, the operating-point selection in
+//! [`pir_params`], and the `IkpirError` enum.
 //!
 //! Production callers should not depend on this crate directly — they
 //! use the re-exports from `ikpir-server` (server-side) or
@@ -13,6 +15,7 @@
 
 pub mod backend;
 mod error;
+pub mod pir_params;
 pub mod wire;
 
 pub use backend::{

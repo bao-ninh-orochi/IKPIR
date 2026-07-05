@@ -80,6 +80,7 @@ mod backend;
 mod params;
 mod sampler;
 
+pub(crate) use backend::reshape_dims;
 pub use backend::{
     SimpleClientState, SimpleHint, SimpleHintMaterial, SimplePirBackend, SimpleQuery,
     SimpleResponse, SimpleServerParams,
