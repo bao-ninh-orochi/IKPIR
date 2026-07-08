@@ -156,80 +156,98 @@ table above is the disambiguation.
 
 ## Benches
 
-Six focused `clap`-parsed CSV-emitting benches (3 server + 3 client) cover
-the classical and incremental PIR criteria needed for the paper, plus three
-fused orchestration benches in `ikpir-client`
-(`classical_throughput`, `mutation_throughput`, `headtohead_throughput`)
-that share one expensive populate + setup across several measurements. Each
-invocation runs one config and appends its row(s); sweeping across configs
-is the orchestrator's job.
+The PIR evaluation is nine focused, `clap`-parsed, CSV-emitting benches — four
+in `ikpir-server`, five in `ikpir-client` — each measuring one criterion at one
+config and appending one row (the per-`(patch mode, kind)` mutation benches
+append one row per pair):
 
-The canonical sweep is **`./scripts/run_all.sh`**, which chains the fused
-sweeps (`run_classical.sh` → `run_mutation.sh` → `run_server_setup.sh`)
-over the full paper config matrix (12 configs × 3 value\_bits = 36 runs
-per sweep; the mutation sweep reuses the same 12 configs × 3 value\_bits,
-with N\_mutations derived per config as capacity / 100 and one row per
-(patch mode, kind) pair):
+| Crate | Benches |
+|---|---|
+| `ikpir-server` | `server_setup`, `server_answer`, `server_mutation`, `headtohead_answer` |
+| `ikpir-client` | `client_query`, `client_decode`, `client_mutation`, `headtohead_query`, `headtohead_decode` |
+
+The `headtohead_*` benches fix the **keyword count** (`--num-keys`) and report
+the DB size each scheme needed — the fair-comparison setting vs ChalametPIR /
+Hao et al. 2025; the others fix the DB geometry and populate to `TableFull`
+(or to `--load-factor` for the mutation benches). The `segmented-cuckoo` crate
+adds nine filter / KV-store micro-benches (`load_factor`, `insert_throughput`,
+`fpr`, …) that run their own fixed internal config matrix.
+
+### Run one bench at one config
+
+`scripts/bench.sh` runs a single bench at a single config, auto-deriving
+`--plaintext-bits` (the max the backend's noise budget admits at `q = 2^32`)
+and `--lwe-dim`, and writing the CSV under `results/<crate>/`:
 
 ```bash
-./scripts/run_all.sh                                  # FrodoPIR only (default)
-IKPIR_BENCH_BACKENDS=frodo,simple ./scripts/run_all.sh  # both backends (~2× runtime)
-IKPIR_BENCH_BACKENDS=simple ./scripts/run_all.sh      # SimplePIR only
-
-./scripts/run_all.sh --skip-setup                     # classical + mutation only
-./scripts/run_all.sh --mutation-only                  # one sweep only (also --classical-only, --setup-only)
-./scripts/run_all.sh --headtohead                     # additionally run the fixed-N head-to-head matrix
-./ikpir-server/scripts/run_benches.sh server_answer   # one individual bench, full matrix
+./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --bucket-size 4 --value-bits 256
+./scripts/bench.sh client_decode --backend simple
+./scripts/bench.sh server_mutation --patch-mode entry,row
+./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
+./scripts/bench.sh insert_throughput            # segmented-cuckoo (fixed matrix)
+./scripts/bench.sh                              # -h: full flag + bench list
 ```
 
-**Plaintext bits per config.** The orchestrator selects the largest
-`plaintext_bits` whose noise budget admits `q = 2^32`, evaluated at the
-**per-segment matrix each backend actually multiplies** (one index-PIR
-instance per SCF segment): FrodoPIR Eq. 8 `q ≥ 8·p²·√m` with
-`m = num_buckets / arity`, and SimplePIR Theorem C.1 adjusted for this
-implementation's uncentered cells and near-square reshape,
-`q/p ≥ 2√2·σ·√ln(2/δ)·p·√R` with σ = 6.4, δ = 2⁻⁴⁰ — which makes the
-SimplePIR operating point depend on `value_bits`. The single source of
-truth is `ikpir_common::pir_params` (invoked by
-`scripts/configs.sh::backend_plaintext_bits` via the `max_plaintext_bits`
-example); the chosen `pb` appears as a column in every CSV. The
-`#[ignore]`d `noise_margin` tests in `ikpir-common` validate the selected
-operating points empirically:
+All flags are optional — omitted geometry falls back to a small default config.
+There is intentionally **no full-matrix sweep script**: reproducing the whole
+paper dataset means looping `bench.sh` over the config matrix below (hours),
+which a reader rarely wants. Run the handful of points you care about instead.
+
+### Quick smoke / correctness check
+
+`scripts/smoke.sh` runs every PIR bench at a tiny config on both backends in a
+couple of minutes, exercising the full setup → answer → query → decode →
+mutation path (each decode bench self-checks with `verify_decode`) — the
+"test the properties on small configs" path:
+
+```bash
+./scripts/smoke.sh                              # frodo + simple
+IKPIR_SMOKE_BACKENDS=frodo ./scripts/smoke.sh   # one backend
+cargo test -p segmented-cuckoo                  # filter / KV-store properties, fast
+```
+
+### Plaintext-bits and the paper config matrix
+
+`bench.sh` sets `plaintext_bits` per `(backend, SCF geometry, value_bits)` from
+the correctness bound each backend actually multiplies per segment — FrodoPIR
+Eq. 8 `q ≥ 8·p²·√m` (`m = num_buckets / arity`), SimplePIR Theorem C.1 adjusted
+for uncentered cells and the near-square reshape,
+`q/p ≥ 2√2·σ·√ln(2/δ)·p·√R` (σ = 6.4, δ = 2⁻⁴⁰) — which makes the SimplePIR
+operating point depend on `value_bits`. The single source of truth is
+`ikpir_common::pir_params`, exposed by the `max_plaintext_bits` example that
+`scripts/lib.sh` shells out to; the chosen `pb` appears as a CSV column. The
+`#[ignore]`d `noise_margin` tests validate these operating points empirically:
 
 ```bash
 cargo test -p ikpir-common --release -- --ignored noise_margin --nocapture
 ```
 
-For one-off measurements, invoke `cargo bench` directly. The CLI default
-for `--plaintext-bits` is `8` (safe everywhere, but usually below the max
-each backend supports); pass `--plaintext-bits N` explicitly to bench at
-the best operating point.
+The paper evaluates 12 throughput configs (6 `(arity, bucket_size)` pairs × 2 DB
+sizes, all > 1 M entries) × 3 value widths, plus a fixed-N head-to-head matrix:
+
+| arity `d` | bucket_size `b` | num_buckets `n_b` | total entries |
+|---|---|---|---|
+| 2 | 4 | 262144 / 1048576 | 2²⁰ / 2²² |
+| 4 | 1 | 1048576 / 4194304 | 2²⁰ / 2²² |
+| 4 | 2 | 524288 / 2097152 | 2²⁰ / 2²² |
+| 3 | 2 | 786432 / 1572864 | 3·2¹⁹ / 3·2²⁰ |
+| 3 | 3 | 393216 / 1572864 | 9·2¹⁷ / 9·2¹⁹ |
+| 4 | 3 | 524288 / 1048576 | 3·2¹⁹ / 3·2²⁰ |
+
+value widths: `--value-bits 256 / 2048 / 8192` (32 B / 256 B / 1 kB);
+head-to-head fixes `--num-keys` ∈ {1 M, 1.5 M, 3 M, 4 M} at ~95 % load.
+
+### Low-level: `cargo bench` directly
+
+`bench.sh` is a thin wrapper; the benches also run standalone (results land in
+the crate-local `results/` unless `IKPIR_RESULTS_DIR` is set). `--plaintext-bits`
+then defaults to `8` (safe everywhere, but below each backend's max):
 
 ```bash
-# Server: setup time, answer throughput, mutation throughput.
-cargo bench -p ikpir-server --bench server_setup
-cargo bench -p ikpir-server --bench server_answer
-cargo bench -p ikpir-server --bench server_mutation -- --n-mutations 1024
-
-# Client: query, decode, and apply_delta (all warm-bc).
-cargo bench -p ikpir-client --bench client_query
-cargo bench -p ikpir-client --bench client_decode
-cargo bench -p ikpir-client --bench client_mutation -- --n-mutations 64
-
-# Backend selection: every bench accepts --backend frodo|simple (default frodo).
-cargo bench -p ikpir-server --bench server_answer  -- --backend simple
-cargo bench -p ikpir-client --bench client_query   -- --backend simple
-
-# Hint-patch realization: the mutation benches accept --patch-mode entry|row
-# (comma-separated, default entry) and emit one CSV row per (mode, kind) pair.
-cargo bench -p ikpir-server --bench server_mutation -- --patch-mode entry,row
-cargo bench -p ikpir-client --bench client_mutation -- --patch-mode entry,row
-
-# Override plaintext_bits explicitly (defaults to 8).
-cargo bench -p ikpir-server --bench server_answer -- --plaintext-bits 10
-
-# Filter / KV-store baselines (load_factor, fpr, throughputs).
-cargo bench -p segmented-cuckoo
+cargo bench -p ikpir-server --bench server_answer -- --backend simple --plaintext-bits 10
+cargo bench -p segmented-cuckoo --bench fpr
 ```
 
-CSVs land under `ikpir-server/results/` and `ikpir-client/results/`.
+CSVs land under `results/<crate>/` (`results/ikpir-server/`,
+`results/ikpir-client/`, `results/segmented-cuckoo/`); the directory is
+git-ignored and regenerated on demand.

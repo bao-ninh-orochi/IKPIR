@@ -100,24 +100,26 @@ setup bundle.
 | Recover from a gap | `client.rs::IkpirClient::reset_from` |
 | Debug a fingerprint mismatch | `client.rs::IkpirClient::decode` — check `candidate_buckets` + `unpack_slot_cells` |
 | Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`) |
-| Benches | `benches/client_query.rs`, `benches/client_decode.rs`, `benches/client_mutation.rs`. All accept `--backend frodo\|simple` |
+| Benches | `benches/client_query.rs`, `benches/client_decode.rs`, `benches/client_mutation.rs`, `benches/headtohead_query.rs`, `benches/headtohead_decode.rs`. All accept `--backend frodo\|simple`; run via `../scripts/bench.sh <name>` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-server/benches/helpers.rs` |
 
 ### Bench layer (under `benches/`)
 
-Three focused benches covering classical and incremental client criteria for the paper:
+Five focused benches covering classical and incremental client criteria for the paper:
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
 | `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
 | `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
 | `client_mutation` | `--load-factor` (0.90) | `apply_delta` throughput per (kind, patch mode) pair (insert/update/delete × entry/row), wall-clock, empty queue (isolates hint-patch cost) | `ikpir_client_mutation.csv` |
+| `headtohead_query` | fixed `--num-keys` | `build_query` rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `client_query` + `num_keys`/`db_size` columns | `ikpir_headtohead_client_query.csv` |
+| `headtohead_decode` | fixed `--num-keys` | `decode` rate at a fixed keyword count; mirrors `client_decode` + `num_keys`/`db_size` columns, with the once-per-config `verify_decode` sanity check | `ikpir_headtohead_client_decode.csv` |
 
 `client_query` and `client_decode` use **warm-bc** mode (precompute the
 prepared-query queue + decode material before the timed loop), so the
 timed call hits the cheap amortised path.
 
-`client_mutation` (and the fused `mutation_throughput` bench) runs the
+`client_mutation` runs the
 client in **empty-queue** mode (no `precompute_queries` /
 `precompute_decodes`). Each `apply_delta` then patches only the hint
 `H` — the queue-iteration inside `client_patch_state` is a no-op when
@@ -135,26 +137,28 @@ in isolation, without warm-bc queue-maintenance overhead mixed in.
   via `helpers::backend_default_lwe_dim`.
 - **Plaintext bits.** Every bench accepts `--plaintext-bits` (default
   `8` — a safe lower bound that works for every backend and every DB
-  size). The orchestrator scripts override this per `(backend, m_label)`
-  via `scripts/configs.sh::backend_plaintext_bits` so each sweep runs
-  at the largest `pb` admitted by the backend's correctness bound at
+  size). `scripts/bench.sh` overrides this per `(backend, geometry,
+  value_bits)` via `scripts/lib.sh::backend_plaintext_bits` so each run
+  uses the largest `pb` admitted by the backend's correctness bound at
   `q = 2^32`. The chosen value is written to every CSV row as the
   `plaintext_bits` column.
-- **Patch modes.** `client_mutation` and the fused `mutation_throughput`
-  bench accept `--patch-mode entry|row` (comma-separated list, default
-  `entry`) and emit one CSV row per `(patch mode, kind)` pair; the
-  `patch_mode` column records which `HintPatchMode` realization the
-  timed `apply_delta` loop used. Deltas are collected once per kind
-  (they are identical under either mode) and replayed per mode. The
-  orchestrators forward `IKPIR_BENCH_PATCH_MODES` (default `entry,row`).
-- One invocation = one CSV row (append-mode writer); the orchestrator
-  is responsible for `rm`-ing the CSV before sweeping. The orchestrator
-  also reads `IKPIR_BENCH_BACKENDS` (default `frodo`) and re-runs every
-  bench once per backend in that comma-separated list.
+- **Patch modes.** `client_mutation` accepts `--patch-mode entry|row`
+  (comma-separated list, default `entry`) and emits one CSV row per
+  `(patch mode, kind)` pair; the `patch_mode` column records which
+  `HintPatchMode` realization the timed `apply_delta` loop used. Deltas
+  are collected once per kind (identical under either mode) and replayed
+  per mode. `scripts/bench.sh` passes `entry,row` by default.
+- **Runner.** `scripts/bench.sh <bench> [flags]` maps the bench to its
+  crate, auto-derives `--plaintext-bits` / `--lwe-dim`, and exports
+  `IKPIR_RESULTS_DIR=results/ikpir-client` before `cargo bench`. One
+  invocation = one CSV row (append-mode `csv_writer`, honoring
+  `IKPIR_RESULTS_DIR`; default `results/`). There is no full-matrix
+  sweep script; `scripts/smoke.sh` runs every PIR bench tiny.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — a common core is mirrored in `ikpir-server/benches/helpers.rs`,
-  but this copy additionally carries `verify_decode` and the fused-bench
-  plumbing, which would create a dev-dep cycle on the server side):
+  but this copy additionally carries `verify_decode`, which round-trips
+  through both client and server — a dev-dep cycle on the server side —
+  and backs the `client_decode` / `headtohead_decode` sanity checks):
     - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard

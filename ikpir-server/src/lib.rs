@@ -58,9 +58,8 @@
 //!
 //! For systematic measurement of setup / answer / mutation throughput
 //! across parameter ranges, see
-//! `benches/{server_setup,server_answer,server_mutation}.rs` and the
-//! sweep orchestrators under `scripts/` (workspace root and
-//! `ikpir-server/scripts/run_benches.sh`).
+//! `benches/{server_setup,server_answer,server_mutation,headtohead_answer}.rs`,
+//! run via the `scripts/bench.sh <name>` runner at the workspace root.
 
 mod hint_patch;
 mod server;
