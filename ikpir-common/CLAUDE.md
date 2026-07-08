@@ -24,6 +24,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/backend/frodo/mod.rs` | Re-exports the FrodoPIR backend's public surface |
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
+| `src/backend/matvec.rs` | `matvec_accumulate` — shared width-adaptive register-blocked `acc += qᵀ·D` kernel used by every online hot loop (`server_answer`, `client_decode` cold path, `compute_c`) in both backends; bit-exact vs the naive loop, no explicit SIMD/threads |
 | `src/backend/frodo/arith.rs` | `round_p_to_q` / `round_q_to_p` — plaintext ↔ ciphertext modulus conversion |
 | `src/backend/frodo/sampler.rs` | `sample_a` (LWE public matrix) + `sample_ternary_into` (LWE secret / error sampling) |
 | `src/backend/simple/mod.rs` | Re-exports the SimplePIR backend's public surface + math summary |
@@ -194,6 +195,7 @@ composition.
 | Wire-bundle layout | `wire.rs` module docs + each bundle's labelled-section block |
 | Shared error variants | `error.rs::IkpirError` |
 | Round-trip cell-modulus conversion | `backend/frodo/arith.rs` (also duplicated in `backend/simple/arith.rs`) |
+| Online matvec hot loop (`acc += qᵀ·D`) | `backend/matvec.rs::matvec_accumulate` — shared by both backends (unlike `arith.rs`, deliberately *not* duplicated: it is backend-agnostic linear algebra whose blocking tunables must never diverge) |
 | LWE sampling (FrodoPIR) | `backend/frodo/sampler.rs` (`sample_a`, `sample_ternary_into`) |
 | LWE sampling (SimplePIR) | `backend/simple/sampler.rs` (`sample_a`, `sample_uniform_zq_into`, `sample_discrete_gaussian_into`) |
 | Cross-crate integration tests | `ikpir-server/tests/frodo_compose.rs` + `simple_compose.rs` exercise each backend end-to-end against `IkpirServer` |

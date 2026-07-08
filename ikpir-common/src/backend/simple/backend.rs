@@ -53,6 +53,7 @@ use super::{
     round_p_to_q, round_q_to_p, sample_a, sample_discrete_gaussian_into, sample_uniform_zq_into,
     SimpleConfig, SimpleParams,
 };
+use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
     BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
 };
@@ -369,14 +370,21 @@ impl IndexPirBackend for SimplePirBackend {
         let reshape_row_width = params.reshape_row_width as usize;
         let mut a = vec![0u32; reshape_row_width];
 
-        for r in 0..n_rows as usize {
-            let reshape_row = r / k;
-            let off_within = (r % k) * row_width_us;
-            let qi = query.b[reshape_row];
-            let row_off = r * row_width_us;
-            for j in 0..row_width_us {
-                a[off_within + j] =
-                    a[off_within + j].wrapping_add(qi.wrapping_mul(db[row_off + j]));
+        // The reshaped matrix is `db` itself reinterpreted with rows of
+        // `reshape_row_width = k · row_width` cells (original row `r` lands
+        // at reshape row `r / k`, offset `(r % k) · row_width` — contiguous).
+        // The first `n_rows / k` reshape rows are dense; run them through the
+        // shared blocked kernel.
+        let full = n_rows as usize / k;
+        matvec_accumulate(&mut a, &db[..full * reshape_row_width], &query.b[..full]);
+
+        // Partial last reshape row (`n_rows mod k` original rows), scalar.
+        let tail_rows = db[full * reshape_row_width..].chunks_exact(row_width_us);
+        for (t, row) in tail_rows.enumerate() {
+            let qi = query.b[full];
+            let off_within = t * row_width_us;
+            for (x, &cell) in a[off_within..off_within + row_width_us].iter_mut().zip(row) {
+                *x = x.wrapping_add(qi.wrapping_mul(cell));
             }
         }
         SimpleResponse { a }
@@ -420,15 +428,11 @@ impl IndexPirBackend for SimplePirBackend {
                 }
             }
             None => {
-                let lwe_dim = state.params.params.lwe_dim as usize;
-                let h = &state.hint.data;
-                for k in 0..lwe_dim {
-                    let sk = slot.secret[k];
-                    let row_off = k * reshape_row_width;
-                    for j in 0..reshape_row_width {
-                        residual[j] = residual[j].wrapping_sub(sk.wrapping_mul(h[row_off + j]));
-                    }
-                }
+                // residual −= sᵀ·H, computed as residual += (−s)ᵀ·H — exact
+                // mod 2³², and the one-time negation (data-independent) lets
+                // the shared blocked kernel carry the heavy pass.
+                let neg_secret: Vec<u32> = slot.secret.iter().map(|s| s.wrapping_neg()).collect();
+                matvec_accumulate(&mut residual, &state.hint.data, &neg_secret);
             }
         }
 
@@ -538,12 +542,7 @@ fn compute_c(secret: &[u32], hint: &[u32], lwe_dim: usize, reshape_row_width: us
     debug_assert_eq!(secret.len(), lwe_dim);
     debug_assert_eq!(hint.len(), lwe_dim * reshape_row_width);
     let mut c = vec![0u32; reshape_row_width];
-    for (k, &sk) in secret.iter().enumerate() {
-        let row_off = k * reshape_row_width;
-        for j in 0..reshape_row_width {
-            c[j] = c[j].wrapping_add(sk.wrapping_mul(hint[row_off + j]));
-        }
-    }
+    matvec_accumulate(&mut c, hint, secret);
     c
 }
 
