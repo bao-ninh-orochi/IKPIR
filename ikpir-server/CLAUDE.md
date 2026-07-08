@@ -140,7 +140,7 @@ without a full rebuild.
 | Wire-bundle definitions | `ikpir-common/src/wire.rs` |
 | `IkpirError` variants | `ikpir-common/src/error.rs` |
 | Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs`, `tests/frodo_compose.rs` + SimplePIR mirrors (`simple_*.rs`) |
-| Benches | `benches/server_setup.rs`, `benches/server_answer.rs`, `benches/server_mutation.rs`. All accept `--backend frodo\|simple` |
+| Benches | `benches/server_setup.rs`, `benches/server_answer.rs`, `benches/server_mutation.rs`, `benches/headtohead_answer.rs`. All accept `--backend frodo\|simple`; run via `../scripts/bench.sh <name>` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-client/benches/helpers.rs` |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:
@@ -173,13 +173,14 @@ without a full rebuild.
 
 ### Bench layer (under `benches/`)
 
-Three focused benches covering classical and incremental server criteria for the paper:
+Four focused benches covering classical and incremental server criteria for the paper:
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
 | `server_setup` | `TableFull` | setup wall-clock (default trials=1, warmup=0): full `IkpirServer::new`, or `--estimate` = time one segment's `B::server_setup` × `arity`; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR matvec answer rate (queries/sec, criterion); query_bytes, response_bytes | `ikpir_server_answer.csv` |
 | `server_mutation` | `--load-factor` (0.90) | Per-(kind, patch-mode) throughput (insert/update/delete × entry/row), wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
+| `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `server_answer` + `num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
 
 - Each bench is `harness = false` and parses CLI via `clap` (see helpers
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
@@ -192,26 +193,28 @@ Three focused benches covering classical and incremental server criteria for the
   via `helpers::backend_default_lwe_dim`.
 - **Plaintext bits.** Every bench accepts `--plaintext-bits` (default
   `8` — a safe lower bound that works for every backend and every DB
-  size). The orchestrator scripts override this per `(backend, m_label)`
-  via `scripts/configs.sh::backend_plaintext_bits` so each sweep runs
-  at the largest `pb` admitted by the backend's correctness bound at
+  size). `scripts/bench.sh` overrides this per `(backend, geometry,
+  value_bits)` via `scripts/lib.sh::backend_plaintext_bits` so each run
+  uses the largest `pb` admitted by the backend's correctness bound at
   `q = 2^32`. The chosen value is written to every CSV row as the
   `plaintext_bits` column.
 - **Patch modes.** `server_mutation` accepts `--patch-mode entry|row`
   (comma-separated list, default `entry`) and emits one CSV row per
   `(patch mode, kind)` pair — the `patch_mode` column records which
-  `HintPatchMode` realization the timed loop used. The orchestrators
-  forward `IKPIR_BENCH_PATCH_MODES` (default `entry,row`) so the sweep
-  produces both mutation-phase columns of the paper's asymptotic table.
-- **Script-level sweep.** The orchestrator reads `IKPIR_BENCH_BACKENDS`
-  (default `frodo`) and re-runs every bench once per backend. Set
-  `IKPIR_BENCH_BACKENDS=frodo,simple` to cover both (~2× runtime).
-- One invocation = one CSV row (append-mode writer); the orchestrator
-  is responsible for `rm`-ing the CSV before sweeping.
+  `HintPatchMode` realization the timed loop used. `scripts/bench.sh`
+  passes `entry,row` by default so a single run produces both
+  mutation-phase columns of the paper's asymptotic table.
+- **Runner.** `scripts/bench.sh <bench> [flags]` maps the bench to its
+  crate, auto-derives `--plaintext-bits` / `--lwe-dim`, and exports
+  `IKPIR_RESULTS_DIR=results/ikpir-server` before `cargo bench`. Pass
+  `--backend simple` to switch backends. There is no full-matrix sweep
+  script; `scripts/smoke.sh` runs every PIR bench tiny for correctness.
+- One invocation = one CSV row (append-mode writer via
+  `csv_writer`, honoring `IKPIR_RESULTS_DIR`; default `results/`).
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — a common core is mirrored in `ikpir-client/benches/helpers.rs`;
-  the client copy additionally carries `verify_decode` and the
-  fused-bench plumbing):
+  the client copy additionally carries `verify_decode`, used by the
+  `headtohead_decode` sanity check):
     - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard

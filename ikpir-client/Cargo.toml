@@ -40,13 +40,9 @@ name    = "client_mutation"
 harness = false
 
 [[bench]]
-name    = "classical_throughput"
+name    = "headtohead_query"
 harness = false
 
 [[bench]]
-name    = "headtohead_throughput"
-harness = false
-
-[[bench]]
-name    = "mutation_throughput"
+name    = "headtohead_decode"
 harness = false

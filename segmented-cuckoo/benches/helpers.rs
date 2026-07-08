@@ -15,21 +15,24 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Create a CSV writer at `results/{path}` and emit `header` as the first
-/// line.
+/// Create a CSV writer at `${IKPIR_RESULTS_DIR:-results}/{path}` and emit
+/// `header` as the first line (truncating any existing file).
 ///
 /// # Arguments
 ///
-/// - `path`   — file name relative to `results/` (parent dirs are created
-///   if missing).
+/// - `path`   — file name relative to the results directory (parent dirs are
+///   created if missing).
 /// - `header` — comma-separated column header line.
 ///
 /// # Returns
 ///
 /// A `BufWriter<File>` positioned just after the header line; the caller
-/// appends one data row per `writeln!` call.
+/// appends one data row per `writeln!` call. `scripts/bench.sh` points
+/// `IKPIR_RESULTS_DIR` at `results/segmented-cuckoo`; a bare `cargo bench`
+/// falls back to the crate-local `results/` directory.
 pub fn csv_writer(path: &str, header: &str) -> BufWriter<fs::File> {
-    let full_path = format!("results/{}", path);
+    let base = std::env::var("IKPIR_RESULTS_DIR").unwrap_or_else(|_| "results".to_string());
+    let full_path = format!("{}/{}", base, path);
     if let Some(parent) = Path::new(&full_path).parent() {
         fs::create_dir_all(parent).unwrap();
     }

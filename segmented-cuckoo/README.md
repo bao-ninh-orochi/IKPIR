@@ -206,7 +206,7 @@ bucket sizes b ∈ {1,2,3,4}. Table sizes: standard 2/4-ary and segmented 2/4-ar
 at n ∈ {2^14..2^20}; standard 3-ary at n ∈ {3^8..3^11}; segmented 3-ary at
 n ∈ {3·2^12..3·2^18}.
 
-| Bench | Measures | CSV (under `results/`) |
+| Bench | Measures | CSV (under `results/segmented-cuckoo/`) |
 |---|---|---|
 | `load_factor` | Max load factor, sweeping `max_kicks` ∈ {500..5000} | `load_factor.csv` |
 | `insert_throughput` | Insert MOps/s while filling | `insert_throughput.csv` |
@@ -221,23 +221,20 @@ the IKPIR primitive layer (segmented `(fingerprint, value)` slots).
 
 ### Running benchmarks
 
-Benches take no args — each runs its hardcoded matrix and writes CSV to
-`results/`. Plotting (`scripts/plot.py`) is optional and needs matplotlib/pandas.
+Each bench runs its own hardcoded config matrix (no CLI flags) and appends CSV
+under `results/segmented-cuckoo/`. Run one through the workspace runner
+[`../scripts/bench.sh`](../scripts/bench.sh), which routes the output:
 
 ```bash
-cargo bench --bench load_factor               # one bench
+./scripts/bench.sh load_factor                # one bench
+./scripts/bench.sh fpr
 
-for b in load_factor insert_throughput lookup_throughput delete_throughput \
-         fpr degree_distribution \
-         kv_store_insert_throughput kv_store_lookup_throughput kv_store_delete_throughput; do
-    cargo bench --bench "$b"                   # all benches
-done
-
-# Optional plots:
-pip install -r scripts/requirements.txt
-python scripts/plot.py            # all plots → results/plots/
-python scripts/plot.py --list     # list plot functions
+# or directly — writes to the crate-local results/ unless IKPIR_RESULTS_DIR is set:
+cargo bench -p segmented-cuckoo --bench load_factor
 ```
+
+The filter / KV-store properties also have fast unit-test coverage:
+`cargo test -p segmented-cuckoo`.
 
 ---
 

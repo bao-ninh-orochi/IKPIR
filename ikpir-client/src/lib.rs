@@ -56,10 +56,8 @@
 //!
 //! For systematic measurement of build_query / decode / apply_delta
 //! across parameter ranges, see
-//! `benches/{client_query,client_decode,client_mutation}.rs`, the fused
-//! `benches/{classical,mutation,headtohead}_throughput.rs`, and the
-//! sweep orchestrators under `scripts/` (workspace root and
-//! `ikpir-client/scripts/run_benches.sh`).
+//! `benches/{client_query,client_decode,client_mutation,headtohead_query,headtohead_decode}.rs`,
+//! run via the `scripts/bench.sh <name>` runner at the workspace root.
 
 mod client;
 mod error;

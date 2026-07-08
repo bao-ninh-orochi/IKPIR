@@ -30,23 +30,35 @@ let _bundle = server.setup();
 
 ## Benches
 
-Three focused `clap`-parsed CSV-emitting benches under `benches/`. Output
-lands in `results/`. Each invocation produces one CSV row (append-mode);
-a sweep is the orchestrator's job — `rm` the CSV first, then loop.
-Pass arguments after `--`, e.g. `cargo bench --bench server_setup -- --help`.
+Four focused `clap`-parsed CSV-emitting benches under `benches/`. The
+recommended way to run one is the workspace runner
+[`../scripts/bench.sh`](../scripts/bench.sh), which auto-derives the largest
+correct `--plaintext-bits` and the backend `--lwe-dim`, and routes output to
+`results/ikpir-server/`:
+
+```bash
+./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --value-bits 256
+./scripts/bench.sh server_setup --backend simple
+./scripts/bench.sh                              # -h: full flag + bench list
+```
+
+Each invocation is one config = one appended CSV row (`server_mutation` emits
+one row per `(patch mode, kind)` pair). The root [README](../README.md#benches)
+has the paper config matrix; there is no full-matrix sweep script.
 
 ### Bench overview
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
-| `server_setup` | `TableFull` | `IkpirServer::new` wall-clock (trials=5, warmup=2); setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
+| `server_setup` | `TableFull` | `IkpirServer::new` wall-clock (trials=1, warmup=0), or `--estimate` = one segment × arity; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR answer rate (queries/sec, criterion, batch=64); query_bytes, response_bytes | `ikpir_server_answer.csv` |
-| `server_mutation` | `--load-factor` | Per-kind (insert/update/delete) ops/sec, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
+| `server_mutation` | `--load-factor` (0.90) | Per-(patch mode, kind) ops/sec, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
+| `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); +`num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
 
 `num_buckets` constraints differ per arity: 2-ary `2^t`, 3-ary `3·2^t`,
 4-ary `2^t ≥ 4`.
 
-### Common flags
+### Flags
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -55,53 +67,25 @@ Pass arguments after `--`, e.g. `cargo bench --bench server_setup -- --help`.
 | `--num-buckets <N>` | per-arity | Buckets per segment |
 | `--bucket-size <N>` | `4` | Slots per bucket |
 | `--value-bits <N>` | `256` | Value width per entry |
+| `--plaintext-bits <N>` | `8` bench / max via `bench.sh` | PIR cell width |
 | `--lwe-dim <N>` | 1566 (frodo) / 1275 (simple) | LWE dimension |
 
-### Bench-specific flags
+Bench-specific: `server_setup` takes `--estimate` / `--trials` / `--warmup`;
+`server_answer` and `headtohead_answer` take `--batch`; `server_mutation` takes
+`--patch-mode entry\|row` (comma list, default `entry`), `--n-mutations`,
+`--load-factor`; `headtohead_answer` requires `--num-keys` and takes
+`--max-mem-gb`.
 
-| Bench | Extra flags |
-|---|---|
-| `server_setup` | `--trials 5`, `--warmup 2` |
-| `server_answer` | `--batch 64` |
-| `server_mutation` | `--n-mutations 1024`, `--load-factor 0.80` |
+### Low-level: `cargo bench`
 
-### Examples
+`bench.sh` is a thin wrapper; the benches also run standalone — then
+`--plaintext-bits` defaults to `8` and output lands in the crate-local
+`results/` unless `IKPIR_RESULTS_DIR` is set:
 
 ```bash
-# One config, one CSV row.
-cargo bench -p ikpir-server --bench server_setup -- \
-    --arity 2 --num-buckets 65536 --bucket-size 4 --value-bits 256
-
-# Answer throughput with SimplePIR backend.
-cargo bench -p ikpir-server --bench server_answer -- \
-    --backend simple --num-buckets 262144 --value-bits 2048 --batch 64
-
-# Mutation throughput sweep: 64 mutations at 80 % load.
-cargo bench -p ikpir-server --bench server_mutation -- \
-    --arity 3 --num-buckets 393216 --bucket-size 2 --value-bits 256 \
-    --n-mutations 64 --load-factor 0.80
-
-# Flag list for any bench.
+cargo bench -p ikpir-server --bench server_answer -- --backend simple --plaintext-bits 10
+cargo bench -p ikpir-server --bench server_mutation -- --patch-mode entry,row --n-mutations 64
 cargo bench -p ikpir-server --bench <name> -- --help
-```
-
-### Orchestrator sweep
-
-`ikpir-server/scripts/run_benches.sh` sweeps the full paper config matrix
-(12 configs × 3 value\_bits = 36 runs per bench; the mutation bench
-reuses the same 12 configs × 3 value\_bits = 36 runs, with N\_mutations
-derived per config as capacity / 100). The orchestrator removes the CSV
-before each sweep and re-runs per backend set in `IKPIR_BENCH_BACKENDS`.
-
-```bash
-# Server benches only, FrodoPIR.
-./ikpir-server/scripts/run_benches.sh
-
-# One bench.
-./ikpir-server/scripts/run_benches.sh server_answer
-
-# Both backends.
-IKPIR_BENCH_BACKENDS=frodo,simple ./ikpir-server/scripts/run_benches.sh
 ```
 
 ## Per-segment architecture

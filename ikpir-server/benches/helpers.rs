@@ -14,12 +14,14 @@ use criterion::{Criterion, Throughput};
 
 // ── CSV writer (append-aware) ───────────────────────────────────────────────
 
-/// Open a CSV writer at `results/{path}` in append mode.
+/// Open a CSV writer at `${IKPIR_RESULTS_DIR:-results}/{path}` in append mode.
 /// Writes the header only if the file is empty or does not yet exist.
-/// The sweep orchestrator must `rm -f results/<bench>.csv` before each sweep
-/// so rows from prior sweeps do not accumulate.
+/// `scripts/bench.sh` points `IKPIR_RESULTS_DIR` at `results/ikpir-server`;
+/// a bare `cargo bench` falls back to the crate-local `results/` directory.
+/// One invocation = one appended row; delete the CSV first for a clean file.
 pub fn csv_writer(path: &str, header: &str) -> BufWriter<fs::File> {
-    let full_path = Path::new("results").join(path);
+    let base = std::env::var("IKPIR_RESULTS_DIR").unwrap_or_else(|_| "results".to_string());
+    let full_path = Path::new(&base).join(path);
     if let Some(parent) = full_path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
@@ -180,9 +182,9 @@ pub fn patch_modes_label(modes: &[PatchMode]) -> String {
 ///
 /// # Rationale
 ///
-/// Memory estimators in `classical_throughput` and `mutation_throughput`
-/// need the per-segment `D` shape because every other LWE-PIR buffer
-/// derives its dimensions from it:
+/// The head-to-head benches' OOM guard (and the `db_rows`/`db_cols` shape
+/// columns every bench reports) need the per-segment `D` shape because every
+/// other LWE-PIR buffer derives its dimensions from it:
 /// - `A` is `rows × lwe_dim` — shares `D`'s row count, so `rows` drives
 ///   the `A` allocation and the per-slot `b`-vector length
 ///   (`b = A·s + e + Δ·u`, length `rows`).

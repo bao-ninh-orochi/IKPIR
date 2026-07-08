@@ -40,6 +40,7 @@ use std::collections::VecDeque;
 use rand::RngCore;
 
 use super::{round_p_to_q, round_q_to_p, sample_a, sample_ternary_into, FrodoConfig, FrodoParams};
+use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
     BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
 };
@@ -291,13 +292,7 @@ impl IndexPirBackend for FrodoPirBackend {
         debug_assert_eq!(query.b.len(), n_rows as usize);
         debug_assert_eq!(db.len(), (n_rows as usize) * (row_width as usize));
         let mut a = vec![0u32; row_width as usize];
-        for i in 0..n_rows as usize {
-            let qi = query.b[i];
-            let row_off = i * row_width as usize;
-            for j in 0..row_width as usize {
-                a[j] = a[j].wrapping_add(qi.wrapping_mul(db[row_off + j]));
-            }
-        }
+        matvec_accumulate(&mut a, db, &query.b);
         FrodoResponse { a }
     }
 
@@ -329,15 +324,11 @@ impl IndexPirBackend for FrodoPirBackend {
                 }
             }
             None => {
-                let lwe_dim = state.params.params.lwe_dim as usize;
-                let h = &state.hint.data;
-                for k in 0..lwe_dim {
-                    let sk = slot.secret[k];
-                    let row_off = k * row_width;
-                    for j in 0..row_width {
-                        residual[j] = residual[j].wrapping_sub(sk.wrapping_mul(h[row_off + j]));
-                    }
-                }
+                // residual −= sᵀ·H, computed as residual += (−s)ᵀ·H — exact
+                // mod 2³², and the one-time negation (data-independent) lets
+                // the shared blocked kernel carry the heavy pass.
+                let neg_secret: Vec<u32> = slot.secret.iter().map(|s| s.wrapping_neg()).collect();
+                matvec_accumulate(&mut residual, &state.hint.data, &neg_secret);
             }
         }
 
@@ -407,12 +398,7 @@ fn compute_c(secret: &[u32], hint: &[u32], lwe_dim: usize, row_width: usize) -> 
     debug_assert_eq!(secret.len(), lwe_dim);
     debug_assert_eq!(hint.len(), lwe_dim * row_width);
     let mut c = vec![0u32; row_width];
-    for (k, &sk) in secret.iter().enumerate() {
-        let row_off = k * row_width;
-        for j in 0..row_width {
-            c[j] = c[j].wrapping_add(sk.wrapping_mul(hint[row_off + j]));
-        }
-    }
+    matvec_accumulate(&mut c, hint, secret);
     c
 }
 

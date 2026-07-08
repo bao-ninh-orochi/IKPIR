@@ -81,7 +81,7 @@
 //! `value_bits = 8192` and paper-scale segments the old `pb = 10`
 //! operating point overflows `Δ/2` on virtually every decode). This
 //! module is the single source of truth replacing that table;
-//! `scripts/configs.sh::backend_plaintext_bits` shells out to the
+//! `scripts/lib.sh::backend_plaintext_bits` shells out to the
 //! [`max_plaintext_bits` example](../examples/max_plaintext_bits.rs).
 //!
 //! # Related files
@@ -92,7 +92,7 @@
 //! - `backend/simple/backend.rs` — `reshape_dims`, re-used here so the
 //!   selection can never drift from the layout; hosts the SimplePIR
 //!   noise-margin probe.
-//! - `scripts/configs.sh` — bench-side consumer via the example CLI.
+//! - `scripts/lib.sh` — bench-side consumer via the example CLI.
 
 use crate::backend::simple::reshape_dims;
 

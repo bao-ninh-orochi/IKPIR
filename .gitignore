@@ -11,27 +11,13 @@ debug
 # reference papers
 *.pdf
 
-# Per-crate transient bench output (cargo bench CWD is the crate dir).
-# Paper-figure CSVs live in `results/paper/` and are tracked.
-/segmented-cuckoo/results
-/ikpir-server/results
-/ikpir-client/results
-
-# Ignore everything in `results/` except the curated subtree that backs the paper.
-results/*
-!results/.gitkeep
-!results/README.md
-!results/SCHEMA.md
-!results/paper/
-!results/plots/
-
-# Generated server-side benchmark result CSVs (reproducible via scripts/).
-/server-results/*.csv
-
-# Python tooling for scripts/
-.venv/
-__pycache__/
-*.pyc
+# Benchmark output — regenerate via scripts/bench.sh; not tracked.
+# `scripts/bench.sh` writes to results/<crate>/; a bare `cargo bench` falls
+# back to a crate-local results/ (ignored too, as a safety net).
+/results/
+/segmented-cuckoo/results/
+/ikpir-server/results/
+/ikpir-client/results/
 
 # Editors / OS
 .DS_Store

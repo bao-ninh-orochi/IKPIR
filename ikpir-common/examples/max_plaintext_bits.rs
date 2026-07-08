@@ -3,10 +3,10 @@
 //!
 //! # Purpose
 //!
-//! Single source of truth for the bench orchestration:
-//! `scripts/configs.sh::backend_plaintext_bits` shells out to this
-//! example instead of maintaining a hand-computed lookup table that can
-//! (and did) drift from the backends' actual per-segment shapes.
+//! Single source of truth for the bench runner:
+//! `scripts/lib.sh::backend_plaintext_bits` (sourced by `scripts/bench.sh`)
+//! shells out to this example instead of maintaining a hand-computed lookup
+//! table that can (and did) drift from the backends' actual per-segment shapes.
 //!
 //! # Usage
 //!
@@ -28,7 +28,7 @@
 //!
 //! - `src/pir_params.rs` — the two selection functions and the full
 //!   derivation of both correctness bounds.
-//! - `scripts/configs.sh` — the bench-side caller.
+//! - `scripts/lib.sh` — the bench-side caller (via `scripts/bench.sh`).
 
 use std::process::exit;
 

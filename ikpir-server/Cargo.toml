@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name    = "server_mutation"
 harness = false
+
+[[bench]]
+name    = "headtohead_answer"
+harness = false
