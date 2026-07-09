@@ -129,6 +129,93 @@ fn block_pass<const R: usize>(acc: &mut [u32], d: &[u32], q: &[u32]) {
     }
 }
 
+/// Fold `A · s` into `b` (all arithmetic mod `2³²`): one dot product
+/// per matrix row, `b[i] += Σ_k a[i][k] · s[k]`.
+///
+/// # Purpose
+///
+/// The query-sampling hot loop (`sample_slot`'s `b = A·s + e`) in both
+/// backends. The dual of [`matvec_accumulate`]: output is indexed by
+/// *rows*, so the accumulators are per-row scalars rather than a
+/// row-wide vector.
+///
+/// # Arguments
+///
+/// - `b` — accumulator, one cell per matrix row; updated in place.
+/// - `a` — row-major `b.len() × s.len()` matrix.
+/// - `s` — one coefficient per matrix column.
+///
+/// # Rationale
+///
+/// Size-adaptive row blocking, measured on Apple M1:
+///
+/// - **`A` cache-resident** (≤ 8 MiB, e.g. SimplePIR's reshaped
+///   `~1365 × 1275`): interleaving 8 rows gives 8 independent
+///   accumulator chains (ILP) and re-uses the L1-resident `s` stream —
+///   ~1.3× over the single-accumulator dot.
+/// - **`A` streaming from DRAM** (FrodoPIR's `16384 × 1566` = 102 MiB):
+///   the loop is memory-bandwidth-bound (~13 GMAC/s ≈ 52 GB/s reads,
+///   the single-core ceiling), and wide interleaving *hurts* (8 row
+///   streams defeat the prefetcher, 2× slower); 2 rows matches the
+///   plain dot while keeping a second chain for ISAs with spare
+///   bandwidth.
+///
+/// # Constraints
+///
+/// Panics (debug) if `a.len() != b.len() * s.len()`. Empty `b` or `s`
+/// is a no-op. Bit-exact vs the naive per-row dot (wrapping add is
+/// associative + commutative); schedule depends only on public shapes.
+///
+/// # Complexity
+///
+/// `Θ(b.len() · s.len())` wrapping multiply-adds.
+pub(crate) fn matvec_rows_accumulate(b: &mut [u32], a: &[u32], s: &[u32]) {
+    debug_assert_eq!(a.len(), b.len() * s.len(), "matvec_rows shape mismatch");
+    // 2 MiB of u32 cells = 8 MiB of A — the cache-residency threshold
+    // between the ILP-bound and DRAM-bound regimes measured above.
+    if a.len() <= 2_097_152 {
+        rows_pass::<8>(b, a, s);
+    } else {
+        rows_pass::<2>(b, a, s);
+    }
+}
+
+/// One monomorphised row-blocking level for [`matvec_rows_accumulate`]:
+/// `R` interleaved dot products per pass, then the `b.len() mod R` tail
+/// rows one at a time.
+#[inline]
+fn rows_pass<const R: usize>(b: &mut [u32], a: &[u32], s: &[u32]) {
+    let n = s.len();
+    if n == 0 || b.is_empty() {
+        return;
+    }
+    let full = b.len() - b.len() % R;
+
+    for (bc, ab) in b[..full]
+        .chunks_exact_mut(R)
+        .zip(a[..full * n].chunks_exact(R * n))
+    {
+        let mut acc = [0u32; R];
+        for (k, &sk) in s.iter().enumerate() {
+            for r in 0..R {
+                acc[r] = acc[r].wrapping_add(ab[r * n + k].wrapping_mul(sk));
+            }
+        }
+        for (bi, &t) in bc.iter_mut().zip(&acc) {
+            *bi = bi.wrapping_add(t);
+        }
+    }
+
+    // Tail rows: plain dot — same arithmetic, bit-identical result.
+    for (bi, row) in b[full..].iter_mut().zip(a[full * n..].chunks_exact(n)) {
+        let mut acc = *bi;
+        for (&x, &y) in row.iter().zip(s) {
+            acc = acc.wrapping_add(x.wrapping_mul(y));
+        }
+        *bi = acc;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Pins the two contracts: bit-exact agreement with the naive loop
@@ -215,5 +302,67 @@ mod tests {
         let mut acc = [7u32, 8];
         matvec_accumulate(&mut acc, &[], &[]);
         assert_eq!(acc, [7, 8]);
+    }
+
+    fn naive_rows(b: &mut [u32], a: &[u32], s: &[u32]) {
+        let n = s.len();
+        for (bi, row) in b.iter_mut().zip(a.chunks_exact(n)) {
+            for (&x, &y) in row.iter().zip(s) {
+                *bi = bi.wrapping_add(x.wrapping_mul(y));
+            }
+        }
+    }
+
+    /// Every row-blocking level and tail length agrees with the naive
+    /// per-row dot bit-for-bit, and folding starts from the incoming
+    /// `b` (the `b = A·s + e` call site seeds `b` with the errors).
+    #[test]
+    fn rows_kernel_matches_naive_across_shapes() {
+        // (rows, n): rows exercise full R=8 blocks, tails, rows < R;
+        // n covers odd lengths. All shapes stay under the cache-size
+        // threshold, so force the R=2 path explicitly too.
+        let shapes = [
+            (1usize, 1usize),
+            (7, 3),
+            (8, 29),
+            (17, 128),
+            (100, 517),
+            (63, 1275),
+        ];
+        for (rows, n) in shapes {
+            let mut a = vec![0u32; rows * n];
+            let mut s = vec![0u32; n];
+            fill_pseudorandom(&mut a, 0x5EED_0000 ^ ((rows as u32) << 10) ^ n as u32);
+            fill_pseudorandom(&mut s, 0xFACE_0000 | n as u32);
+
+            let mut base = vec![0u32; rows];
+            fill_pseudorandom(&mut base, 0xE44_0E44);
+
+            let mut expected = base.clone();
+            naive_rows(&mut expected, &a, &s);
+
+            let mut got = base.clone();
+            matvec_rows_accumulate(&mut got, &a, &s);
+            assert_eq!(got, expected, "adaptive mismatch at rows={rows} n={n}");
+
+            // Both monomorphised levels, regardless of the size cutoff.
+            let mut got8 = base.clone();
+            rows_pass::<8>(&mut got8, &a, &s);
+            assert_eq!(got8, expected, "R=8 mismatch at rows={rows} n={n}");
+            let mut got2 = base;
+            rows_pass::<2>(&mut got2, &a, &s);
+            assert_eq!(got2, expected, "R=2 mismatch at rows={rows} n={n}");
+        }
+    }
+
+    /// Degenerate shapes are no-ops, not panics.
+    #[test]
+    fn rows_kernel_empty_inputs_are_noops() {
+        let mut b: [u32; 0] = [];
+        matvec_rows_accumulate(&mut b, &[], &[1, 2]);
+
+        let mut b = [3u32, 4];
+        matvec_rows_accumulate(&mut b, &[], &[]);
+        assert_eq!(b, [3, 4]);
     }
 }

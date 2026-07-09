@@ -41,7 +41,7 @@ use rand::RngCore;
 
 use super::{round_p_to_q, round_q_to_p, sample_a, sample_ternary_into, FrodoConfig, FrodoParams};
 use crate::backend::gemm::gemm_at_d_accumulate;
-use crate::backend::matvec::matvec_accumulate;
+use crate::backend::matvec::{matvec_accumulate, matvec_rows_accumulate};
 use crate::backend::{
     BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
 };
@@ -363,17 +363,10 @@ fn sample_slot(params: &FrodoServerParams, material: &FrodoHintMaterial) -> Prep
     let mut e = vec![0u32; n_rows];
     sample_ternary_into(&mut rng, &mut e);
 
-    // b = A·s + e
+    // b = A·s + e — the size-adaptive row-blocked kernel (see
+    // matvec_rows_accumulate) folds A·s into the error vector in place.
     let mut b = e;
-    let a = &material.a;
-    for (i, bi) in b.iter_mut().enumerate() {
-        let row_off = i * lwe_dim;
-        let mut acc = *bi;
-        for k in 0..lwe_dim {
-            acc = acc.wrapping_add(a[row_off + k].wrapping_mul(secret[k]));
-        }
-        *bi = acc;
-    }
+    matvec_rows_accumulate(&mut b, &material.a, &secret);
     PreparedSlot { secret, b, c: None }
 }
 
