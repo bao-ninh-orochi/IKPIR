@@ -14,9 +14,13 @@ Target Index-PIR backends: **FrodoPIR** and **SimplePIR** (LWE-based, post-quant
 
 ```
 Incremental-Keyword-PIR/          ← workspace root
-├── Cargo.toml                    ← workspace manifest
+├── Cargo.toml                    ← workspace manifest (members = ["crates/*"])
 ├── CLAUDE.md
 ├── README.md
+├── CONTRIBUTING.md               ← toolchain pin, local CI gates, PR conventions
+├── SECURITY.md                   ← threat-model caveats, private vulnerability reporting
+├── LICENSE-APACHE / LICENSE-MIT  ← dual license (MIT OR Apache-2.0)
+├── .github/workflows/            ← ci.yml (fmt / clippy / test / bench compile check)
 ├── crates/
 │   ├── segmented-cuckoo/         ← filter + key-value store primitives
 │   ├── ikpir-common/             ← shared: backend traits, FrodoPIR, wire bundles, IkpirError

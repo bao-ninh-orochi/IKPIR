@@ -107,6 +107,8 @@ RisePIR-S.
 | [`crates/ikpir-server/README.md`](crates/ikpir-server/README.md) | Server quick start and backend implementation guide |
 | [`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) | Client crate internals, epoch state machine, failure modes |
 | [`crates/ikpir-client/README.md`](crates/ikpir-client/README.md) | Client quick start and lifecycle overview |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Toolchain pin, local CI gates, bench workflow, PR conventions |
+| [`SECURITY.md`](SECURITY.md) | Prototype threat-model caveats and private vulnerability reporting |
 
 ## Paper ↔ code notation
 

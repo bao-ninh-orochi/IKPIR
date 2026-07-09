@@ -45,7 +45,7 @@
 //! before it applies to this implementation:
 //!
 //! 1. **True row count.** The SimplePIR backend reshapes each segment
-//!    to a near-square `R × C` matrix ([`reshape_dims`]) with
+//!    to a near-square `R × C` matrix (`reshape_dims` in the backend) with
 //!    `R = ⌈n_rows/k⌉`, `k = max(1, round(√(n_rows/row_width)))`, and
 //!    the noise sums over the `R` rows, so `N^(1/4) = √(√N)` must be
 //!    replaced by `√R`. Because
