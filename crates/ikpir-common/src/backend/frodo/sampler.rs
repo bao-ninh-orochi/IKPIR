@@ -23,7 +23,10 @@
 //! - `params.rs` — `FrodoParams::seed` is the input to `sample_a`.
 //! - `backend.rs` — sole caller for both samplers.
 
-use rand::{RngCore, SeedableRng};
+use rand::RngCore;
+#[cfg(test)]
+use rand::SeedableRng;
+#[cfg(test)]
 use rand_chacha::ChaCha20Rng;
 
 /// Build a ChaCha20Rng from a 16-byte seed (zero-padded to 32 bytes).
@@ -34,6 +37,7 @@ use rand_chacha::ChaCha20Rng;
 /// takes a 32-byte seed. We zero-pad to bridge — equivalent to using
 /// the first 128 bits of a 256-bit seed and is documented in
 /// `frodo/mod.rs`'s math summary.
+#[cfg(test)] // production expansion goes through backend/prg.rs
 fn rng_from_seed(seed: &[u8; 16]) -> ChaCha20Rng {
     let mut padded = [0u8; 32];
     padded[..16].copy_from_slice(seed);
@@ -66,11 +70,12 @@ pub fn sample_a(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32> {
     let len = (n_rows as usize)
         .checked_mul(lwe_dim as usize)
         .expect("A dimensions overflow usize");
-    let mut rng = rng_from_seed(seed);
+    let mut padded = [0u8; 32];
+    padded[..16].copy_from_slice(seed);
     let mut out = vec![0u32; len];
-    for cell in &mut out {
-        *cell = rng.next_u32();
-    }
+    // Chunk-parallel, byte-identical to the sequential stream — see
+    // backend/prg.rs for the seekability argument and pinning tests.
+    crate::backend::prg::chacha20_fill_words(padded, &mut out);
     out
 }
 

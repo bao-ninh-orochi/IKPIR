@@ -77,6 +77,7 @@
 pub mod frodo;
 pub(crate) mod gemm;
 pub(crate) mod matvec;
+pub(crate) mod prg;
 pub mod simple;
 pub use frodo::{FrodoConfig, FrodoPirBackend};
 pub use simple::{SimpleConfig, SimplePirBackend};
