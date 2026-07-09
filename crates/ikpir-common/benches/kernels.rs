@@ -33,7 +33,7 @@ use std::time::Instant;
 
 use ikpir_common::{
     FrodoConfig, FrodoPirBackend, HintPatchMode, IncrementalPirBackend, IndexPirBackend,
-    SimpleConfig, SimplePirBackend,
+    PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
 };
 
 /// Per-segment shape to measure: `n_rows` DB rows of `row_width` cells.
@@ -102,7 +102,7 @@ fn report(backend: &str, shape: Shape, label: &str, iters: u32, min: f64, mean: 
 }
 
 /// Run the full op suite for one backend at one shape.
-fn run_backend<B: IndexPirBackend + IncrementalPirBackend>(
+fn run_backend<B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend>(
     backend: &str,
     config: &B::Config,
     shape: Shape,
@@ -154,6 +154,31 @@ fn run_backend<B: IndexPirBackend + IncrementalPirBackend>(
         std::hint::black_box(&v);
     });
     report(backend, shape, "decode_cold", 200, min, mean);
+
+    // precompute_b16: one Phase-B batch of 16 slots. The queue is
+    // drained by cheap client_query pops between iterations so it does
+    // not grow across iters (the pops add 16 vector clones per iter —
+    // noise against 16 A·s products).
+    let (min, mean) = time_op(5, || {
+        B::client_precompute_queries(&mut state, 16);
+        while B::prepared_slot_count(&state) > 0 {
+            let q = B::client_query(&mut state, 1);
+            std::hint::black_box(&q);
+        }
+    });
+    report(backend, shape, "precompute_b16", 5, min, mean);
+
+    // precompute_bc16: Phase B + Phase C for the same 16 slots; the
+    // Phase-C share is this line minus the previous one.
+    let (min, mean) = time_op(5, || {
+        B::client_precompute_queries(&mut state, 16);
+        B::client_precompute_decodes(&mut state);
+        while B::prepared_slot_count(&state) > 0 {
+            let q = B::client_query(&mut state, 1);
+            std::hint::black_box(&q);
+        }
+    });
+    report(backend, shape, "precompute_bc16", 5, min, mean);
 
     // patch_entry / patch_row: 64-row × 8-cell burst, both realizations.
     // Repeated application drifts the hint values, but the cost is

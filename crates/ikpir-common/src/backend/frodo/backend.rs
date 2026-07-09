@@ -397,7 +397,22 @@ fn compute_c(secret: &[u32], hint: &[u32], lwe_dim: usize, row_width: usize) -> 
 }
 
 impl PrecomputingPirBackend for FrodoPirBackend {
+    /// Slots are mutually independent random samples, so a Phase-B
+    /// batch parallelises over slots (each task draws from its own
+    /// thread-local RNG; queue order among fresh random slots carries
+    /// no meaning, and rayon's indexed collect preserves it anyway).
     fn client_precompute_queries(state: &mut FrodoClientState, count: u32) {
+        #[cfg(feature = "parallel")]
+        if count >= 2 {
+            use rayon::prelude::*;
+            let (params, material) = (&state.params, &state.hint_material);
+            let slots: Vec<PreparedSlot> = (0..count)
+                .into_par_iter()
+                .map(|_| sample_slot(params, material))
+                .collect();
+            state.prepared.extend(slots);
+            return;
+        }
         state.prepared.reserve(count as usize);
         for _ in 0..count {
             state
@@ -406,20 +421,41 @@ impl PrecomputingPirBackend for FrodoPirBackend {
         }
     }
 
+    /// Phase-C materialisation is one independent `sᵀ·H` per slot —
+    /// parallel over the pending slots.
     fn client_precompute_decodes(state: &mut FrodoClientState) {
-        let lwe_dim = state.params.params.lwe_dim as usize;
-        let row_width = state.params.row_width as usize;
-        let h = &state.hint.data;
+        let FrodoClientState {
+            params,
+            hint,
+            prepared,
+            in_flight,
+            ..
+        } = state;
+        let lwe_dim = params.params.lwe_dim as usize;
+        let row_width = params.row_width as usize;
+        let h = &hint.data;
 
-        for slot in state.prepared.iter_mut() {
-            if slot.c.is_none() {
-                slot.c = Some(compute_c(&slot.secret, h, lwe_dim, row_width));
+        let pending = prepared
+            .iter_mut()
+            .chain(in_flight.as_mut())
+            .filter(|slot| slot.c.is_none());
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            let pending: Vec<&mut PreparedSlot> = pending.collect();
+            if pending.len() >= 2 {
+                pending.into_par_iter().for_each(|slot| {
+                    slot.c = Some(compute_c(&slot.secret, h, lwe_dim, row_width));
+                });
+            } else {
+                for slot in pending {
+                    slot.c = Some(compute_c(&slot.secret, h, lwe_dim, row_width));
+                }
             }
         }
-        if let Some(slot) = state.in_flight.as_mut() {
-            if slot.c.is_none() {
-                slot.c = Some(compute_c(&slot.secret, h, lwe_dim, row_width));
-            }
+        #[cfg(not(feature = "parallel"))]
+        for slot in pending {
+            slot.c = Some(compute_c(&slot.secret, h, lwe_dim, row_width));
         }
     }
 
