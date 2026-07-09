@@ -1,6 +1,6 @@
 # ikpir-client
 
-Client-side crate for [Incremental Keyword PIR](../README.md). Holds
+Client-side crate for [Incremental Keyword PIR](../../README.md). Holds
 per-segment `ClientState` and translates `(key, value)` lookups into
 wire-level Index-PIR query/response exchanges with `ikpir-server`.
 
@@ -33,7 +33,7 @@ assert_eq!(v, &[0x01u8]);
 
 Five focused `clap`-parsed CSV-emitting benches under `benches/`. The
 recommended way to run one is the workspace runner
-[`../scripts/bench.sh`](../scripts/bench.sh), which auto-derives the largest
+[`../../scripts/bench.sh`](../../scripts/bench.sh), which auto-derives the largest
 correct `--plaintext-bits` and the backend `--lwe-dim`, and routes output to
 `results/ikpir-client/`:
 
@@ -47,7 +47,7 @@ Each invocation is one config = one appended CSV row (`client_mutation` emits
 one row per `(patch mode, kind)` pair). `client_query` / `client_decode` run in
 **warm-bc** mode (precompute before the timed loop); `client_mutation` runs in
 **empty-queue** mode so `apply_delta` reports the hint-patch cost in isolation.
-The root [README](../README.md#benches) has the paper config matrix.
+The root [README](../../README.md#benches) has the paper config matrix.
 
 ### Bench overview
 

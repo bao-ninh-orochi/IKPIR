@@ -223,7 +223,7 @@ the IKPIR primitive layer (segmented `(fingerprint, value)` slots).
 
 Each bench runs its own hardcoded config matrix (no CLI flags) and appends CSV
 under `results/segmented-cuckoo/`. Run one through the workspace runner
-[`../scripts/bench.sh`](../scripts/bench.sh), which routes the output:
+[`../../scripts/bench.sh`](../../scripts/bench.sh), which routes the output:
 
 ```bash
 ./scripts/bench.sh load_factor                # one bench

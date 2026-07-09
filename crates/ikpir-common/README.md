@@ -1,6 +1,6 @@
 # ikpir-common
 
-Shared primitives for [Incremental Keyword PIR](../README.md). Holds the
+Shared primitives for [Incremental Keyword PIR](../../README.md). Holds the
 Index-PIR backend trait family, the two shipped LWE backends (FrodoPIR
 and SimplePIR), the wire-format bundles exchanged between server and
 client, and the shared `IkpirError` enum.

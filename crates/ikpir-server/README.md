@@ -1,6 +1,6 @@
 # ikpir-server
 
-Server-side crate for [Incremental Keyword PIR](../README.md). Wraps a
+Server-side crate for [Incremental Keyword PIR](../../README.md). Wraps a
 `Segmented{2,3,4}aryCuckooKVStore` in per-segment Index-PIR sub-databases
 and exposes the full server protocol: `setup`, `answer`, `insert`,
 `update`, `delete`, `full_rebuild`.
@@ -32,7 +32,7 @@ let _bundle = server.setup();
 
 Four focused `clap`-parsed CSV-emitting benches under `benches/`. The
 recommended way to run one is the workspace runner
-[`../scripts/bench.sh`](../scripts/bench.sh), which auto-derives the largest
+[`../../scripts/bench.sh`](../../scripts/bench.sh), which auto-derives the largest
 correct `--plaintext-bits` and the backend `--lwe-dim`, and routes output to
 `results/ikpir-server/`:
 
@@ -43,7 +43,7 @@ correct `--plaintext-bits` and the backend `--lwe-dim`, and routes output to
 ```
 
 Each invocation is one config = one appended CSV row (`server_mutation` emits
-one row per `(patch mode, kind)` pair). The root [README](../README.md#benches)
+one row per `(patch mode, kind)` pair). The root [README](../../README.md#benches)
 has the paper config matrix; there is no full-matrix sweep script.
 
 ### Bench overview

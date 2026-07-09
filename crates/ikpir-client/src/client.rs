@@ -273,7 +273,7 @@ where
     /// co-located timing observer learns nothing beyond
     /// `(arity, bucket_size)` from the decode call. The `if sk == 0`
     /// shortcut in the underlying LWE decode is a separate concern;
-    /// see `ikpir-server/CLAUDE.md` for the server-side threat model.
+    /// see `crates/ikpir-server/CLAUDE.md` for the server-side threat model.
     ///
     /// **Fingerprint-collision behaviour.** If two candidate slots
     /// happen to share `fp` (rare false positive at the cuckoo layer),
