@@ -100,13 +100,15 @@ RisePIR-S.
 
 | Resource | Purpose |
 |---|---|
-| [`segmented-cuckoo/CLAUDE.md`](segmented-cuckoo/CLAUDE.md) | Filter + KV store internals, file map, design decisions |
-| [`ikpir-common/CLAUDE.md`](ikpir-common/CLAUDE.md) | Shared crate internals: backend trait family, FrodoPIR, wire bundles, `IkpirError` |
-| [`ikpir-common/README.md`](ikpir-common/README.md) | Shared crate role in the workspace + backend-author quick reference |
-| [`ikpir-server/CLAUDE.md`](ikpir-server/CLAUDE.md) | Server crate internals, per-segment architecture, backend-author checklist |
-| [`ikpir-server/README.md`](ikpir-server/README.md) | Server quick start and backend implementation guide |
-| [`ikpir-client/CLAUDE.md`](ikpir-client/CLAUDE.md) | Client crate internals, epoch state machine, failure modes |
-| [`ikpir-client/README.md`](ikpir-client/README.md) | Client quick start and lifecycle overview |
+| [`crates/segmented-cuckoo/CLAUDE.md`](crates/segmented-cuckoo/CLAUDE.md) | Filter + KV store internals, file map, design decisions |
+| [`crates/ikpir-common/CLAUDE.md`](crates/ikpir-common/CLAUDE.md) | Shared crate internals: backend trait family, FrodoPIR, wire bundles, `IkpirError` |
+| [`crates/ikpir-common/README.md`](crates/ikpir-common/README.md) | Shared crate role in the workspace + backend-author quick reference |
+| [`crates/ikpir-server/CLAUDE.md`](crates/ikpir-server/CLAUDE.md) | Server crate internals, per-segment architecture, backend-author checklist |
+| [`crates/ikpir-server/README.md`](crates/ikpir-server/README.md) | Server quick start and backend implementation guide |
+| [`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) | Client crate internals, epoch state machine, failure modes |
+| [`crates/ikpir-client/README.md`](crates/ikpir-client/README.md) | Client quick start and lifecycle overview |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Toolchain pin, local CI gates, bench workflow, PR conventions |
+| [`SECURITY.md`](SECURITY.md) | Prototype threat-model caveats and private vulnerability reporting |
 
 ## Paper ↔ code notation
 
@@ -251,3 +253,19 @@ cargo bench -p segmented-cuckoo --bench fpr
 CSVs land under `results/<crate>/` (`results/ikpir-server/`,
 `results/ikpir-client/`, `results/segmented-cuckoo/`); the directory is
 git-ignored and regenerated on demand.
+
+Paper numbers were measured on the machine described in
+[`docs/server-specs.txt`](docs/server-specs.txt).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.

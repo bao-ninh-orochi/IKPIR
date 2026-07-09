@@ -25,6 +25,8 @@
 //! - `client.rs` — sole producer of these variants.
 //! - `ikpir-server::IkpirError` — wrapped by the `Server` variant.
 
+use std::fmt;
+
 use ikpir_common::IkpirError;
 
 /// Errors returned by [`IkpirClient`](crate::IkpirClient) methods.
@@ -80,5 +82,44 @@ pub enum IkpirClientError {
 impl From<IkpirError> for IkpirClientError {
     fn from(e: IkpirError) -> Self {
         Self::Server(e)
+    }
+}
+
+impl fmt::Display for IkpirClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleDelta { expected, got } => {
+                write!(f, "stale delta: expected epoch {expected}, got {got}")
+            }
+            Self::FutureDelta { expected, got } => {
+                write!(
+                    f,
+                    "future delta: expected epoch {expected}, got {got} \
+                     (missed at least one update; recover via reset_from)"
+                )
+            }
+            Self::EpochMismatch { client, response } => {
+                write!(
+                    f,
+                    "epoch mismatch: client is at epoch {client}, response carries epoch {response}"
+                )
+            }
+            Self::MalformedBundle => {
+                write!(
+                    f,
+                    "malformed bundle: segment count or row width does not match client parameters"
+                )
+            }
+            Self::Server(e) => write!(f, "server error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for IkpirClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Server(e) => Some(e),
+            _ => None,
+        }
     }
 }

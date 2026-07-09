@@ -6,6 +6,8 @@
 //! `IkpirClient` can wrap it in `IkpirClientError::Server(IkpirError)`
 //! without depending on `ikpir-server` at compile time.
 
+use std::fmt;
+
 /// Errors returned by `IkpirServer` methods.
 ///
 /// All variants are recoverable in the sense that they leave the server's
@@ -38,3 +40,32 @@ pub enum IkpirError {
     /// Caller-provided value width does not match the store's `value_size_in_bytes()`.
     InvalidInput,
 }
+
+impl fmt::Display for IkpirError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleEpoch { expected, got } => {
+                write!(
+                    f,
+                    "stale query epoch: server is at epoch {expected}, query announced {got}"
+                )
+            }
+            Self::MalformedQuery => {
+                write!(
+                    f,
+                    "malformed query: wrong segment count for the active arity"
+                )
+            }
+            Self::TableFull => write!(f, "table is full: cuckoo kicking budget exhausted"),
+            Self::NotFound => write!(f, "key not found"),
+            Self::InvalidInput => {
+                write!(
+                    f,
+                    "invalid input: value width does not match the store's value size"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for IkpirError {}

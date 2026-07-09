@@ -15,9 +15,10 @@ debug
 # `scripts/bench.sh` writes to results/<crate>/; a bare `cargo bench` falls
 # back to a crate-local results/ (ignored too, as a safety net).
 /results/
-/segmented-cuckoo/results/
-/ikpir-server/results/
-/ikpir-client/results/
+/crates/segmented-cuckoo/results/
+/crates/ikpir-common/results/
+/crates/ikpir-server/results/
+/crates/ikpir-client/results/
 
 # Editors / OS
 .DS_Store

@@ -14,13 +14,20 @@ Target Index-PIR backends: **FrodoPIR** and **SimplePIR** (LWE-based, post-quant
 
 ```
 Incremental-Keyword-PIR/          ← workspace root
-├── Cargo.toml                    ← workspace manifest
+├── Cargo.toml                    ← workspace manifest (members = ["crates/*"])
 ├── CLAUDE.md
 ├── README.md
-├── segmented-cuckoo/             ← filter + key-value store primitives
-├── ikpir-common/                 ← shared: backend traits, FrodoPIR, wire bundles, IkpirError
-├── ikpir-server/                 ← server-side IKPIR logic
-└── ikpir-client/                 ← client-side IKPIR logic
+├── CONTRIBUTING.md               ← toolchain pin, local CI gates, PR conventions
+├── SECURITY.md                   ← threat-model caveats, private vulnerability reporting
+├── LICENSE-APACHE / LICENSE-MIT  ← dual license (MIT OR Apache-2.0)
+├── .github/workflows/            ← ci.yml (fmt / clippy / test / bench compile check)
+├── crates/
+│   ├── segmented-cuckoo/         ← filter + key-value store primitives
+│   ├── ikpir-common/             ← shared: backend traits, FrodoPIR, wire bundles, IkpirError
+│   ├── ikpir-server/             ← server-side IKPIR logic
+│   └── ikpir-client/             ← client-side IKPIR logic
+├── docs/                         ← benchmark-machine spec (server-specs.txt)
+└── scripts/                      ← bench runner (bench.sh), smoke.sh, shared lib.sh
 ```
 
 Dependency direction:
@@ -57,7 +64,7 @@ the shipped `FrodoPirBackend`, the wire-format bundles
 and the `IkpirError` enum. `ikpir-server` and `ikpir-client` both
 re-export the items they expose in their own public signatures, so
 existing call sites (`use ikpir_server::IndexPirBackend`, etc.) keep
-resolving unchanged. See [`ikpir-common/CLAUDE.md`](ikpir-common/CLAUDE.md)
+resolving unchanged. See [`crates/ikpir-common/CLAUDE.md`](crates/ikpir-common/CLAUDE.md)
 for the trait family overview and backend-author checklist.
 
 ### `ikpir-server`
@@ -70,14 +77,14 @@ patch is realized at a selectable `HintPatchMode` granularity
 entry-level — identical state and wire bytes either way). Backend
 tunables are passed via the `IndexPirBackend::Config` associated type
 (e.g. `FrodoConfig { lwe_dim }`, defined in `ikpir-common`); see
-[`ikpir-server/CLAUDE.md`](ikpir-server/CLAUDE.md) for the full
+[`crates/ikpir-server/CLAUDE.md`](crates/ikpir-server/CLAUDE.md) for the full
 per-segment architecture, protocol invariants, and backend-author checklist.
 
 ### `ikpir-client`
 
 Holds `CuckooParams` and per-segment `ClientState`; translates keyword
 lookups into PIR query/response bundles and applies incremental hint deltas.
-See [`ikpir-client/CLAUDE.md`](ikpir-client/CLAUDE.md) for the epoch
+See [`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) for the epoch
 state machine, failure-mode table, and entry-point map.
 
 ## Benches

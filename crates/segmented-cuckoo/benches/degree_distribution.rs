@@ -30,8 +30,8 @@
 //! DH_NUM_BUCKETS_POW4=65536, DH_SEG3_NUM_BUCKETS=3·2^14=49152. bucket_size ∈ {1, 2, 3, 4}.
 //!
 //! **Output:**
-//! - `segmented-cuckoo/results/degree_per_bucket.csv` — columns: scheme, arity, num_buckets, bucket_size, bucket_index, degree
-//! - `segmented-cuckoo/results/degree_distribution.csv` — columns: scheme, arity, num_buckets, bucket_size, degree, count
+//! - `crates/segmented-cuckoo/results/degree_per_bucket.csv` — columns: scheme, arity, num_buckets, bucket_size, bucket_index, degree
+//! - `crates/segmented-cuckoo/results/degree_distribution.csv` — columns: scheme, arity, num_buckets, bucket_size, degree, count
 
 mod helpers;
 

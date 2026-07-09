@@ -140,7 +140,7 @@ without a full rebuild.
 | Wire-bundle definitions | `ikpir-common/src/wire.rs` |
 | `IkpirError` variants | `ikpir-common/src/error.rs` |
 | Integration tests | `tests/setup_answer.rs`, `tests/incremental_correctness.rs`, `tests/frodo_compose.rs` + SimplePIR mirrors (`simple_*.rs`) |
-| Benches | `benches/server_setup.rs`, `benches/server_answer.rs`, `benches/server_mutation.rs`, `benches/headtohead_answer.rs`. All accept `--backend frodo\|simple`; run via `../scripts/bench.sh <name>` |
+| Benches | `benches/server_setup.rs`, `benches/server_answer.rs`, `benches/server_mutation.rs`, `benches/headtohead_answer.rs`. All accept `--backend frodo\|simple`; run via `../../scripts/bench.sh <name>` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-client/benches/helpers.rs` |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:

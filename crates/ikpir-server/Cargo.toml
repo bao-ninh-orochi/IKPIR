@@ -1,6 +1,6 @@
 [package]
-name        = "ikpir-client"
-description = "Client-side IKPIR protocol: PIR query construction, response decoding, incremental hint sync"
+name        = "ikpir-server"
+description = "Server-side IKPIR protocol: per-segment Index-PIR setup, answer, incremental hint patching, and full rebuild"
 keywords    = ["pir", "keyword-pir", "frodopir", "lwe", "incremental"]
 categories  = ["cryptography", "data-structures"]
 readme      = "README.md"
@@ -11,6 +11,7 @@ rust-version.workspace = true
 authors.workspace      = true
 repository.workspace   = true
 license.workspace      = true
+publish.workspace      = true
 
 autobenches = false
 
@@ -20,29 +21,27 @@ workspace = true
 [dependencies]
 segmented-cuckoo = { workspace = true }
 ikpir-common     = { workspace = true }
+rand             = { workspace = true }
+rand_chacha      = { workspace = true }
 
 [dev-dependencies]
-ikpir-server = { workspace = true }
 proptest     = { workspace = true }
+ikpir-client = { workspace = true }
 clap         = { workspace = true }
 criterion    = { workspace = true }
 
 [[bench]]
-name    = "client_query"
+name    = "server_setup"
 harness = false
 
 [[bench]]
-name    = "client_decode"
+name    = "server_answer"
 harness = false
 
 [[bench]]
-name    = "client_mutation"
+name    = "server_mutation"
 harness = false
 
 [[bench]]
-name    = "headtohead_query"
-harness = false
-
-[[bench]]
-name    = "headtohead_decode"
+name    = "headtohead_answer"
 harness = false
