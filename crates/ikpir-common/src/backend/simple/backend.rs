@@ -53,6 +53,7 @@ use super::{
     round_p_to_q, round_q_to_p, sample_a, sample_discrete_gaussian_into, sample_uniform_zq_into,
     SimpleConfig, SimpleParams,
 };
+use crate::backend::gemm::gemm_at_d_accumulate;
 use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
     BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
@@ -600,16 +601,15 @@ impl PrecomputingPirBackend for SimplePirBackend {
 ///
 /// # Rationale
 ///
-/// Loop nest is `r, k_idx, j` over the **original** `(n_rows, lwe_dim,
-/// row_width)` shape so the flat `db` slice is read sequentially per
-/// original row. Each original row contributes to a `row_width`-wide
-/// sub-segment of one reshape row, starting at `off_within = (r % k) *
-/// row_width`. The `aik == 0` early-exit is a sparsity shortcut on the
-/// public matrix `A` (safe to branch on since `A` is public). With `A`
-/// sampled uniformly over `Z_q` via ChaCha20, this branch fires only
-/// when ChaCha20 produces a literal zero `u32` — i.e. ~2⁻³² of cells,
-/// so the early-exit is effectively dead code on the hot path but
-/// retained for parity with FrodoPIR's `compute_hint`.
+/// The reshaped matrix is `db` itself reinterpreted with rows of
+/// `reshape_row_width = k · row_width` cells (original row `r` lands at
+/// reshape row `r / k`, offset `(r % k) · row_width` — contiguous), so
+/// the first `n_rows / k` reshape rows form a dense row-major matrix
+/// and run through the shared panel-blocked [`gemm_at_d_accumulate`]
+/// kernel (see `backend/gemm.rs` for the blocking scheme and the
+/// bit-exactness argument). The partial last reshape row
+/// (`n_rows mod k` original rows) is patched in scalar afterwards —
+/// the same dense/tail split as `server_answer`.
 ///
 /// # Complexity
 ///
@@ -631,20 +631,30 @@ fn compute_hint(
     let k_us = k as usize;
     let mut h = vec![0u32; lwe_dim_us * reshape_row_width_us];
 
-    for r in 0..n_rows as usize {
-        let reshape_row = r / k_us;
-        let off_within = (r % k_us) * row_width_us;
-        let a_row = &a[reshape_row * lwe_dim_us..(reshape_row + 1) * lwe_dim_us];
-        let d_row = &db[r * row_width_us..(r + 1) * row_width_us];
-        for k_idx in 0..lwe_dim_us {
-            let aik = a_row[k_idx];
-            if aik == 0 {
-                continue;
-            }
+    // Dense prefix: the first n_rows / k reshape rows.
+    let full = n_rows as usize / k_us;
+    gemm_at_d_accumulate(
+        &mut h,
+        &a[..full * lwe_dim_us],
+        &db[..full * reshape_row_width_us],
+        lwe_dim_us,
+        reshape_row_width_us,
+    );
+
+    // Partial last reshape row (n_rows mod k original rows), scalar.
+    for (t, d_row) in db[full * reshape_row_width_us..]
+        .chunks_exact(row_width_us)
+        .enumerate()
+    {
+        let off_within = t * row_width_us;
+        let a_row = &a[full * lwe_dim_us..(full + 1) * lwe_dim_us];
+        for (k_idx, &aik) in a_row.iter().enumerate() {
             let h_row = &mut h[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
-            for j in 0..row_width_us {
-                h_row[off_within + j] =
-                    h_row[off_within + j].wrapping_add(aik.wrapping_mul(d_row[j]));
+            for (hj, &dj) in h_row[off_within..off_within + row_width_us]
+                .iter_mut()
+                .zip(d_row)
+            {
+                *hj = hj.wrapping_add(aik.wrapping_mul(dj));
             }
         }
     }

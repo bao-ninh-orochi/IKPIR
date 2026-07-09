@@ -40,6 +40,7 @@ use std::collections::VecDeque;
 use rand::RngCore;
 
 use super::{round_p_to_q, round_q_to_p, sample_a, sample_ternary_into, FrodoConfig, FrodoParams};
+use crate::backend::gemm::gemm_at_d_accumulate;
 use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
     BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
@@ -448,10 +449,11 @@ impl PrecomputingPirBackend for FrodoPirBackend {
 ///
 /// # Rationale
 ///
-/// Loop nest is `i, k, j` to keep `A` and `D` row accesses sequential
-/// per `i` — the inner-loop pattern LLVM auto-vectorises. The
-/// `aik == 0` early-exit is a sparsity shortcut on the random ternary
-/// `A` (about 1/3 of cells); harmless to timing since `A` is public.
+/// Delegates to the shared panel-blocked [`gemm_at_d_accumulate`]
+/// kernel (see `backend/gemm.rs` for the blocking scheme and the
+/// bit-exactness argument) — the reference `i, k, j` rank-one-update
+/// loop streamed the whole hint once per DB row and was bound on `H`
+/// cache traffic, not multiply throughput.
 ///
 /// # Complexity
 ///
@@ -460,21 +462,9 @@ impl PrecomputingPirBackend for FrodoPirBackend {
 fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32) -> Vec<u32> {
     let lwe_dim_us = lwe_dim as usize;
     let row_width_us = row_width as usize;
+    debug_assert_eq!(a.len(), n_rows as usize * lwe_dim_us);
     let mut h = vec![0u32; lwe_dim_us * row_width_us];
-    for i in 0..n_rows as usize {
-        let a_row = &a[i * lwe_dim_us..(i + 1) * lwe_dim_us];
-        let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
-        for k in 0..lwe_dim_us {
-            let aik = a_row[k];
-            if aik == 0 {
-                continue;
-            }
-            let h_row = &mut h[k * row_width_us..(k + 1) * row_width_us];
-            for j in 0..row_width_us {
-                h_row[j] = h_row[j].wrapping_add(aik.wrapping_mul(d_row[j]));
-            }
-        }
-    }
+    gemm_at_d_accumulate(&mut h, a, db, lwe_dim_us, row_width_us);
     h
 }
 

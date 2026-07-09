@@ -75,6 +75,7 @@
 //!    without re-cloning it.
 
 pub mod frodo;
+pub(crate) mod gemm;
 pub(crate) mod matvec;
 pub mod simple;
 pub use frodo::{FrodoConfig, FrodoPirBackend};
