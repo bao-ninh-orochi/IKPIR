@@ -105,74 +105,113 @@ pub(crate) fn gemm_at_d_accumulate(
     debug_assert_eq!(d.len(), n_rows * width, "D shape mismatch");
     debug_assert_eq!(h.len(), lwe_dim * width, "H shape mismatch");
 
-    let k_tiles = lwe_dim.div_ceil(MR);
-    let j_full = width - width % NR;
-    // Packed Aᵀ block, [tile][row][m] layout, k-tail zero-padded.
-    let mut apk = vec![0u32; KC * k_tiles * MR];
+    // Each k-tile owns MR consecutive H rows — one contiguous chunk of
+    // `h` — so tiles are independent tasks with disjoint writes: the
+    // parallel and sequential paths run the identical per-tile code and
+    // produce bit-identical output (the tile schedule carries no
+    // arithmetic).
+    #[cfg(feature = "parallel")]
+    if (n_rows as u64) * (lwe_dim as u64) * (width as u64) >= GEMM_PAR_MIN_MACS {
+        use rayon::prelude::*;
+        let mut i0 = 0;
+        while i0 < n_rows {
+            let kc = KC.min(n_rows - i0);
+            h.par_chunks_mut(MR * width)
+                .enumerate()
+                .for_each(|(kt, h_tile)| {
+                    block_tile(h_tile, a, d, lwe_dim, width, i0..i0 + kc, kt * MR);
+                });
+            i0 += kc;
+        }
+        return;
+    }
 
     let mut i0 = 0;
     while i0 < n_rows {
         let kc = KC.min(n_rows - i0);
-        for kt in 0..k_tiles {
-            let k0 = kt * MR;
-            let mr = MR.min(lwe_dim - k0);
-            let base = kt * (kc * MR);
-            for i in 0..kc {
-                let a_off = (i0 + i) * lwe_dim + k0;
-                for m in 0..MR {
-                    apk[base + i * MR + m] = if m < mr { a[a_off + m] } else { 0 };
-                }
-            }
-        }
-
-        for j0 in (0..j_full).step_by(NR) {
-            for kt in 0..k_tiles {
-                let a_tile = &apk[kt * (kc * MR)..(kt + 1) * (kc * MR)];
-                let mr = MR.min(lwe_dim - kt * MR);
-                micro_full(h, a_tile, d, i0, kc, j0, width, kt * MR, mr);
-            }
-        }
-        if j_full < width {
-            for kt in 0..k_tiles {
-                let a_tile = &apk[kt * (kc * MR)..(kt + 1) * (kc * MR)];
-                let mr = MR.min(lwe_dim - kt * MR);
-                micro_tail(h, a_tile, d, i0, kc, j_full, width, kt * MR, mr);
-            }
+        for (kt, h_tile) in h.chunks_mut(MR * width).enumerate() {
+            block_tile(h_tile, a, d, lwe_dim, width, i0..i0 + kc, kt * MR);
         }
         i0 += kc;
     }
 }
 
+/// Minimum multiply-add count before the GEMM fans out to rayon: below
+/// this the join overhead outweighs the win. Real segment shapes are
+/// three orders of magnitude above it.
+#[cfg(feature = "parallel")]
+const GEMM_PAR_MIN_MACS: u64 = 1 << 24;
+
+/// One `(KC-block, k-tile)` unit of work: transpose-pack the tile's
+/// `A` coefficients for rows `i0 .. i0 + kc`, then fold the block into
+/// the tile's `mr` H rows (`h_tile`, row stride `width`).
+///
+/// # Rationale
+///
+/// Packing per task (rather than once per KC-block) keeps tasks fully
+/// independent for the parallel path; the pack is `Θ(kc · MR)` against
+/// `Θ(kc · MR · width)` tile work, and the 8 KiB scratch allocation is
+/// noise at that scale.
+fn block_tile(
+    h_tile: &mut [u32],
+    a: &[u32],
+    d: &[u32],
+    lwe_dim: usize,
+    width: usize,
+    rows: core::ops::Range<usize>,
+    k0: usize,
+) {
+    let mr = h_tile.len() / width;
+    debug_assert!((1..=MR).contains(&mr));
+    let (i0, kc) = (rows.start, rows.len());
+
+    // at[i * MR + m] = A[i0 + i, k0 + m], zero-padded when mr < MR.
+    let mut at = vec![0u32; kc * MR];
+    for i in 0..kc {
+        let a_off = (i0 + i) * lwe_dim + k0;
+        for m in 0..mr {
+            at[i * MR + m] = a[a_off + m];
+        }
+    }
+
+    let j_full = width - width % NR;
+    for j0 in (0..j_full).step_by(NR) {
+        micro_full(h_tile, &at, d, i0, kc, j0, width);
+    }
+    if j_full < width {
+        micro_tail(h_tile, &at, d, i0, kc, j_full, width);
+    }
+}
+
 /// Full-width micro-kernel: one `MR × NR` register tile folded over
-/// `kc` contraction rows, then written back to the `mr` live `H` rows
-/// (`mr < MR` only on the zero-padded final k-tile).
+/// `kc` contraction rows, then written back to the tile's `mr` live
+/// `H` rows (`mr < MR` only on the zero-padded final k-tile).
 #[inline]
 fn micro_full(
-    h: &mut [u32],
-    a_tile: &[u32],
+    h_tile: &mut [u32],
+    at: &[u32],
     d: &[u32],
     i0: usize,
     kc: usize,
     j0: usize,
     width: usize,
-    k0: usize,
-    mr: usize,
 ) {
     let mut acc = [[0u32; NR]; MR];
     for i in 0..kc {
-        let ar = &a_tile[i * MR..i * MR + MR];
+        let ar = &at[i * MR..i * MR + MR];
         let dv = &d[(i0 + i) * width + j0..(i0 + i) * width + j0 + NR];
         for m in 0..MR {
             let am = ar[m];
-            for n in 0..NR {
-                acc[m][n] = acc[m][n].wrapping_add(am.wrapping_mul(dv[n]));
+            for (accn, &dn) in acc[m].iter_mut().zip(dv) {
+                *accn = accn.wrapping_add(am.wrapping_mul(dn));
             }
         }
     }
+    let mr = h_tile.len() / width;
     for m in 0..mr {
-        let h_row = &mut h[(k0 + m) * width + j0..(k0 + m) * width + j0 + NR];
-        for n in 0..NR {
-            h_row[n] = h_row[n].wrapping_add(acc[m][n]);
+        let h_row = &mut h_tile[m * width + j0..m * width + j0 + NR];
+        for (hn, &accn) in h_row.iter_mut().zip(&acc[m]) {
+            *hn = hn.wrapping_add(accn);
         }
     }
 }
@@ -183,21 +222,19 @@ fn micro_full(
 /// measurable.
 #[inline]
 fn micro_tail(
-    h: &mut [u32],
-    a_tile: &[u32],
+    h_tile: &mut [u32],
+    at: &[u32],
     d: &[u32],
     i0: usize,
     kc: usize,
     j0: usize,
     width: usize,
-    k0: usize,
-    mr: usize,
 ) {
     let jt = width - j0;
     debug_assert!(jt < NR);
     let mut acc = [[0u32; NR]; MR];
     for i in 0..kc {
-        let ar = &a_tile[i * MR..i * MR + MR];
+        let ar = &at[i * MR..i * MR + MR];
         let dv = &d[(i0 + i) * width + j0..(i0 + i) * width + jt + j0];
         for m in 0..MR {
             let am = ar[m];
@@ -206,8 +243,9 @@ fn micro_tail(
             }
         }
     }
+    let mr = h_tile.len() / width;
     for m in 0..mr {
-        let h_row = &mut h[(k0 + m) * width + j0..(k0 + m) * width + j0 + jt];
+        let h_row = &mut h_tile[m * width + j0..m * width + j0 + jt];
         for (hn, &accn) in h_row.iter_mut().zip(&acc[m][..jt]) {
             *hn = hn.wrapping_add(accn);
         }
@@ -310,5 +348,25 @@ mod tests {
         let mut h = [1u32, 2, 3, 4];
         gemm_at_d_accumulate(&mut h, &[], &[], 2, 2);
         assert_eq!(h, [1, 2, 3, 4]);
+    }
+
+    /// A shape crossing `GEMM_PAR_MIN_MACS` exercises the rayon path
+    /// end-to-end and must still be bit-identical to the reference
+    /// loop (disjoint-tile partition carries no arithmetic).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_path_matches_naive() {
+        let (n, lwe, w) = (2048usize, 66usize, 130usize); // 17.6M MACs ≥ gate
+        assert!((n as u64) * (lwe as u64) * (w as u64) >= GEMM_PAR_MIN_MACS);
+        let mut a = vec![0u32; n * lwe];
+        let mut d = vec![0u32; n * w];
+        fill_pseudorandom(&mut a, 0x7A7A_7A7A);
+        fill_pseudorandom(&mut d, 0x5B5B_5B5B);
+
+        let mut expected = vec![0u32; lwe * w];
+        naive(&mut expected, &a, &d, lwe, w);
+        let mut got = vec![0u32; lwe * w];
+        gemm_at_d_accumulate(&mut got, &a, &d, lwe, w);
+        assert_eq!(got, expected);
     }
 }

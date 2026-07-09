@@ -79,6 +79,16 @@
 /// per cell once blocked (vs 3 for the naive loop).
 pub(crate) fn matvec_accumulate(acc: &mut [u32], d: &[u32], q: &[u32]) {
     debug_assert_eq!(d.len(), q.len() * acc.len(), "matvec shape mismatch");
+    #[cfg(feature = "parallel")]
+    if d.len() >= PAR_MIN_CELLS && !acc.is_empty() {
+        matvec_accumulate_par(acc, d, q, par_chunk_rows(q.len()));
+        return;
+    }
+    matvec_accumulate_seq(acc, d, q);
+}
+
+/// Sequential realization: width-adaptive register blocking.
+fn matvec_accumulate_seq(acc: &mut [u32], d: &[u32], q: &[u32]) {
     // R = largest power of two ≤ 16 with R · width ≤ 2048 cells (8 KiB
     // block footprint) — see the module docs for the measured cliffs
     // that pin both ends of this rule.
@@ -89,6 +99,58 @@ pub(crate) fn matvec_accumulate(acc: &mut [u32], d: &[u32], q: &[u32]) {
         257..=512 => block_pass::<4>(acc, d, q),
         513..=1024 => block_pass::<2>(acc, d, q),
         _ => block_pass::<1>(acc, d, q),
+    }
+}
+
+/// Minimum matrix cells before the vector-matrix kernels fan out to
+/// rayon; below this the fork/join overhead outweighs the win. Every
+/// real per-segment DB and every SimplePIR hint clears it; FrodoPIR's
+/// small `lwe_dim × width` hint at narrow widths stays sequential —
+/// which is also the faster choice there.
+#[cfg(feature = "parallel")]
+const PAR_MIN_CELLS: usize = 1 << 20;
+
+/// Rows per parallel task: ~4 tasks per thread for stealing balance,
+/// floored so a task never degenerates below the register-blocking
+/// window.
+#[cfg(feature = "parallel")]
+fn par_chunk_rows(rows: usize) -> usize {
+    rows.div_ceil(rayon::current_num_threads() * 4).max(64)
+}
+
+/// Parallel realization: partition the rows into `chunk_rows`-row
+/// tasks, fold each through the sequential kernel into a per-task
+/// partial accumulator, and reduce with element-wise wrapping adds.
+///
+/// # Rationale
+///
+/// Bit-exact for any chunking: each `acc[j]` is a sum over rows, and
+/// `u32` wrapping addition is associative + commutative, so regrouping
+/// by task and reducing in any order yields the same word. The chunk
+/// boundaries depend only on public shapes, never on data values.
+#[cfg(feature = "parallel")]
+fn matvec_accumulate_par(acc: &mut [u32], d: &[u32], q: &[u32], chunk_rows: usize) {
+    use rayon::prelude::*;
+    let width = acc.len();
+    let partial = d
+        .par_chunks(chunk_rows * width)
+        .zip(q.par_chunks(chunk_rows))
+        .map(|(dc, qc)| {
+            let mut p = vec![0u32; width];
+            matvec_accumulate_seq(&mut p, dc, qc);
+            p
+        })
+        .reduce(
+            || vec![0u32; width],
+            |mut x, y| {
+                for (xi, yi) in x.iter_mut().zip(y) {
+                    *xi = xi.wrapping_add(yi);
+                }
+                x
+            },
+        );
+    for (a, p) in acc.iter_mut().zip(partial) {
+        *a = a.wrapping_add(p);
     }
 }
 
@@ -171,6 +233,25 @@ fn block_pass<const R: usize>(acc: &mut [u32], d: &[u32], q: &[u32]) {
 /// `Θ(b.len() · s.len())` wrapping multiply-adds.
 pub(crate) fn matvec_rows_accumulate(b: &mut [u32], a: &[u32], s: &[u32]) {
     debug_assert_eq!(a.len(), b.len() * s.len(), "matvec_rows shape mismatch");
+    // Each output row is an independent dot product, so row-partitioned
+    // parallelism has disjoint writes and is bit-exact by construction.
+    // Worthwhile even in the DRAM-bound regime: threads add aggregate
+    // memory bandwidth that a single core cannot reach.
+    #[cfg(feature = "parallel")]
+    if a.len() >= PAR_MIN_CELLS && !s.is_empty() {
+        use rayon::prelude::*;
+        let n = s.len();
+        let chunk = par_chunk_rows(b.len());
+        b.par_chunks_mut(chunk)
+            .zip(a.par_chunks(chunk * n))
+            .for_each(|(bc, ac)| matvec_rows_seq(bc, ac, s));
+        return;
+    }
+    matvec_rows_seq(b, a, s);
+}
+
+/// Sequential realization: size-adaptive row blocking.
+fn matvec_rows_seq(b: &mut [u32], a: &[u32], s: &[u32]) {
     // 2 MiB of u32 cells = 8 MiB of A — the cache-residency threshold
     // between the ILP-bound and DRAM-bound regimes measured above.
     if a.len() <= 2_097_152 {
@@ -364,5 +445,46 @@ mod tests {
         let mut b = [3u32, 4];
         matvec_rows_accumulate(&mut b, &[], &[]);
         assert_eq!(b, [3, 4]);
+    }
+
+    /// The rayon partition + wrapping-add reduce is bit-identical to
+    /// the naive loop for chunkings that split rows unevenly, including
+    /// a chunk size larger than the row count (single-task edge).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_matvec_matches_naive_across_chunkings() {
+        let (n, width) = (103usize, 37usize);
+        let mut d = vec![0u32; n * width];
+        let mut q = vec![0u32; n];
+        fill_pseudorandom(&mut d, 0xC0DE_C0DE);
+        fill_pseudorandom(&mut q, 0xF00D_F00D);
+
+        let mut expected = vec![0u32; width];
+        naive(&mut expected, &d, &q);
+
+        for chunk_rows in [1usize, 7, 64, 200] {
+            let mut got = vec![0u32; width];
+            matvec_accumulate_par(&mut got, &d, &q, chunk_rows);
+            assert_eq!(got, expected, "mismatch at chunk_rows={chunk_rows}");
+        }
+    }
+
+    /// A rows-kernel shape crossing `PAR_MIN_CELLS` exercises the rayon
+    /// path end-to-end (disjoint row writes — no reduce involved).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_rows_kernel_matches_naive() {
+        let (rows, n) = (2100usize, 512usize); // 1.07M cells ≥ gate
+        assert!(rows * n >= PAR_MIN_CELLS);
+        let mut a = vec![0u32; rows * n];
+        let mut s = vec![0u32; n];
+        fill_pseudorandom(&mut a, 0xAB1E_5EED);
+        fill_pseudorandom(&mut s, 0x00DD_BA11);
+
+        let mut expected = vec![0u32; rows];
+        naive_rows(&mut expected, &a, &s);
+        let mut got = vec![0u32; rows];
+        matvec_rows_accumulate(&mut got, &a, &s);
+        assert_eq!(got, expected);
     }
 }

@@ -18,6 +18,11 @@ autobenches = false
 [lints]
 workspace = true
 
+[features]
+# Forward the perf branch's parallel-kernels feature (default-on).
+default  = ["parallel"]
+parallel = ["ikpir-common/parallel"]
+
 [dependencies]
 segmented-cuckoo = { workspace = true }
 ikpir-common     = { workspace = true }

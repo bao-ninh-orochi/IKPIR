@@ -22,6 +22,14 @@ workspace = true
 segmented-cuckoo = { workspace = true }
 rand             = { workspace = true }
 rand_chacha      = { workspace = true }
+rayon            = { workspace = true, optional = true }
+
+[features]
+# perf/optimized branch: rayon-parallel kernels (matvec, GEMM, sampling,
+# hint patches). Default-on here; disable with --no-default-features for
+# single-threaded runs comparable to main.
+default  = ["parallel"]
+parallel = ["dep:rayon"]
 
 [[bench]]
 name    = "kernels"
