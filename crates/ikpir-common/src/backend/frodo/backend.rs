@@ -589,28 +589,56 @@ fn patch_slot_c<'a, I>(
     let lwe_dim_us = lwe_dim as usize;
     let row_width_us = row_width as usize;
 
-    for slot in slots {
-        let Some(c) = slot.c.as_mut() else {
-            continue;
-        };
-        debug_assert_eq!(c.len(), row_width_us);
-        debug_assert_eq!(slot.secret.len(), lwe_dim_us);
-
-        for (row_idx, cells) in row_deltas {
-            let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
-            // dot = secret · A_row (offset-independent).
-            let dot: u32 = slot
-                .secret
-                .iter()
-                .zip(a_row.iter())
-                .fold(0u32, |acc, (&s, &ai)| acc.wrapping_add(s.wrapping_mul(ai)));
-            for (off, delta) in cells {
-                if *delta == 0 {
-                    continue;
-                }
-                let delta_u32 = *delta as u32;
-                c[*off as usize] = c[*off as usize].wrapping_add(dot.wrapping_mul(delta_u32));
+    // Slots are independent (each owns its secret and c), so a warm
+    // queue parallelises trivially; a cold/small queue stays inline.
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let slot_refs: Vec<&mut PreparedSlot> = slots.into_iter().collect();
+        if slot_refs.len() >= 4 {
+            slot_refs.into_par_iter().for_each(|slot| {
+                patch_one_slot_c(a, lwe_dim_us, row_width_us, slot, row_deltas);
+            });
+        } else {
+            for slot in slot_refs {
+                patch_one_slot_c(a, lwe_dim_us, row_width_us, slot, row_deltas);
             }
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    for slot in slots {
+        patch_one_slot_c(a, lwe_dim_us, row_width_us, slot, row_deltas);
+    }
+}
+
+/// Patch a single slot's `c` (no-op when Phase C hasn't run for it).
+fn patch_one_slot_c(
+    a: &[u32],
+    lwe_dim_us: usize,
+    row_width_us: usize,
+    slot: &mut PreparedSlot,
+    row_deltas: &[(u32, Vec<(u16, i64)>)],
+) {
+    let Some(c) = slot.c.as_mut() else {
+        return;
+    };
+    debug_assert_eq!(c.len(), row_width_us);
+    debug_assert_eq!(slot.secret.len(), lwe_dim_us);
+
+    for (row_idx, cells) in row_deltas {
+        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
+        // dot = secret · A_row (offset-independent).
+        let dot: u32 = slot
+            .secret
+            .iter()
+            .zip(a_row.iter())
+            .fold(0u32, |acc, (&s, &ai)| acc.wrapping_add(s.wrapping_mul(ai)));
+        for (off, delta) in cells {
+            if *delta == 0 {
+                continue;
+            }
+            let delta_u32 = *delta as u32;
+            c[*off as usize] = c[*off as usize].wrapping_add(dot.wrapping_mul(delta_u32));
         }
     }
 }
@@ -654,8 +682,10 @@ fn apply_patch(
 /// Math: `H[k, cell] += A[row_idx, k] · Δ mod 2³²`. Iterates touched
 /// `(row, cell, Δ)` triples and slides `A`'s `row_idx`-th column
 /// against the hint column at `cell`; untouched columns are never read
-/// or written. The `aik == 0` early-exit captures sparsity in the
-/// random ternary `A` (public, so the branch leaks nothing secret).
+/// or written. Large bursts split the `k` dimension across rayon tasks
+/// — each task owns a contiguous band of hint rows, so writes are
+/// disjoint and every `(row, cell, k)` term is added exactly once
+/// (bit-exact for any banding).
 ///
 /// # Complexity
 ///
@@ -674,18 +704,55 @@ fn apply_patch_entry_level(
     let row_width_us = row_width as usize;
     debug_assert_eq!(a.len(), (n_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * row_width_us);
+    if row_width_us == 0 {
+        return;
+    }
 
+    #[cfg(feature = "parallel")]
+    {
+        let touched: usize = row_deltas.iter().map(|(_, cells)| cells.len()).sum();
+        if touched * lwe_dim_us >= PATCH_PAR_MIN_MACS {
+            use rayon::prelude::*;
+            let band_k = lwe_dim_us
+                .div_ceil(rayon::current_num_threads() * 4)
+                .max(16);
+            hint.par_chunks_mut(band_k * row_width_us)
+                .enumerate()
+                .for_each(|(bi, band)| {
+                    entry_level_band(a, lwe_dim_us, row_width_us, band, bi * band_k, row_deltas);
+                });
+            return;
+        }
+    }
+    entry_level_band(a, lwe_dim_us, row_width_us, hint, 0, row_deltas);
+}
+
+/// Minimum multiply-add count before a hint patch fans out to rayon —
+/// single-mutation bursts stay inline, `server_mutation`-sized batches
+/// parallelise.
+#[cfg(feature = "parallel")]
+const PATCH_PAR_MIN_MACS: usize = 1 << 19;
+
+/// Apply every `(row, cell, Δ)` edit to one contiguous band of hint
+/// rows (`k_base ..` for `band.len() / row_width` rows).
+fn entry_level_band(
+    a: &[u32],
+    lwe_dim_us: usize,
+    row_width_us: usize,
+    band: &mut [u32],
+    k_base: usize,
+    row_deltas: &[(u32, Vec<(u16, i64)>)],
+) {
+    let k_count = band.len() / row_width_us;
     for (row_idx, cells) in row_deltas {
-        debug_assert!(
-            (*row_idx as usize) < n_rows as usize,
-            "row_idx {row_idx} out of range (n_rows={n_rows})",
-        );
-        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
+        debug_assert!((*row_idx as usize) * lwe_dim_us < a.len());
+        let a_off = (*row_idx as usize) * lwe_dim_us + k_base;
+        let a_band = &a[a_off..a_off + k_count];
 
         for (cell_offset, delta) in cells {
             debug_assert!(
                 (*cell_offset as usize) < row_width_us,
-                "cell_offset {cell_offset} out of range (row_width={row_width})",
+                "cell_offset {cell_offset} out of range (row_width={row_width_us})",
             );
             if *delta == 0 {
                 continue;
@@ -693,12 +760,9 @@ fn apply_patch_entry_level(
             let delta_u32 = *delta as u32;
             let cell_us = *cell_offset as usize;
 
-            for (k, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
+            for (k, &aik) in a_band.iter().enumerate() {
                 let idx = k * row_width_us + cell_us;
-                hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
+                band[idx] = band[idx].wrapping_add(aik.wrapping_mul(delta_u32));
             }
         }
     }
@@ -709,16 +773,17 @@ fn apply_patch_entry_level(
 ///
 /// # Rationale
 ///
-/// For each touched row, densify its sparse edits into a full
-/// `row_width`-wide delta vector `δ` (zero at untouched columns) and
-/// apply the dense rank-one update
-/// `H[k, ·] += A[row_idx, k] · δ[·] mod 2³²` across the entire hint
-/// width. Columns with `δ = 0` are still multiplied — that is the
+/// Densify the sparse edits into a `touched_rows × row_width` delta
+/// matrix `Δ` (zero at untouched columns), gather the touched `A` rows,
+/// and apply the whole burst as one `H += A_selᵀ · Δ` product through
+/// the shared register-tiled [`gemm_at_d_accumulate`] — the dense
+/// rank-one updates of the paper's row-level patch, batched into the
+/// same tiled (and, for large bursts, parallel) kernel that computes
+/// hints. Columns with `δ = 0` are still multiplied — that is the
 /// point: this is the row-granular patch of SimplePIR, kept as the
-/// baseline the entry-level sharpening is measured against. The
-/// `aik == 0` early-exit matches [`apply_patch_entry_level`] so the two
-/// realizations share the same micro-optimisation policy on the public
-/// ternary `A`.
+/// baseline the entry-level sharpening is measured against. Bit-exact
+/// vs the per-row loop: each `H[k, j]` gains `Σ_r A[r, k] · δ_r[j]`
+/// and wrapping addition is associative + commutative.
 ///
 /// # Complexity
 ///
@@ -737,33 +802,28 @@ fn apply_patch_row_level(
     debug_assert_eq!(a.len(), (n_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * row_width_us);
 
-    let mut delta_row = vec![0u32; row_width_us];
-    for (row_idx, cells) in row_deltas {
+    let t = row_deltas.len();
+    let mut delta = vec![0u32; t * row_width_us];
+    let mut a_sel = vec![0u32; t * lwe_dim_us];
+    for (r, (row_idx, cells)) in row_deltas.iter().enumerate() {
         debug_assert!(
             (*row_idx as usize) < n_rows as usize,
             "row_idx {row_idx} out of range (n_rows={n_rows})",
         );
-        delta_row.fill(0);
-        for (cell_offset, delta) in cells {
+        let delta_row = &mut delta[r * row_width_us..(r + 1) * row_width_us];
+        for (cell_offset, d) in cells {
             debug_assert!(
                 (*cell_offset as usize) < row_width_us,
                 "cell_offset {cell_offset} out of range (row_width={row_width})",
             );
             let cell_us = *cell_offset as usize;
-            delta_row[cell_us] = delta_row[cell_us].wrapping_add(*delta as u32);
+            delta_row[cell_us] = delta_row[cell_us].wrapping_add(*d as u32);
         }
-        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
-
-        for (k, &aik) in a_row.iter().enumerate() {
-            if aik == 0 {
-                continue;
-            }
-            let h_row = &mut hint[k * row_width_us..(k + 1) * row_width_us];
-            for (h, &d) in h_row.iter_mut().zip(delta_row.iter()) {
-                *h = h.wrapping_add(aik.wrapping_mul(d));
-            }
-        }
+        a_sel[r * lwe_dim_us..(r + 1) * lwe_dim_us].copy_from_slice(
+            &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us],
+        );
     }
+    gemm_at_d_accumulate(hint, &a_sel, &delta, lwe_dim_us, row_width_us);
 }
 
 #[cfg(test)]

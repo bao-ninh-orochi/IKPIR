@@ -781,31 +781,85 @@ fn patch_slot_c<'a, I>(
     let lwe_dim_us = lwe_dim as usize;
     let reshape_row_width_us = reshape_row_width as usize;
 
-    for slot in slots {
-        let Some(c) = slot.c.as_mut() else {
-            continue;
-        };
-        debug_assert_eq!(c.len(), reshape_row_width_us);
-        debug_assert_eq!(slot.secret.len(), lwe_dim_us);
-
-        for (orig_row, cells) in row_deltas {
-            let (reshape_row, _) = translate(*orig_row, 0, k, row_width);
-            let a_row =
-                &a[(reshape_row as usize) * lwe_dim_us..(reshape_row as usize + 1) * lwe_dim_us];
-            let dot: u32 = slot
-                .secret
-                .iter()
-                .zip(a_row.iter())
-                .fold(0u32, |acc, (&s, &ai)| acc.wrapping_add(s.wrapping_mul(ai)));
-            for (orig_off, delta) in cells {
-                if *delta == 0 {
-                    continue;
-                }
-                let (_, reshape_off) = translate(*orig_row, *orig_off, k, row_width);
-                let delta_u32 = *delta as u32;
-                c[reshape_off as usize] =
-                    c[reshape_off as usize].wrapping_add(dot.wrapping_mul(delta_u32));
+    // Slots are independent (each owns its secret and c), so a warm
+    // queue parallelises trivially; a cold/small queue stays inline.
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let slot_refs: Vec<&mut PreparedSlot> = slots.into_iter().collect();
+        if slot_refs.len() >= 4 {
+            slot_refs.into_par_iter().for_each(|slot| {
+                patch_one_slot_c(
+                    a,
+                    lwe_dim_us,
+                    row_width,
+                    k,
+                    reshape_row_width_us,
+                    slot,
+                    row_deltas,
+                );
+            });
+        } else {
+            for slot in slot_refs {
+                patch_one_slot_c(
+                    a,
+                    lwe_dim_us,
+                    row_width,
+                    k,
+                    reshape_row_width_us,
+                    slot,
+                    row_deltas,
+                );
             }
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    for slot in slots {
+        patch_one_slot_c(
+            a,
+            lwe_dim_us,
+            row_width,
+            k,
+            reshape_row_width_us,
+            slot,
+            row_deltas,
+        );
+    }
+}
+
+/// Patch a single slot's `c` (no-op when Phase C hasn't run for it).
+fn patch_one_slot_c(
+    a: &[u32],
+    lwe_dim_us: usize,
+    row_width: u32,
+    k: u32,
+    reshape_row_width_us: usize,
+    slot: &mut PreparedSlot,
+    row_deltas: &[(u32, Vec<(u16, i64)>)],
+) {
+    let Some(c) = slot.c.as_mut() else {
+        return;
+    };
+    debug_assert_eq!(c.len(), reshape_row_width_us);
+    debug_assert_eq!(slot.secret.len(), lwe_dim_us);
+
+    for (orig_row, cells) in row_deltas {
+        let (reshape_row, _) = translate(*orig_row, 0, k, row_width);
+        let a_row =
+            &a[(reshape_row as usize) * lwe_dim_us..(reshape_row as usize + 1) * lwe_dim_us];
+        let dot: u32 = slot
+            .secret
+            .iter()
+            .zip(a_row.iter())
+            .fold(0u32, |acc, (&s, &ai)| acc.wrapping_add(s.wrapping_mul(ai)));
+        for (orig_off, delta) in cells {
+            if *delta == 0 {
+                continue;
+            }
+            let (_, reshape_off) = translate(*orig_row, *orig_off, k, row_width);
+            let delta_u32 = *delta as u32;
+            c[reshape_off as usize] =
+                c[reshape_off as usize].wrapping_add(dot.wrapping_mul(delta_u32));
         }
     }
 }
@@ -872,8 +926,9 @@ fn apply_patch(
 /// `(reshape_row, reshape_off) = translate(orig_row, orig_off, k,
 /// row_width)`. Iterates touched `(orig_row, orig_off, Δ)` triples and
 /// slides `A`'s `reshape_row`-th column against the hint column at
-/// `reshape_off`. The `aik == 0` early-exit is a sparsity optimisation
-/// safe under public `A`.
+/// `reshape_off`. Large bursts split the `k` dimension across rayon
+/// tasks — each owns a contiguous band of hint rows, so writes are
+/// disjoint and the result is bit-identical for any banding.
 ///
 /// # Complexity
 ///
@@ -895,15 +950,78 @@ fn apply_patch_entry_level(
     let reshape_row_width_us = reshape_row_width as usize;
     debug_assert_eq!(a.len(), (reshape_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * reshape_row_width_us);
+    debug_assert!(
+        row_deltas.iter().all(|(r, _)| *r < n_rows),
+        "orig_row out of range (n_rows={n_rows})",
+    );
 
+    if reshape_row_width_us == 0 {
+        return;
+    }
+    #[cfg(feature = "parallel")]
+    {
+        let touched: usize = row_deltas.iter().map(|(_, cells)| cells.len()).sum();
+        if touched * lwe_dim_us >= PATCH_PAR_MIN_MACS {
+            use rayon::prelude::*;
+            let band_k = lwe_dim_us
+                .div_ceil(rayon::current_num_threads() * 4)
+                .max(16);
+            hint.par_chunks_mut(band_k * reshape_row_width_us)
+                .enumerate()
+                .for_each(|(bi, band)| {
+                    entry_level_band(
+                        a,
+                        lwe_dim_us,
+                        row_width,
+                        k,
+                        reshape_row_width_us,
+                        band,
+                        bi * band_k,
+                        row_deltas,
+                    );
+                });
+            return;
+        }
+    }
+    entry_level_band(
+        a,
+        lwe_dim_us,
+        row_width,
+        k,
+        reshape_row_width_us,
+        hint,
+        0,
+        row_deltas,
+    );
+}
+
+/// Minimum multiply-add count before a hint patch fans out to rayon —
+/// single-mutation bursts stay inline, `server_mutation`-sized batches
+/// parallelise.
+#[cfg(feature = "parallel")]
+const PATCH_PAR_MIN_MACS: usize = 1 << 19;
+
+/// Apply every `(row, cell, Δ)` edit to one contiguous band of hint
+/// rows (`k_base ..` for `band.len() / reshape_row_width` rows) — the
+/// disjoint-write unit behind the (optional) rayon fan-out. Each
+/// `(row, cell, k)` term is added exactly once for any banding, so the
+/// result is bit-identical to the single-band pass.
+#[allow(clippy::too_many_arguments)]
+fn entry_level_band(
+    a: &[u32],
+    lwe_dim_us: usize,
+    row_width: u32,
+    k: u32,
+    reshape_row_width_us: usize,
+    band: &mut [u32],
+    k_base: usize,
+    row_deltas: &[(u32, Vec<(u16, i64)>)],
+) {
+    let k_count = band.len() / reshape_row_width_us;
     for (orig_row, cells) in row_deltas {
-        debug_assert!(
-            *orig_row < n_rows,
-            "orig_row {orig_row} out of range (n_rows={n_rows})",
-        );
         let (reshape_row, _) = translate(*orig_row, 0, k, row_width);
-        let a_row =
-            &a[(reshape_row as usize) * lwe_dim_us..(reshape_row as usize + 1) * lwe_dim_us];
+        let a_off = (reshape_row as usize) * lwe_dim_us + k_base;
+        let a_band = &a[a_off..a_off + k_count];
 
         for (orig_off, delta) in cells {
             debug_assert!(
@@ -917,12 +1035,9 @@ fn apply_patch_entry_level(
             let delta_u32 = *delta as u32;
             let cell_us = reshape_off as usize;
 
-            for (k_idx, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
+            for (k_idx, &aik) in a_band.iter().enumerate() {
                 let idx = k_idx * reshape_row_width_us + cell_us;
-                hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
+                band[idx] = band[idx].wrapping_add(aik.wrapping_mul(delta_u32));
             }
         }
     }
@@ -941,11 +1056,10 @@ fn apply_patch_entry_level(
 /// full `reshape_row_width`-wide delta vector (zero at untouched
 /// columns), and applied as
 /// `H[k_idx, ·] += A[reshape_row, k_idx] · δ[·] mod 2³²` across the
-/// entire hint width. `BTreeMap` keeps the update order deterministic.
-/// The `aik == 0` early-exit matches [`apply_patch_entry_level`] so the
-/// two realizations share the same micro-optimisation policy (on the
-/// uniform-`Z_q` `A` it fires with probability `2⁻³²` — kept for parity
-/// with FrodoPIR).
+/// entire hint width, with the whole burst batched into one
+/// `H += A_selᵀ · Δ` product through the shared register-tiled
+/// [`gemm_at_d_accumulate`]. `BTreeMap` keeps the gather order
+/// deterministic (the sums are order-independent anyway).
 ///
 /// # Complexity
 ///
@@ -991,19 +1105,21 @@ fn apply_patch_row_level(
         }
     }
 
-    for (reshape_row, dense) in &dense_by_reshape_row {
-        let a_row =
-            &a[(*reshape_row as usize) * lwe_dim_us..(*reshape_row as usize + 1) * lwe_dim_us];
-        for (k_idx, &aik) in a_row.iter().enumerate() {
-            if aik == 0 {
-                continue;
-            }
-            let h_row = &mut hint[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
-            for (h, &d) in h_row.iter_mut().zip(dense.iter()) {
-                *h = h.wrapping_add(aik.wrapping_mul(d));
-            }
-        }
+    // Batch the dense rank-one updates into one H += A_sel^T · Δ product
+    // through the shared register-tiled (and, for large bursts,
+    // parallel) GEMM kernel — bit-exact vs the per-row loop since each
+    // H[k, j] gains Σ_r A[r, k] · δ_r[j] under associative + commutative
+    // wrapping addition.
+    let t = dense_by_reshape_row.len();
+    let mut a_sel = vec![0u32; t * lwe_dim_us];
+    let mut delta = vec![0u32; t * reshape_row_width_us];
+    for (r, (reshape_row, dense)) in dense_by_reshape_row.iter().enumerate() {
+        a_sel[r * lwe_dim_us..(r + 1) * lwe_dim_us].copy_from_slice(
+            &a[(*reshape_row as usize) * lwe_dim_us..(*reshape_row as usize + 1) * lwe_dim_us],
+        );
+        delta[r * reshape_row_width_us..(r + 1) * reshape_row_width_us].copy_from_slice(dense);
     }
+    gemm_at_d_accumulate(hint, &a_sel, &delta, lwe_dim_us, reshape_row_width_us);
 }
 
 #[cfg(test)]

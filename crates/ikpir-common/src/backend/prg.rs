@@ -37,6 +37,7 @@ use rand_chacha::ChaCha20Rng;
 
 /// ChaCha20 outputs 16 `u32` words per block; chunk boundaries snap to
 /// this so no parallel task regenerates a partial block.
+#[cfg(feature = "parallel")]
 const CHACHA_BLOCK_WORDS: usize = 16;
 
 /// Minimum output words before fanning out to rayon. A ~1 MiB fill
