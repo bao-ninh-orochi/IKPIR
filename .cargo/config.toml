@@ -1,0 +1,10 @@
+# perf/optimized branch: compile for the local machine's full ISA.
+#
+# `main` deliberately builds for the portable baseline target so paper
+# numbers are reproducible anywhere; this branch instead hands the
+# autovectorizer every instruction the build host offers (NEON on Apple
+# Silicon, AVX2/AVX-512 on the EPYC bench machine). Binaries built on
+# one machine may not run on an older one — acceptable for a
+# performance branch, wrong for the reference implementation.
+[build]
+rustflags = ["-C", "target-cpu=native"]

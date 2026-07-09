@@ -26,5 +26,5 @@ debug
 .idea/
 .vscode/
 
-# Local cargo config
-.cargo/config.toml
+# perf/optimized branch: .cargo/config.toml is tracked here (it carries
+# the branch's target-cpu=native rustflags); main ignores it as local config.
