@@ -23,32 +23,30 @@ xxhash-rust = { workspace = true }
 rand        = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+clap = { workspace = true }
 
+# ── Cuckoo-filter benches (SCF vs standard; the paper's Table 2) ──────────────
 [[bench]]
-name    = "load_factor"
+name    = "cuckoo_filter_load_factor"
 harness = false
 
 [[bench]]
-name    = "insert_throughput"
+name    = "cuckoo_filter_insert_throughput"
 harness = false
 
 [[bench]]
-name    = "lookup_throughput"
+name    = "cuckoo_filter_lookup_throughput"
 harness = false
 
 [[bench]]
-name    = "fpr"
+name    = "cuckoo_filter_delete_throughput"
 harness = false
 
 [[bench]]
-name    = "degree_distribution"
+name    = "cuckoo_filter_false_positive_rate"
 harness = false
 
-[[bench]]
-name    = "delete_throughput"
-harness = false
-
+# ── KV-store benches (segmented only; the IKPIR primitive layer) ──────────────
 [[bench]]
 name    = "kv_store_insert_throughput"
 harness = false

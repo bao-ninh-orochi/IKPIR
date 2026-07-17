@@ -13,7 +13,7 @@ Target Index-PIR backends: **FrodoPIR** and **SimplePIR** (LWE-based, post-quant
 ## Workspace structure
 
 ```
-Incremental-Keyword-PIR/          ← workspace root
+RisePIR/                          ← workspace root
 ├── Cargo.toml                    ← workspace manifest (members = ["crates/*"])
 ├── CLAUDE.md
 ├── README.md
@@ -89,24 +89,35 @@ state machine, failure-mode table, and entry-point map.
 
 ## Benches
 
-Nine focused `clap`-parsed benches — four server (`server_setup`,
+Nine focused `clap`-parsed PIR benches — four server (`server_setup`,
 `server_answer`, `server_mutation`, `headtohead_answer`) and five client
 (`client_query`, `client_decode`, `client_mutation`, `headtohead_query`,
 `headtohead_decode`) — emit CSV under `results/<crate>/`. Each invocation =
 one config = one CSV row (the mutation benches emit one row per
 `(patch mode, kind)` pair; the `headtohead_*` benches fix `--num-keys` and add
 `num_keys`/`db_size` columns for the fixed-N comparison vs ChalametPIR /
-Hao 2025). `segmented-cuckoo` adds nine filter/KV-store micro-benches that run
-a fixed internal config matrix (no CLI flags).
+Hao 2025).
+
+`segmented-cuckoo` adds eight filter/KV-store benches: five `cuckoo_filter_*`
+(`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,
+`false_positive_rate`) and three `kv_store_*`. They are `clap`-parsed too, but
+every flag is optional: with none, each runs the paper's **Table 2** matrix — the
+six `(arity, bucket_size)` pairs at `fingerprint_bits = 32`, `max_kicks = 2500`,
+~10^6 buckets. That matrix and every default live in
+`crates/segmented-cuckoo/benches/configs.rs`, the single source of truth;
+`--arity` / `--bucket-size` narrow it, other flags override one axis.
 
 Run one bench at one config with **`scripts/bench.sh <name> [flags]`**, which
-maps the bench to its crate, auto-derives `--plaintext-bits` and `--lwe-dim`,
-and exports `IKPIR_RESULTS_DIR=results/<crate>` before `cargo bench`. There is
-**no full-matrix sweep script** (the paper is complete); reproducing the whole
-matrix means looping `bench.sh`. **`scripts/smoke.sh`** runs every PIR bench at
-a tiny config on both backends in a couple of minutes (into a throwaway
-`results/.smoke/`) — the fast correctness/property check. Shared derivation
-(pb/lwe, the bench→crate map) lives in **`scripts/lib.sh`**.
+maps the bench to its crate, auto-derives `--plaintext-bits` and `--lwe-dim` for
+the PIR benches, and exports `IKPIR_RESULTS_DIR=results/<crate>` before
+`cargo bench`. **`scripts/table2.sh`** reproduces the paper's Table 2 end to end
+(the four `cuckoo_filter_*` benches behind its columns; flags are forwarded to
+each). There is **no full-matrix sweep script for the PIR benches** (the paper is
+complete); reproducing that matrix means looping `bench.sh`.
+**`scripts/smoke.sh`** runs every PIR bench at a tiny config on both backends in
+a couple of minutes (into a throwaway `results/.smoke/`) — the fast
+correctness/property check. Shared derivation (pb/lwe, the bench→crate map) lives
+in **`scripts/lib.sh`**.
 
 `plaintext_bits` is **not fixed across configs**. For each
 `(backend, SCF geometry, value_bits)` triple, `bench.sh` picks the maximum `pb`
@@ -133,6 +144,13 @@ row-level vs entry-level mutation columns.
 ./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --value-bits 256
 ./scripts/bench.sh client_mutation --backend simple --patch-mode entry,row
 ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
+
+# Reproduce the paper's Table 2 (SCF vs standard cuckoo filter, six configs).
+./scripts/table2.sh
+./scripts/table2.sh --arity 4          # narrow: flags forwarded to each bench
+
+# One segmented-cuckoo bench: no flags = the full Table 2 matrix.
+./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2
 
 # Fast correctness/property smoke across all PIR benches, both backends.
 ./scripts/smoke.sh

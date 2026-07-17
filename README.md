@@ -172,8 +172,12 @@ The `headtohead_*` benches fix the **keyword count** (`--num-keys`) and report
 the DB size each scheme needed — the fair-comparison setting vs ChalametPIR /
 Hao et al. 2025; the others fix the DB geometry and populate to `TableFull`
 (or to `--load-factor` for the mutation benches). The `segmented-cuckoo` crate
-adds nine filter / KV-store micro-benches (`load_factor`, `insert_throughput`,
-`fpr`, …) that run their own fixed internal config matrix.
+adds eight filter / KV-store benches — five `cuckoo_filter_*`
+(`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,
+`false_positive_rate`) and three `kv_store_*`. Their flags are all optional:
+with none, each runs the paper's **Table 2** matrix (six `(arity, bucket_size)`
+pairs, `fingerprint_bits = 32`, `max_kicks = 2500`, ~10⁶ buckets), defined once
+in `crates/segmented-cuckoo/benches/configs.rs`.
 
 ### Run one bench at one config
 
@@ -186,14 +190,31 @@ and `--lwe-dim`, and writing the CSV under `results/<crate>/`:
 ./scripts/bench.sh client_decode --backend simple
 ./scripts/bench.sh server_mutation --patch-mode entry,row
 ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
-./scripts/bench.sh insert_throughput            # segmented-cuckoo (fixed matrix)
+./scripts/bench.sh cuckoo_filter_insert_throughput               # all six Table 2 configs
+./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2   # one cell
 ./scripts/bench.sh                              # -h: full flag + bench list
 ```
 
-All flags are optional — omitted geometry falls back to a small default config.
-There is intentionally **no full-matrix sweep script**: reproducing the whole
-paper dataset means looping `bench.sh` over the config matrix below (hours),
-which a reader rarely wants. Run the handful of points you care about instead.
+All flags are optional — for the PIR benches, omitted geometry falls back to a
+small default config; for the `segmented-cuckoo` benches, to the paper's Table 2
+matrix.
+
+### Reproduce the paper's Table 2
+
+`scripts/table2.sh` runs the four `cuckoo_filter_*` benches behind Table 2's
+columns (load factor + insert/lookup/delete throughput, SCF vs standard filter
+across all six configs). Any flags are forwarded to each bench:
+
+```bash
+./scripts/table2.sh                              # the full published table (~1-2 h)
+./scripts/table2.sh --arity 4                    # just the arity-4 rows
+./scripts/table2.sh --trials 3                   # faster, noisier
+```
+
+There is intentionally **no full-matrix sweep script for the PIR benches**:
+reproducing that dataset means looping `bench.sh` over the config matrix below
+(hours), which a reader rarely wants. Run the handful of points you care about
+instead.
 
 ### Quick smoke / correctness check
 
@@ -247,7 +268,7 @@ then defaults to `8` (safe everywhere, but below each backend's max):
 
 ```bash
 cargo bench -p ikpir-server --bench server_answer -- --backend simple --plaintext-bits 10
-cargo bench -p segmented-cuckoo --bench fpr
+cargo bench -p segmented-cuckoo --bench cuckoo_filter_false_positive_rate
 ```
 
 CSVs land under `results/<crate>/` (`results/ikpir-server/`,

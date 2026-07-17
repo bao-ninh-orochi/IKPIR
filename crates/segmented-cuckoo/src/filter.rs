@@ -2005,70 +2005,85 @@ mod tests {
         assert!(f.contain(b"fresh".as_ref()));
     }
 
-    // ─── Property tests (proptest) ───────────────────────────────────────────
+    // ─── Insert/delete bookkeeping over an item-bytes grid ───────────────────
     //
-    // Run for Standard 2-ary, Segmented 2-ary, and Standard 3-ary.
+    // The item hash diffuses its input before the filter sees an index or a
+    // fingerprint, so what varying the item bytes exercises is the insert/delete
+    // bookkeeping, not the byte patterns themselves. A fixed set of
+    // representative encodings pins that contract for each scheme and keeps any
+    // failure reproducible from the test name alone.
 
-    #[cfg(test)]
-    mod prop_tests {
-        use super::*;
-        use proptest::prelude::*;
+    /// Representative item encodings: minimal, all-zero, all-ones, a patterned
+    /// mid-width run, and a full 64-byte item.
+    fn item_bytes_grid() -> Vec<Vec<u8>> {
+        vec![
+            vec![0x00],
+            vec![0xFF],
+            vec![0u8; 16],
+            vec![0xFFu8; 16],
+            (0..32u8).map(|i| i.wrapping_mul(37)).collect(),
+            (0..64u8).collect(),
+        ]
+    }
 
-        proptest! {
-            /// For any random item bytes: insert then delete leaves the filter empty
-            /// and size returns to 0.
-            #[test]
-            fn prop_insert_delete_roundtrip_std2(item in proptest::collection::vec(any::<u8>(), 1..=64)) {
-                let mut f = CuckooFilter::<Standard2aryScheme>::new(64, 4, 12).unwrap();
-                f.insert(item.as_slice()).unwrap();
-                assert_eq!(f.num_items(), 1);
-                f.delete(item.as_slice()).unwrap();
-                assert_eq!(f.num_items(), 0);
-            }
+    /// Insert then delete returns a Standard 2-ary filter to empty, for every
+    /// item encoding in the grid.
+    #[test]
+    fn insert_delete_roundtrip_std2_over_item_grid() {
+        for item in item_bytes_grid() {
+            let mut f = CuckooFilter::<Standard2aryScheme>::new(64, 4, 12).unwrap();
+            f.insert(item.as_slice()).unwrap();
+            assert_eq!(f.num_items(), 1, "insert failed for item {item:?}");
+            f.delete(item.as_slice()).unwrap();
+            assert_eq!(f.num_items(), 0, "delete failed for item {item:?}");
+        }
+    }
 
-            /// For any random item bytes: insert then delete leaves the filter empty
-            /// and size returns to 0 (Segmented 2-ary).
-            #[test]
-            fn prop_insert_delete_roundtrip_seg2(item in proptest::collection::vec(any::<u8>(), 1..=64)) {
-                let mut f = CuckooFilter::<Segmented2aryScheme>::new(64, 4, 12).unwrap();
-                f.insert(item.as_slice()).unwrap();
-                assert_eq!(f.num_items(), 1);
-                f.delete(item.as_slice()).unwrap();
-                assert_eq!(f.num_items(), 0);
-            }
+    /// Same round-trip on a Segmented 2-ary filter — segmentation changes index
+    /// placement, not insert/delete bookkeeping.
+    #[test]
+    fn insert_delete_roundtrip_seg2_over_item_grid() {
+        for item in item_bytes_grid() {
+            let mut f = CuckooFilter::<Segmented2aryScheme>::new(64, 4, 12).unwrap();
+            f.insert(item.as_slice()).unwrap();
+            assert_eq!(f.num_items(), 1, "insert failed for item {item:?}");
+            f.delete(item.as_slice()).unwrap();
+            assert_eq!(f.num_items(), 0, "delete failed for item {item:?}");
+        }
+    }
 
-            /// For any random item bytes on a fresh Standard 3-ary filter:
-            /// delete returns Err(NotFound).
-            #[test]
-            fn prop_delete_without_insert_not_found_std3(item in proptest::collection::vec(any::<u8>(), 1..=64)) {
-                let mut f = CuckooFilter::<Standard3aryScheme>::new(81, 4, 12).unwrap();
-                assert!(matches!(
-                    f.delete(item.as_slice()),
-                    Err(CuckooError::NotFound)
-                ));
-            }
+    /// Deleting from a fresh Standard 3-ary filter reports `NotFound` for every
+    /// item encoding — the modulo index path has no false "present" answer on an
+    /// empty table.
+    #[test]
+    fn delete_without_insert_not_found_std3_over_item_grid() {
+        for item in item_bytes_grid() {
+            let mut f = CuckooFilter::<Standard3aryScheme>::new(81, 4, 12).unwrap();
+            assert!(
+                matches!(f.delete(item.as_slice()), Err(CuckooError::NotFound)),
+                "expected NotFound for item {item:?}",
+            );
+        }
+    }
 
-            /// Insert N distinct items (encoded as u64 little-endian), delete all N,
-            /// verify size = 0 (Standard 2-ary).
-            #[test]
-            fn prop_insert_n_delete_n_empty_std2(
-                keys in proptest::collection::vec(any::<u64>(), 1..=20)
-            ) {
-                let mut f = CuckooFilter::<Standard2aryScheme>::new(64, 4, 12).unwrap();
-                let mut inserted: Vec<u64> = Vec::new();
-                for k in &keys {
-                    if f.insert(k.to_le_bytes()).is_ok() {
-                        inserted.push(*k);
-                    }
-                }
-                for k in &inserted {
-                    f.delete(k.to_le_bytes()).unwrap_or_else(|e| {
-                        panic!("delete({k}) failed: {e}")
-                    });
-                }
-                assert_eq!(f.num_items(), 0);
+    /// Inserting N distinct keys then deleting all of them returns the filter to
+    /// empty, exercising the multi-item path (including any kicking) rather than
+    /// the single-item case above.
+    #[test]
+    fn insert_n_delete_n_empty_std2() {
+        let mut f = CuckooFilter::<Standard2aryScheme>::new(64, 4, 12).unwrap();
+        let mut inserted: Vec<u64> = Vec::new();
+        for k in (0u64..20).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) {
+            if f.insert(k.to_le_bytes()).is_ok() {
+                inserted.push(k);
             }
         }
+        assert!(!inserted.is_empty(), "no key was inserted");
+        for k in &inserted {
+            f.delete(k.to_le_bytes())
+                .unwrap_or_else(|e| panic!("delete({k}) failed: {e}"));
+        }
+        assert_eq!(f.num_items(), 0);
     }
 
     #[test]
