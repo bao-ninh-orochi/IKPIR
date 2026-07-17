@@ -1,8 +1,8 @@
 //! **Intent:** Head-to-head counterpart of `client_query` — measure
-//! client-side `build_query` throughput at a **fixed keyword count**
-//! (1 M / 1.5 M / 3 M / 4 M), for the fair comparison against ChalametPIR and
-//! Hao et al. 2025. See `headtohead_answer` for the motivation behind fixing
-//! `num_keys` instead of DB size.
+//! client-side `build_query` throughput at a **fixed keyword count**, for the
+//! fair comparison against ChalametPIR and Hao et al. 2025. See
+//! `headtohead_answer` for the motivation behind fixing `num_keys` instead of
+//! DB size, and for the two key-count regimes `scripts/table3.sh` sweeps.
 //!
 //! **Method:** Identical warm-bc pipeline as `client_query` except
 //! `populate_exact_n_keys(target_n = num_keys)` replaces `populate_until_full`,
@@ -54,7 +54,8 @@ struct Cli {
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
     bucket_size: u32,
-    #[arg(long, default_value_t = 256)]
+    /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
+    #[arg(long, default_value_t = 2048)]
     value_bits: u32,
     #[arg(long, default_value_t = 32)]
     fingerprint_bits: u32,

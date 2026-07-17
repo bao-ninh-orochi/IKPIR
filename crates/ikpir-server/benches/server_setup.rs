@@ -4,7 +4,7 @@
 //! **Method:** Two interchangeable timing paths producing the *same*
 //! single-threaded, non-SIMD setup number (the paper's reported regime):
 //!
-//! - **Full (default):** populate a store to `TableFull`, wrap it in
+//! - **Full (default):** populate a store to `--load-factor`, wrap it in
 //!   `IkpirServer::new`, and time the wall-clock cost of that call — the
 //!   per-segment hint precompute `H_j = A_jᵀ·D_j` run sequentially over all
 //!   `arity` segments. This is the ground truth.
@@ -25,8 +25,10 @@
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
 //! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
-//! `--lwe-dim` (defaults to backend recommendation), `--trials`, `--warmup`,
-//! `--estimate` (time one segment × arity instead of the full
+//! `--lwe-dim` (defaults to backend recommendation), `--load-factor`
+//! (default 0.90 — matches `server_mutation`, the bench this one is the
+//! static baseline for; setup time itself is fill-independent), `--trials`,
+//! `--warmup`, `--estimate` (time one segment × arity instead of the full
 //! `IkpirServer::new`; default off = full ground truth).
 //!
 //! **Output:** `results/ikpir_server_setup.csv`
@@ -80,7 +82,8 @@ struct Cli {
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
     bucket_size: u32,
-    #[arg(long, default_value_t = 256)]
+    /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
+    #[arg(long, default_value_t = 2048)]
     value_bits: u32,
     #[arg(long, default_value_t = 32)]
     fingerprint_bits: u32,
@@ -89,9 +92,29 @@ struct Cli {
     /// LWE dimension. Defaults to 1566 (Frodo) or 1275 (Simple) when omitted.
     #[arg(long)]
     lwe_dim: Option<u32>,
-    #[arg(long, default_value_t = 0)]
-    warmup: u32,
+    /// Fill to seed the store to before timing setup.
+    ///
+    /// Setup time does not depend on it — both backends' `compute_hint`
+    /// multiply every cell unconditionally, so only the matrix shape matters —
+    /// but the paper reports Setup as the rebuild a static scheme pays on every
+    /// mutation, against `server_mutation` on the same store. Sharing that
+    /// bench's fill keeps the two tables describing one store, and the CSV's
+    /// `load_factor` column honest about which.
+    #[arg(long, default_value_t = 0.90)]
+    load_factor: f64,
+    /// Untimed warmup runs before measurement. One by default: the first
+    /// `IkpirServer::new` on a cold process pays page-fault and allocator
+    /// warmup that later runs do not, so discarding it tightens the mean.
     #[arg(long, default_value_t = 1)]
+    warmup: u32,
+    /// Timed runs; the CSV reports mean/min/max/stddev over them. Three by
+    /// default so the error bar is real rather than a single-sample `±0.000`.
+    /// Setup is a deterministic linear pass with low variance, so three is
+    /// plenty — raise it only if a machine is noisy. Each run is a full
+    /// `Θ(nNw)` hint rebuild (seconds to minutes at paper scale), so this
+    /// trades wall time for the error bar; pass `--estimate` to cut each run
+    /// to one segment × arity.
+    #[arg(long, default_value_t = 3)]
     trials: u32,
     /// Estimate the full single-threaded setup time by timing the per-segment
     /// hint precompute (`B::server_setup`) over ONE full segment and
@@ -130,7 +153,8 @@ fn run_one<S, B>(
     // Both paths build the full store: the full path feeds it to
     // `IkpirServer::new`; the estimate path slices segment 0's real `D` out of
     // it. Build + snapshot once, then drop the store before timing.
-    let (seed_store, n_inserted) = helpers::populate_until_full::<S>(
+    let (seed_store, n_inserted) = helpers::populate_to_load::<S>(
+        cli.load_factor,
         num_buckets,
         cli.bucket_size,
         cli.fingerprint_bits,
@@ -275,6 +299,11 @@ fn run_one<S, B>(
             name: "lwe_dim",
             value: lwe_dim_eff.to_string(),
             is_default: cli.lwe_dim.is_none(),
+        },
+        helpers::Knob {
+            name: "load_factor",
+            value: format!("{:.2}", cli.load_factor),
+            is_default: matches.value_source("load_factor") != Some(ValueSource::CommandLine),
         },
         helpers::Knob {
             name: "setup_mode",

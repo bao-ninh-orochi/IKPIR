@@ -19,7 +19,7 @@ setup bundle.
 
 > Production code in this crate depends only on `ikpir-common` and
 > `segmented-cuckoo`. `ikpir-server` is carried as a `[dev-dependency]`
-> for `tests/client_e2e.rs`, the six benches, and the quick-start doctest.
+> for `tests/client_e2e.rs`, the five benches, and the quick-start doctest.
 
 ## 3. Key design decisions (the WHY)
 
@@ -152,8 +152,11 @@ in isolation, without warm-bc queue-maintenance overhead mixed in.
   crate, auto-derives `--plaintext-bits` / `--lwe-dim`, and exports
   `IKPIR_RESULTS_DIR=results/ikpir-client` before `cargo bench`. One
   invocation = one CSV row (append-mode `csv_writer`, honoring
-  `IKPIR_RESULTS_DIR`; default `results/`). There is no full-matrix
-  sweep script; `scripts/smoke.sh` runs every PIR bench tiny.
+  `IKPIR_RESULTS_DIR`; default `results/`). Its geometry defaults are dev
+  scale, not the paper's: the paper matrix lives in `scripts/lib.sh`
+  (`PAPER_*`) and is swept by `scripts/table3.sh` (online, via
+  `headtohead_{query,decode}`) and `table4.sh` (mutation, via
+  `client_mutation`). `scripts/smoke.sh` runs every PIR bench tiny.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — a common core is mirrored in `ikpir-server/benches/helpers.rs`,
   but this copy additionally carries `verify_decode`, which round-trips

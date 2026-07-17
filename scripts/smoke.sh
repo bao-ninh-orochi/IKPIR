@@ -27,8 +27,10 @@ rm -rf "$IKPIR_RESULTS_BASE"
 
 IFS=',' read -ra BACKENDS <<< "${IKPIR_SMOKE_BACKENDS:-frodo,simple}"
 
-# Tiny geometry: capacity = 256 × 4 = 1024 slots — sub-second per bench.
-TINY=(--arity 2 --num-buckets 256 --bucket-size 4 --value-bits 256)
+# Tiny geometry: capacity = 256 × 4 = 1024 slots — sub-second per bench. The
+# value width is the paper's narrower one, so the exercised cells_per_slot is
+# realistic; at 1024 slots that is still well under a megabyte.
+TINY=(--arity 2 --num-buckets 256 --bucket-size 4 --value-bits 2048)
 
 SMOKE_BENCHES=(server_setup server_answer server_mutation
                client_query client_decode client_mutation

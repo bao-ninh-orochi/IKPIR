@@ -177,7 +177,7 @@ Four focused benches covering classical and incremental server criteria for the 
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
-| `server_setup` | `TableFull` | setup wall-clock (default trials=1, warmup=0): full `IkpirServer::new`, or `--estimate` = time one segment's `B::server_setup` × `arity`; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
+| `server_setup` | `--load-factor` (0.90) | setup wall-clock (default trials=3, warmup=1): full `IkpirServer::new`, or `--estimate` = time one segment's `B::server_setup` × `arity`; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR matvec answer rate (queries/sec, criterion); query_bytes, response_bytes | `ikpir_server_answer.csv` |
 | `server_mutation` | `--load-factor` (0.90) | Per-(kind, patch-mode) throughput (insert/update/delete × entry/row), wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
 | `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `server_answer` + `num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
@@ -207,8 +207,19 @@ Four focused benches covering classical and incremental server criteria for the 
 - **Runner.** `scripts/bench.sh <bench> [flags]` maps the bench to its
   crate, auto-derives `--plaintext-bits` / `--lwe-dim`, and exports
   `IKPIR_RESULTS_DIR=results/ikpir-server` before `cargo bench`. Pass
-  `--backend simple` to switch backends. There is no full-matrix sweep
-  script; `scripts/smoke.sh` runs every PIR bench tiny for correctness.
+  `--backend simple` to switch backends. Its geometry defaults are dev
+  scale, not the paper's: the paper matrix lives in `scripts/lib.sh`
+  (`PAPER_*`) and is swept by `scripts/table3.sh` (online, via
+  `headtohead_answer`), `table4.sh` (mutation, via `server_mutation`)
+  and `table5.sh` (setup, via `server_setup`). `scripts/smoke.sh` runs
+  every PIR bench tiny for correctness.
+- **Fill.** `server_setup` and `server_mutation` both seed to
+  `--load-factor` (default 0.90) so the setup table and the mutation
+  table describe one store — setup is the static rebuild that mutation
+  replaces. Setup time itself is fill-independent (`compute_hint`
+  multiplies unconditionally); the fill only makes the CSV's
+  `load_factor` column honest. `server_answer` still populates to
+  `TableFull`, and `headtohead_answer` to an exact `--num-keys`.
 - One invocation = one CSV row (append-mode writer via
   `csv_writer`, honoring `IKPIR_RESULTS_DIR`; default `results/`).
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across

@@ -16,7 +16,7 @@
 //! the paper's tables; see `kv_store_insert_throughput` for why this bench sizes
 //! from `--target-items` rather than Table 2's ~10^6 buckets.
 //!
-//! **Arguments (CLI):** all optional; with none, runs the paper's six configs.
+//! **Arguments (CLI):** all optional; with none, runs the paper's five configs.
 //! `--arity`, `--bucket-size`, `--fingerprint-bits`, `--max-kicks`, `--warmup`,
 //! `--trials` (see `benches/configs.rs`), plus `--value-bits` (comma-separated,
 //! default `8,64,256,1024`), `--plaintext-bits` (default 8), `--target-items`
