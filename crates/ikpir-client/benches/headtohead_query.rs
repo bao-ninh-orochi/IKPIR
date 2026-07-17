@@ -19,7 +19,7 @@
 
 mod helpers;
 
-use criterion::{Criterion, Throughput};
+use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
@@ -228,7 +228,7 @@ fn run_one<S, B>(
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut idx = 0usize;
     {
-        let mut c = Criterion::default();
+        let mut c = helpers::configured_criterion();
         let mut group = c.benchmark_group("headtohead_query");
         group.throughput(Throughput::Elements(1));
         group.bench_function("headtohead_query", |b| {
