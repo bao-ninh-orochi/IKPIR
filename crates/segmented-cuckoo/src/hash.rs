@@ -244,30 +244,87 @@ pub fn hash_and_i1(item: &[u8], fingerprint_bits: u32, range: u32) -> (u64, u32,
 }
 
 // ── xor3 and xor4 implementation ────────────────────────────────────────────────────────
+
+/// Base-3 digits per [`XOR3_T81`] chunk. `3^4 = 81` fits a `u8`, keeping the
+/// table at `81 * 81` = 6.4 KiB — L1-resident on every target we build for.
+const XOR3_CHUNK_DIGITS: u32 = 4;
+
+/// `XOR3_T81[x][y]` = base-3 digit-wise sum mod 3 of `x` and `y`, each read as a
+/// [`XOR3_CHUNK_DIGITS`]-digit base-3 number.
+///
+/// Built at compile time by the same digit loop [`xor3`] used to run at
+/// runtime, so the table *is* the reference semantics, evaluated once.
+const fn build_xor3_t81() -> [[u8; 81]; 81] {
+    let mut t = [[0u8; 81]; 81];
+    let mut x = 0usize;
+    while x < 81 {
+        let mut y = 0usize;
+        while y < 81 {
+            let mut r = 0u32;
+            let mut place = 1u32;
+            let mut d = 0;
+            while d < XOR3_CHUNK_DIGITS {
+                r += ((x as u32 / place) % 3 + (y as u32 / place) % 3) % 3 * place;
+                place *= 3;
+                d += 1;
+            }
+            t[x][y] = r as u8;
+            y += 1;
+        }
+        x += 1;
+    }
+    t
+}
+
+static XOR3_T81: [[u8; 81]; 81] = build_xor3_t81();
+
 /// Follow the academic paper "D-Ary Cuckoo Filter: A Space Efficient Data Structure for Set Membership Lookup"
 /// at https://ieeexplore.ieee.org/abstract/document/8368364
 ///
 /// Base-3 digit-wise addition mod 3. Property: xor3(xor3(xor3(a,b),b),b) == a.
+///
+/// That cycling property is what lets [`all_indices_standard_3ary`] rebuild all
+/// three candidate buckets from whichever one it is standing on, so no per-slot
+/// position needs storing.
+///
+/// # Why a table
+///
+/// Digit `k` of the result depends only on digit `k` of each input — mod-3
+/// addition carries nothing. The digits are therefore independent, and the
+/// obvious `while aa != 0 { aa /= 3 }` digit loop is the wrong shape: each
+/// iteration's divide feeds the next, so a `3^13` table serialises ~13 divides
+/// (~26 ns) while the core sits idle. Chunking into [`XOR3_CHUNK_DIGITS`]-digit
+/// groups turns that chain into five *independent* lookups the core issues at
+/// once (~3.7 ns): every divisor below is a literal, so each becomes a
+/// multiply-shift rather than a division.
+///
+/// # Digit range
+///
+/// Digits `0..=19` only — digit 20 is deliberately **not**
+/// processed, matching the digit loop this replaced (which stopped once
+/// `place > 1_000_000_000`, and `3^19 = 1_162_261_467` trips that). Callers pass
+/// indices `< num_buckets <= 3^20`, whose digit 20 is always 0, so the cutoff is
+/// unobservable through the filter; it is preserved so the two agree on every
+/// `u32`, including the `>= 3^20` values only a direct call can produce. The
+/// trailing `% 81` on each chunk is what discards it.
+///
+/// # Returns
+///
+/// The digit-wise mod-3 sum, at most `3^20 - 1 = 3_486_784_400` — no overflow.
+///
+/// # Performance
+///
+/// O(1): five independent table lookups, no division, no branches.
 #[inline]
 pub const fn xor3(a: u32, b: u32) -> u32 {
-    let mut result = 0u32;
-    let mut aa = a;
-    let mut bb = b;
-    let mut place = 1u32;
-    loop {
-        result += ((aa % 3) + (bb % 3)) % 3 * place;
-        aa /= 3;
-        bb /= 3;
-        if aa == 0 && bb == 0 {
-            break;
-        }
-        // Prevent overflow: max u32 needs at most 21 base-3 digits
-        if place > 1_000_000_000 {
-            break;
-        }
-        place *= 3;
-    }
-    result
+    // Chunk j covers digits 4j..=4j+3; `/ 3^(4j)` shifts it down, `% 81` keeps 4 digits.
+    let c0 = XOR3_T81[(a % 81) as usize][(b % 81) as usize] as u32;
+    let c1 = XOR3_T81[((a / 81) % 81) as usize][((b / 81) % 81) as usize] as u32;
+    let c2 = XOR3_T81[((a / 6561) % 81) as usize][((b / 6561) % 81) as usize] as u32;
+    let c3 = XOR3_T81[((a / 531441) % 81) as usize][((b / 531441) % 81) as usize] as u32;
+    let c4 = XOR3_T81[((a / 43046721) % 81) as usize][((b / 43046721) % 81) as usize] as u32;
+    // Reassemble at each chunk's base-3 weight 3^(4j).
+    c0 + c1 * 81 + c2 * 6561 + c3 * 531441 + c4 * 43046721
 }
 
 /// Base-4 digit-wise addition mod 4 using bitwise trick (O(1)).
@@ -1141,5 +1198,122 @@ mod tests {
         assert_eq!(extract_fingerprint(h, 8), 0xFF);
         assert_eq!(extract_fingerprint(h, 12), 0xFFF);
         assert_eq!(extract_fingerprint(h, 32), 0xFFFF_FFFF);
+    }
+
+    // ── xor3 ──
+    //
+    // `xor3` is a chunked-table rewrite of a base-3 digit loop. The loop is kept
+    // here as the oracle: every test below asserts the table agrees with it, so
+    // the two can never silently diverge. Note the `place > 1_000_000_000` cutoff
+    // — the oracle stops after digit 19, and `xor3` must match that on every u32
+    // (see `xor3`'s `# Digit range`).
+
+    /// The original digit loop, verbatim. Reference semantics for `xor3`.
+    fn xor3_reference(a: u32, b: u32) -> u32 {
+        let mut result = 0u32;
+        let mut aa = a;
+        let mut bb = b;
+        let mut place = 1u32;
+        loop {
+            result += ((aa % 3) + (bb % 3)) % 3 * place;
+            aa /= 3;
+            bb /= 3;
+            if aa == 0 && bb == 0 {
+                break;
+            }
+            if place > 1_000_000_000 {
+                break;
+            }
+            place *= 3;
+        }
+        result
+    }
+
+    /// Deterministic xorshift64 — a fixed seed keeps a failure reproducible.
+    fn xorshift(state: &mut u64) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state as u32
+    }
+
+    #[test]
+    fn xor3_matches_reference_exhaustively_over_low_digits() {
+        // Every (digit_a, digit_b) pair in digits 0..=5, which spans the first
+        // chunk boundary (digits 0..=3 | 4..=7) where a chunked rewrite would break.
+        let n = 3u32.pow(6);
+        for a in 0..n {
+            for b in 0..n {
+                assert_eq!(xor3(a, b), xor3_reference(a, b), "a={a} b={b}");
+            }
+        }
+    }
+
+    #[test]
+    fn xor3_matches_reference_over_standard_3ary_range() {
+        // Every index the standard 3-ary filter can hold, against the `h` values
+        // `fingerprint_hash_mod` actually produces for it.
+        let num_buckets = 3u32.pow(13);
+        for a in 0..num_buckets {
+            let h = fingerprint_hash_mod(a | 1, num_buckets);
+            assert_eq!(xor3(a, h), xor3_reference(a, h), "a={a} h={h}");
+        }
+    }
+
+    #[test]
+    fn xor3_matches_reference_over_full_u32_range() {
+        // Reaches the >= 3^20 inputs where digit 20 exists and both must drop it.
+        let mut state = 0x243F_6A88_85A3_08D3;
+        for _ in 0..200_000 {
+            let (a, b) = (xorshift(&mut state), xorshift(&mut state));
+            assert_eq!(xor3(a, b), xor3_reference(a, b), "a={a} b={b}");
+        }
+    }
+
+    #[test]
+    fn xor3_matches_reference_at_boundaries() {
+        let corners = [
+            0,
+            1,
+            2,
+            80,
+            81,
+            242,
+            243,
+            3u32.pow(13) - 1,
+            3u32.pow(13),
+            3u32.pow(19),
+            3u32.pow(20) - 1,
+            3u32.pow(20),
+            u32::MAX - 1,
+            u32::MAX,
+        ];
+        for &a in &corners {
+            for &b in &corners {
+                assert_eq!(xor3(a, b), xor3_reference(a, b), "a={a} b={b}");
+            }
+        }
+    }
+
+    #[test]
+    fn xor3_result_never_exceeds_3_pow_20() {
+        // Digits 0..=19 each contribute at most 2 * 3^k, so the sum is 3^20 - 1.
+        // Guards the `c0 + c1 * 81 + ...` reassembly against u32 overflow.
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..100_000 {
+            let (a, b) = (xorshift(&mut state), xorshift(&mut state));
+            assert!(xor3(a, b) < 3u32.pow(20), "a={a} b={b}");
+        }
+    }
+
+    #[test]
+    fn xor3_cycles_after_three_applications() {
+        // The property the d-ary construction rests on, and the reason
+        // `all_indices_standard_3ary` can rebuild the candidate set from any of them.
+        let num_buckets = 3u32.pow(13);
+        for a in (0..num_buckets).step_by(37) {
+            let h = fingerprint_hash_mod(a | 1, num_buckets);
+            assert_eq!(xor3(xor3(xor3(a, h), h), h), a, "a={a} h={h}");
+        }
     }
 }
