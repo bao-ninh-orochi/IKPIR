@@ -539,6 +539,31 @@ pub fn verify_decode<B, S>(
 
 // ── Criterion throughput helper ──────────────────────────────────────────────
 
+// Shared Table 3 measurement contract. RisePIR, ChalametPIR (`../chalamet`),
+// and KPIR^index (`../KPIR-index`) all measure the online query/answer/decode
+// benches on one criterion contract so the table's three rows are directly
+// comparable: 100 samples, 3 s warm-up, 5 s measurement. These are criterion's
+// own defaults, pinned explicitly here so a criterion version bump can't
+// silently drift them and so the contract is visible in-tree rather than
+// implied by a bare `Criterion::default()`.
+#[allow(dead_code)]
+pub const CRIT_SAMPLE_SIZE: usize = 100;
+#[allow(dead_code)]
+pub const CRIT_WARMUP_SECS: u64 = 3;
+#[allow(dead_code)]
+pub const CRIT_MEASUREMENT_SECS: u64 = 5;
+
+/// A `Criterion` pinned to the shared Table 3 measurement contract
+/// (`CRIT_SAMPLE_SIZE` samples, `CRIT_WARMUP_SECS` warm-up, `CRIT_MEASUREMENT_SECS`
+/// measurement). Use in place of `Criterion::default()` in every online bench.
+#[allow(dead_code)]
+pub fn configured_criterion() -> Criterion {
+    Criterion::default()
+        .sample_size(CRIT_SAMPLE_SIZE)
+        .warm_up_time(std::time::Duration::from_secs(CRIT_WARMUP_SECS))
+        .measurement_time(std::time::Duration::from_secs(CRIT_MEASUREMENT_SECS))
+}
+
 #[allow(dead_code)]
 pub struct CriterionThroughputStats {
     pub mean_ops_per_s: f64,
@@ -568,7 +593,7 @@ where
 {
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     {
-        let mut c = Criterion::default();
+        let mut c = configured_criterion();
         let mut group = c.benchmark_group(bench_label);
         group.throughput(Throughput::Elements(elements_per_iter));
         group.bench_function(bench_label, |b| {
@@ -627,7 +652,7 @@ where
 {
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     {
-        let mut c = Criterion::default();
+        let mut c = configured_criterion();
         let mut group = c.benchmark_group(bench_label);
         group.throughput(Throughput::Elements(elements_per_iter));
         group.bench_function(bench_label, |b| {
