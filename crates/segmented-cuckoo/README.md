@@ -18,7 +18,7 @@ The combination yields **6 filter variants** (Standard/Segmented × 2/3/4-ary),
 all sharing identical insert/lookup/delete logic and differing only in index
 computation. A segmented filter additionally gives every item a *deterministic,
 fixed* set of lookup positions — the property IKPIR relies on to keep keyword
-lookups to a single Index-PIR query.
+lookups to a single Index-PIR query per segment.
 
 > **Notation.** This README uses `k` for the arity, following the k-ary
 > cuckoo-hashing literature it compares against; the accompanying CANS 2026
@@ -37,17 +37,24 @@ lookups to a single Index-PIR query.
   dedicated segment; chain position derives from the segment index, again with
   no per-slot position storage.
 - **Empirical comparison.** Benchmarks all 6 variants on load factor,
-  insert/lookup/delete throughput, false-positive rate, and degree distribution,
-  against theoretical k-ary cuckoo-hashing thresholds.
+  insert/lookup/delete throughput, and false-positive rate, against theoretical
+  k-ary cuckoo-hashing thresholds.
 
 ## Key findings
 
+Measured across the six configurations RisePIR uses ([Results](#results), the
+paper's Table 2).
+
 | Finding | Detail |
 |---|---|
-| k-ary works as expected | 3/4-ary standard filters reach load factors 0.15–2.10% below theoretical thresholds, consistent with the partial-key penalty |
-| Segmented matches or beats standard | For b ≥ 2, segmented is +0.04% to +0.23% higher load factor than standard at the same arity |
-| Standard 3-ary throughput limited by modulo | Standard 3-ary (n = 3^k) needs modulo-based `fingerprint_hash_mod`, slower than the bitmask path available when n is a power of 2 |
-| Load factor decreases with table size | At fixed `max_kicks = 500`, larger tables hit lower load factor (the kick budget is proportionally smaller) |
+| Segmentation costs nothing in space | The SCF reaches a *higher* load factor than the standard filter in all six configurations, by 0.02–0.07 pp, peaking at 99.86% |
+| Close to the theoretical limit | Every configuration lands within 0.7 pp of the k-partite information-theoretic threshold |
+| Segmentation wins big at arity 3 | 2.2–3.3× faster on insert, lookup, and delete — the standard filter needs a modulo (n = 3^k), the SCF a bitmask (n = 3·2^m) |
+| Comparable at arities 2 and 4 | Both layouts fall on powers of two; they differ by at most ~13% with neither consistently ahead, the exception being lookup at (2, 4) where standard is ~1.5× faster |
+
+The confinement that keyword PIR depends on — each candidate restricted to a
+predictable segment — therefore imposes no measurable cost in storage
+efficiency, and at arity 3 it is a substantial speedup.
 
 ---
 
@@ -146,6 +153,8 @@ i4 = xor4(i3, fingerprint_hash(fp))
 ```
 
 Standard 3-ary uses `(fp * 0x5bd1e995) % n` because n = 3^k is not a power of 2.
+This modulo is what the arity-3 throughput gap in the results below comes down
+to.
 
 **No position storage.** The same offset is applied at each step, so the cycling
 property reconstructs all k candidates from any one of them — no per-slot chain
@@ -201,37 +210,72 @@ via the xord cycling property.)
 
 ## Experimental setup
 
-Defaults: `fingerprint_bits = 12` (unless swept), `max_kicks = 500`, xxHash3,
-bucket sizes b ∈ {1,2,3,4}. Table sizes: standard 2/4-ary and segmented 2/4-ary
-at n ∈ {2^14..2^20}; standard 3-ary at n ∈ {3^8..3^11}; segmented 3-ary at
-n ∈ {3·2^12..3·2^18}.
+Defaults, and the reasoning behind them, live in one place —
+[`benches/configs.rs`](benches/configs.rs) — which every bench reads:
+
+| Parameter | Default | Why |
+|---|---|---|
+| `fingerprint_bits` | **32** | Drives FPR to `k·b / 2^32`, so a false positive never perturbs a load-factor or throughput measurement and the numbers isolate the indexing scheme |
+| `max_kicks` | **2500** | High enough that measured load factor reflects the scheme rather than the kick budget; a small budget caps it well below the true threshold at ~10^6 buckets |
+| `num_buckets` | **~10^6** | Per arity, below |
+| trials | 10 (20 for load factor) | Load factor reports one headline number per config, so it buys a tighter error bar |
+
+**Config matrix.** The benches default to the six `(arity, bucket_size)` pairs
+RisePIR uses. The two schemes are compared at equal table size, as close as their
+divisibility constraints allow — at arities 2 and 4 both ladders hit 2^20
+exactly; at arity 3 one is `3·2^m` and the other `3^k`, so they cannot coincide
+and land 1.4% apart:
+
+| Arity | b | Segmented n | Standard n |
+|:---:|:---:|---:|---:|
+| 2 | 4 | 1 048 576 (2^20) | 1 048 576 (2^20) |
+| 3 | 2, 3 | 1 572 864 (3·2^19) | 1 594 323 (3^13) |
+| 4 | 1, 2, 3 | 1 048 576 (2^20) | 1 048 576 (4^10) |
+
+Note `n` depends only on the arity, not on `b` — the six rows carry three
+distinct pairs between them.
 
 | Bench | Measures | CSV (under `results/segmented-cuckoo/`) |
 |---|---|---|
-| `load_factor` | Max load factor, sweeping `max_kicks` ∈ {500..5000} | `load_factor.csv` |
-| `insert_throughput` | Insert MOps/s while filling | `insert_throughput.csv` |
-| `lookup_throughput` | Lookup MOps/s at 5 hit rates | `lookup_throughput.csv` |
-| `delete_throughput` | Delete MOps/s on a full filter | `delete_throughput.csv` |
-| `fpr` | FPR vs `fingerprint_bits` | `fpr/*.csv` |
-| `degree_distribution` | Per-bucket degree at saturation | `degree_*.csv` |
+| `cuckoo_filter_load_factor` | Max load factor | `cuckoo_filter_load_factor.csv` |
+| `cuckoo_filter_insert_throughput` | Insert MOps/s while filling | `cuckoo_filter_insert_throughput.csv` |
+| `cuckoo_filter_lookup_throughput` | Lookup MOps/s at a given hit rate | `cuckoo_filter_lookup_throughput.csv` |
+| `cuckoo_filter_delete_throughput` | Delete MOps/s on a full filter | `cuckoo_filter_delete_throughput.csv` |
+| `cuckoo_filter_false_positive_rate` | FPR vs `fingerprint_bits` | `cuckoo_filter_false_positive_rate/*.csv` |
 | `kv_store_{insert,lookup,delete}_throughput` | KV-store MOps/s (segmented only) | `kv_store_*.csv` |
 
-The first six are the comparison study below; the `kv_store_*` benches measure
-the IKPIR primitive layer (segmented `(fingerprint, value)` slots).
+The first four produce the [Results](#results) table below. The `kv_store_*`
+benches measure the IKPIR primitive layer (segmented `(fingerprint, value)`
+slots) and are not part of that comparison: a KV slot carries `fp ‖ value`, so
+they size from `--target-items` (default 65536) rather than ~10^6 buckets, which
+at `value_bits = 1024` would run to gigabytes.
 
 ### Running benchmarks
 
-Each bench runs its own hardcoded config matrix (no CLI flags) and appends CSV
-under `results/segmented-cuckoo/`. Run one through the workspace runner
-[`../../scripts/bench.sh`](../../scripts/bench.sh), which routes the output:
-
 ```bash
-./scripts/bench.sh load_factor                # one bench
-./scripts/bench.sh fpr
+# Reproduce the paper's Table 2 — the four benches, all six configs. (~1-2 h)
+./scripts/table2.sh
 
-# or directly — writes to the crate-local results/ unless IKPIR_RESULTS_DIR is set:
-cargo bench -p segmented-cuckoo --bench load_factor
+# Narrow it: any flags are forwarded to every bench.
+./scripts/table2.sh --arity 4                  # the three arity-4 rows
+./scripts/table2.sh --trials 3                 # faster, noisier
+
+# One bench, via the workspace runner (routes the CSV to results/segmented-cuckoo/).
+./scripts/bench.sh cuckoo_filter_insert_throughput                  # all six configs
+./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2
+./scripts/bench.sh cuckoo_filter_false_positive_rate --arity 2 --bucket-size 4
+./scripts/bench.sh kv_store_lookup_throughput --value-bits 8,256
+
+# Directly — writes to the crate-local results/ unless IKPIR_RESULTS_DIR is set.
+cargo bench -p segmented-cuckoo --bench cuckoo_filter_load_factor
 ```
+
+Every flag is optional; passing none runs the paper's matrix at the paper's
+tunables. `--arity` / `--bucket-size` narrow to the matching rows, or synthesize
+a config outside the matrix if none match. Common overrides: `--num-buckets`,
+`--fingerprint-bits`, `--max-kicks`, `--warmup`, `--trials`; plus `--hit-rate`
+(lookup), `--num-queries` (false-positive rate), and `--value-bits` /
+`--plaintext-bits` / `--target-items` (KV store).
 
 The filter / KV-store properties also have fast unit-test coverage:
 `cargo test -p segmented-cuckoo`.
@@ -240,178 +284,85 @@ The filter / KV-store properties also have fast unit-test coverage:
 
 ## Results
 
+Reproduce with `./scripts/table2.sh`. This is Table 2 of the CANS 2026 paper,
+measured on an Apple M1 MacBook Pro with 16 GiB of memory, 32-bit fingerprint,
+each filter filled to capacity. **Theory** is the k-partite information-theoretic
+threshold, from Walzer's tabulation of Dietzfelbinger et al. 2010 and Sanders &
+Walzer 2022. Bold marks the better filter on each metric.
+
+| Arity | b | Scheme | n | Load factor (%) | Theory (%) | Insert (Mops) | Lookup (Mops) | Delete (Mops) |
+|:---:|:---:|---|---:|---:|---:|---:|---:|---:|
+| 2 | 4 | Segmented | 1 048 576 | **97.40** | 98.04 | **9.04** | 24.91 | **34.55** |
+|   |   | Standard  | 1 048 576 | 97.33 |  | 8.46 | **36.64** | 34.35 |
+| 3 | 2 | Segmented | 1 572 864 | **98.32** | 98.82 | **9.52** | **48.07** | **37.86** |
+|   |   | Standard  | 1 594 323 | 98.29 |  | 3.24 | 14.56 | 13.03 |
+| 3 | 3 | Segmented | 1 572 864 | **99.43** | 99.73 | **8.72** | **28.23** | **28.50** |
+|   |   | Standard  | 1 594 323 | 99.39 |  | 4.02 | 10.33 | 10.38 |
+| 4 | 1 | Segmented | 1 048 576 | **97.12** | 97.68 | 8.86 | **64.12** | **46.60** |
+|   |   | Standard  | 1 048 576 | 97.06 |  | **9.38** | 60.93 | 45.58 |
+| 4 | 2 | Segmented | 1 048 576 | **99.59** | 99.82 | 12.09 | **48.61** | 37.04 |
+|   |   | Standard  | 1 048 576 | 99.55 |  | **12.89** | 45.99 | **37.71** |
+| 4 | 3 | Segmented | 1 048 576 | **99.86** | 99.98 | 13.61 | 25.59 | 31.30 |
+|   |   | Standard  | 1 048 576 | 99.84 |  | **14.42** | **29.25** | **31.73** |
+
 ### Load factor
 
-Mean load factor over all tested table sizes, 20 trials per config. **Threshold**
-is the theoretical limit for k-ary cuckoo hashing with truly random hashes
-(Sanders & Walzer 2022 / Dietzfelbinger et al. 2010).
+The SCF attains a slightly higher load factor in **all six** configurations
+(+0.02 to +0.07 pp) and stays within 0.7 pp of the k-partite threshold, peaking
+at 99.86%. Segmentation removes placement freedom the standard filter has — each
+candidate is pinned to its own segment — yet costs nothing in storage
+efficiency. Higher arity and larger `b` both help sharply: (4, 3) reaches 99.86%,
+within 0.12 pp of its threshold.
 
-| Arity | b | Threshold | Standard | Segmented | Seg. vs Std | Std vs Thresh. |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 2 | 1 | ~50.0% | 51.76% | 48.71% | −3.05%\* | +1.76% |
-| 2 | 2 | ~89.0% | 87.25% | 87.38% | **+0.13%** | −1.75% |
-| 2 | 3 | ~95.0% | 93.63% | 93.86% | **+0.23%** | −1.37% |
-| 2 | 4 | ~98.0% | 96.20% | 96.41% | **+0.21%** | −1.80% |
-| 3 | 1 | ~91.8% | 89.70% | 89.68% | −0.01% | −2.10% |
-| 3 | 2 | ~97.7% | 97.47% | 97.64% | **+0.17%** | −0.23% |
-| 3 | 3 | ~99.2% | 98.86% | 98.96% | **+0.09%** | −0.34% |
-| 3 | 4 | ~99.7% | 99.31% | 99.40% | **+0.09%** | −0.39% |
-| 4 | 1 | ~97.6% | 96.13% | 96.12% | −0.01% | −1.47% |
-| 4 | 2 | ~99.3% | 99.07% | 99.18% | **+0.11%** | −0.23% |
-| 4 | 3 | ~99.7% | 99.55% | 99.61% | **+0.06%** | −0.15% |
-| 4 | 4 | ~99.9% | 99.71% | 99.75% | **+0.04%** | −0.19% |
+The residual gap to threshold is the **partial-key penalty**: the xord offset
+takes at most `2^f` (or `3^f`) distinct values rather than ranging uniformly over
+`n`, so the hashes are not truly random. This is the same gap Fan et al. (2014)
+documented for 2-ary; it extends to 3/4-ary with xor3/xor4.
 
-\* The 2-ary b=1 case is anomalous (see Discussion): standard slightly *exceeds*
-the threshold, segmented falls below it.
+### Throughput
 
-- For **b ≥ 2 across all arities**, segmented equals or slightly beats standard.
-- Standard 2-ary b=4 hits 96.2%, consistent with Fan et al. (2014)'s ~95.5% (our
-  larger kick budget explains the gap).
-- Higher arity helps sharply: 4-ary b=4 reaches 99.71%, within 0.19% of maximum.
-- The 0.15–2.10% gap to threshold is the partial-key penalty: the xord offset has
-  only `2^f` (or `3^f`) possible values, not `n`.
+The comparison splits by arity.
 
-### Insert throughput (MOps/s)
+**Arity 3 — the SCF is 2.2–3.3× faster** on all three operations. This is a table-
+size effect, not a segmentation effect: the standard filter addresses `3^k`
+buckets and must reconstruct candidates by base-3 digit-wise XOR with a modulo,
+while the SCF sizes its table along the finer `n = 3·2^m` ladder and recovers each
+candidate with a single binary XOR inside a power-of-two segment.
 
-2/4-ary at n = 262,144 (2^18); standard 3-ary at n = 177,147 (3^11), segmented
-3-ary at n = 196,608 (3·2^16) — the 3-ary rows are at different n.
-
-| Arity | b | Standard | Segmented | Diff |
-|:---:|:---:|:---:|:---:|:---:|
-| 2 | 1 | 25.52 | 27.22 | +6.7% |
-| 2 | 2 | 13.36 | 13.96 | +4.5% |
-| 2 | 3 | 12.17 | 12.45 | +2.3% |
-| 2 | 4 | 11.24 | 10.22 | −9.0% |
-| 3 | 1 | 4.62 | 9.33 | n/a† |
-| 3 | 2 | 5.06 | 11.38 | n/a† |
-| 3 | 3 | 5.82 | 12.29 | n/a† |
-| 3 | 4 | 6.10 | 11.08 | n/a† |
-| 4 | 1 | 10.00 | 9.59 | −4.1% |
-| 4 | 2 | 12.94 | 11.36 | −12.2% |
-| 4 | 3 | 13.86 | 10.49 | −24.3% |
-| 4 | 4 | 11.65 | 11.42 | −1.9% |
-
-† Standard 3-ary is slowed by the modulo-based `fingerprint_hash_mod` (n = 3^k);
-the n values also differ, so the raw numbers aren't directly comparable.
-
-For 2-ary, segmented wins 3 of 4 configs; for 4-ary, standard wins 3 of 4. The
-locality advantage of segmented (chains stay within one segment) helps 2-ary more
-than 4-ary at these sizes.
-
-### Lookup throughput (MOps/s, 50% hit rate)
-
-2/4-ary at n = 262,144; standard 3-ary at n = 59,049 (3^10), segmented 3-ary at
-n = 196,608 — 3-ary rows not directly comparable.
-
-| Arity | b | Standard | Segmented | Diff |
-|:---:|:---:|:---:|:---:|:---:|
-| 2 | 2 | 43.46 | 39.40 | −9.3% |
-| 2 | 4 | 37.30 | 38.09 | +2.1% |
-| 3 | 2 | 12.08 | 35.26 | n/a† |
-| 3 | 4 | 13.31 | 26.50 | n/a† |
-| 4 | 2 | 29.01 | 27.27 | −6.0% |
-| 4 | 4 | 17.08 | 25.79 | +51.0% |
-
-† Standard 3-ary slowed by modulo xor3 arithmetic; n values differ.
-
-At matched n, differences range −9.3% to +51%. Throughput drops with higher arity
-(more buckets to probe) and larger b (more slots per bucket).
-
-### Delete throughput (MOps/s)
-
-Same n values as insert.
-
-| Arity | b | Standard | Segmented | Diff |
-|:---:|:---:|:---:|:---:|:---:|
-| 2 | 1 | 48.47 | 44.44 | −8.3% |
-| 2 | 2 | 32.54 | 32.82 | +0.9% |
-| 2 | 3 | 29.50 | 30.57 | +3.6% |
-| 2 | 4 | 28.15 | 27.81 | −1.2% |
-| 3 | 1 | 13.93 | 41.97 | n/a† |
-| 3 | 2 | 12.14 | 29.77 | n/a† |
-| 3 | 3 | 11.36 | 26.29 | n/a† |
-| 3 | 4 | 10.85 | 26.39 | n/a† |
-| 4 | 1 | 29.30 | 33.23 | +13.4% |
-| 4 | 2 | 25.69 | 25.87 | +0.7% |
-| 4 | 3 | 24.82 | 23.89 | −3.7% |
-| 4 | 4 | 24.19 | 24.03 | −0.7% |
-
-† Standard 3-ary slowed by modulo xor3; n values differ.
-
-At matched n, differences are small (−8% to +13%) with no consistent winner.
-Delete scans candidate buckets and clears a match, so eviction locality is moot.
-
-### False-positive rate
-
-Theoretical FPR is `k·b / 2^f`. Measured at selected `fp_bits` (2-ary, n = 262,144, b = 4):
-
-| fp_bits | Standard | Segmented | Theoretical (2b/2^f) |
-|:---:|:---:|:---:|:---:|
-| 8 | 2.986% | 2.973% | 3.125% |
-| 10 | 0.745% | 0.746% | 0.781% |
-| 12 | 0.188% | 0.188% | 0.195% |
-| 16 | 0.012% | 0.012% | 0.012% |
-| 20 | 0.001% | 0.001% | 0.001% |
-
-Both variants track the theoretical curve closely. The indexing strategy has no
-measurable effect on FPR, as expected — FPR depends only on fingerprint width and
-bucket size, not on how indices are computed.
+**Arities 2 and 4 — comparable.** Both layouts fall on powers of two, so both use
+the bitmask path; they differ by at most ~13% with neither consistently ahead.
+The one notable exception is lookup at (2, 4), where the standard filter is
+roughly 1.5× faster (36.64 vs 24.91 Mops).
 
 ---
 
 ## Discussion
 
-### Summary
+The segmented cuckoo filter performs on par with or better than the standard
+filter across every metric measured. The k-partite structure does not degrade
+performance, and it buys the property IKPIR is built on: a deterministic, fixed
+lookup-position set per item. No per-slot position storage is needed for any
+scheme — standard k > 2 uses the xor3/xor4 cycling property, segmented derives
+position from the segment index. The 3/4-ary extensions reach load factors
+consistent with the theoretical thresholds, validating the partial-key approach
+at higher arities.
 
-The segmented cuckoo filter performs on par with or slightly better than the
-standard filter across all metrics. The k-partite structure does not degrade
-performance and gives a practical edge: slightly higher load factor for b ≥ 2.
-No per-slot position storage is needed for any scheme — standard k > 2 uses the
-xor3/xor4 cycling property, segmented derives position from the segment index.
-The 3/4-ary extensions achieve load factors consistent with theoretical
-thresholds, validating the partial-key approach at higher arities.
+### On `max_kicks`
 
-### Load factor decreases with table size
-
-At fixed `max_kicks = 500`, achievable load factor falls as n grows (2-ary, b=4):
-
-| n | Standard | Segmented |
-|---:|:---:|:---:|
-| 16,384 | 96.51% | 96.70% |
-| 65,536 | 96.32% | 96.57% |
-| 262,144 | 96.09% | 96.28% |
-| 1,048,576 | 95.87% | 96.10% |
-
-The kick budget is an absolute constant. At small tables 500 kicks is a large
-fraction of capacity (3.1% at n=16,384), giving room to find free slots; at large
-tables it is tiny (0.05% at n=1,048,576) and the budget is exhausted before
-navigating the longer chains near saturation. Raise `max_kicks`
-(`set_max_kicks()`) to recover, or accept the <1pp drop across a 64× size range.
-
-### Why 2-ary b=1 segmented underperforms standard
-
-At b=1, a 2-ary filter is edges of a random graph on n vertices; the threshold is
-exactly 50%. **Standard** hits 51.76% (above): partial-key hashing correlates
-index pairs, and at b=1 with a small fingerprint space these correlations
-occasionally admit valid placements. **Segmented** hits 48.71% (below): the
-bipartite constraint plus the limited fingerprint space makes the graph slightly
-less connected. For **b ≥ 2** the effect vanishes — extra slots absorb the
-connectivity difference and segmented matches or exceeds standard.
-
-### Consistency with theory
-
-Measured load factors sit 0.15–2.10% below the Sanders & Walzer thresholds. The
-gap is partial-key hashing not being truly random: the offset `fingerprint_hash(fp)`
-has at most `2^f` (or `3^f`) distinct values vs. uniform over `n`. This is the
-same gap Fan et al. (2014) documented for 2-ary; we confirm it extends to 3/4-ary
-with xor3/xor4. Segmented sits at or above standard for b ≥ 2, confirming the
-k-partite structure does not hurt and may marginally help.
+The kick budget is an absolute constant, so its adequacy depends on table size:
+at 16 384 buckets, 500 kicks is 3.1% of capacity, but at 1 048 576 buckets it is
+0.05% — too few to navigate the long eviction chains near saturation, and the
+measured load factor then reports the budget rather than the scheme. This is why
+the default is 2500 rather than the 500 used in earlier sweeps of this crate. An
+open question is whether `max_kicks = O(n)` would close the remaining gap to
+threshold at large `n`.
 
 ### Open questions
 
-- **Scaling max_kicks.** Would `max_kicks = O(n)` or `O(n·b)` close the gap at large n?
-- **Tighter bounds.** Can the thresholds be sharpened for partial-key (XOR-based) hashing?
-- **Mixed-arity.** Could a filter start 2-ary at low load and raise arity as it fills?
+- **Tighter bounds.** Can the thresholds be sharpened for partial-key (XOR-based)
+  hashing, rather than assuming truly random hashes?
+- **Mixed-arity.** Could a filter start 2-ary at low load and raise arity as it
+  fills?
 
 ---
 
@@ -425,3 +376,5 @@ k-partite structure does not hurt and may marginally help.
   Blocks*. [arXiv:1707.06855](https://arxiv.org/pdf/1707.06855), 2022.
 - M. Dietzfelbinger, A. Goerdt, M. Mitzenmacher, A. Montanari, R. Pagh, M. Rink.
   *Tight Thresholds for Cuckoo Hashing via XORSAT*. ICALP 2010.
+- S. Walzer. Tabulation of k-partite load thresholds (the **Theory** column
+  above).

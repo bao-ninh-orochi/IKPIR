@@ -649,7 +649,7 @@ dependencies = [
 name = "segmented-cuckoo"
 version = "0.1.0"
 dependencies = [
- "proptest",
+ "clap",
  "rand",
  "xxhash-rust",
 ]

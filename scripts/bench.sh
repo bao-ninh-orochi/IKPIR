@@ -27,17 +27,32 @@
 #   Any other flag (--batch, --fingerprint-bits, --estimate, --max-mem-gb,
 #   --trials, --warmup, …) is forwarded to the bench unchanged.
 #
-# segmented-cuckoo benches (fixed internal config matrix — take no --arity/etc.):
-#   load_factor  insert_throughput  lookup_throughput  delete_throughput  fpr
-#   degree_distribution  kv_store_insert_throughput  kv_store_lookup_throughput
-#   kv_store_delete_throughput
+# segmented-cuckoo benches (all flags optional; with none, each runs the paper's
+# Table 2 matrix of six (arity, bucket_size) configs — see
+# crates/segmented-cuckoo/benches/configs.rs). Flags are forwarded unchanged:
+#   cuckoo_filter_load_factor         cuckoo_filter_insert_throughput
+#   cuckoo_filter_lookup_throughput   cuckoo_filter_delete_throughput
+#   cuckoo_filter_false_positive_rate
+#   kv_store_insert_throughput  kv_store_lookup_throughput  kv_store_delete_throughput
+#
+#     --arity N            2 | 3 | 4          (default: every arity in the matrix)
+#     --bucket-size N      1..4               (default: every size in the matrix)
+#     --num-buckets N                         (default: per-arity, per Table 2)
+#     --fingerprint-bits N                    (default 32)
+#     --max-kicks N                           (default 2500)
+#     --warmup N / --trials N   (default 3 / 10; load_factor defaults to 20 trials)
+#   Filter-bench extras:  --hit-rate (lookup), --num-queries (false_positive_rate)
+#   KV-store extras:      --value-bits, --plaintext-bits, --target-items
+#
+# To reproduce the paper's Table 2 end to end, use ./scripts/table2.sh.
 #
 # Examples:
 #   ./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --bucket-size 4 --value-bits 256
 #   ./scripts/bench.sh client_decode --backend simple
 #   ./scripts/bench.sh server_mutation --patch-mode entry
 #   ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
-#   ./scripts/bench.sh insert_throughput
+#   ./scripts/bench.sh cuckoo_filter_insert_throughput                    # full Table 2 matrix
+#   ./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2   # one cell
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,9 +76,14 @@ export IKPIR_RESULTS_DIR="$RESULTS_BASE/$CRATE"
 mkdir -p "$IKPIR_RESULTS_DIR"
 REL_DIR="${IKPIR_RESULTS_DIR#"$IKPIR_ROOT"/}"
 
-# segmented-cuckoo benches run their own fixed matrix — just dispatch + route.
+# segmented-cuckoo benches parse their own flags and default to the paper's
+# Table 2 matrix — just dispatch + route the CSV.
 if [[ "$CRATE" == segmented-cuckoo ]]; then
-    log "$BENCH  (segmented-cuckoo — fixed internal config matrix)"
+    if [[ $# -eq 0 ]]; then
+        log "$BENCH  (segmented-cuckoo — paper Table 2 matrix)"
+    else
+        log "$BENCH  (segmented-cuckoo — $*)"
+    fi
     cargo bench -p segmented-cuckoo --bench "$BENCH" -- "$@"
     ok "CSV(s) under $REL_DIR/"
     exit 0

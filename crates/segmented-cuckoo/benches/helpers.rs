@@ -2,14 +2,18 @@
 //!
 //! # Purpose
 //!
-//! Two utilities every bench in this crate needs: a writer for the
-//! `results/*.csv` files this crate's benches emit, and a `Stats` /
-//! `compute_stats` pair for summarising trial samples.
+//! The utilities every bench in this crate needs and that are not about
+//! *configuration*: a writer for the `results/*.csv` files the benches emit, a
+//! `Stats` / `compute_stats` pair for summarising trial samples, and the
+//! `cargo test` guard.
+//!
+//! Bench *configuration* — the paper's config matrix, the default tunables, and
+//! the CLI — lives next door in `benches/configs.rs`.
 //!
 //! # Related files
 //!
-//! - `benches/insert_throughput.rs` and
-//!   `benches/kv_store_insert_throughput.rs` — sole consumers.
+//! - `benches/configs.rs` — the config matrix and shared CLI.
+//! - `benches/cuckoo_filter_*.rs`, `benches/kv_store_*.rs` — consumers.
 
 use std::fs;
 use std::io::{BufWriter, Write};

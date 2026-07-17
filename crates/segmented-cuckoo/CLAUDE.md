@@ -26,6 +26,34 @@ Two filter families plus a KV-store layer. No PIR, crypto, or network I/O
 | `src/store.rs` | `CuckooKVStore<S>` + `CuckooParams` + `SlotMutation` + `OccupiedSlot` |
 | `src/lib.rs` | Public type aliases + module docs |
 | `src/util.rs` | `next_power_of_{2,3,4}` / `is_power_of_{3,4}` (constructors only) |
+| `benches/configs.rs` | **The paper's Table 2 config matrix + default tunables + shared CLI** — single source of truth for what any bench runs at |
+| `benches/helpers.rs` | CSV writer, trial statistics, `cargo test` guard |
+
+## Benches
+
+Five `cuckoo_filter_*` benches (load factor, insert/lookup/delete throughput,
+false-positive rate) and three `kv_store_*` benches. Every flag is optional;
+with none, each bench runs the paper's Table 2 matrix — the six
+`(arity, bucket_size)` pairs at `fingerprint_bits = 32`, `max_kicks = 2500`, and
+~10^6 buckets. `../../scripts/table2.sh` is the entry point that reproduces the
+table; `../../scripts/bench.sh <name> [flags]` runs one bench.
+
+Two things to keep straight when touching them:
+
+- **`benches/configs.rs` owns every default.** Add a knob there, not in a bench.
+  Table 2's `num_buckets` depends only on *arity*, not bucket size, so it is
+  computed from arity rather than repeated per row — the six rows cannot drift
+  apart.
+- **`kv_store_*` benches are not a paper table.** They borrow Table 2's six
+  `(arity, bucket_size)` pairs so the geometry lines up, but size from
+  `--target-items` (default 2^16): a KV slot carries `fp ‖ value`, so Table 2's
+  ~10^6 buckets at `value_bits = 1024` would run to gigabytes.
+
+Tests are unit tests in `src/` only — there is no `tests/` directory, and
+`proptest` is deliberately not a dependency. The randomized coverage that used
+to live in `tests/proptests.rs` is now deterministic grid tests in `src/store.rs`
+(`*_over_param_grid`), which reach the same ragged-tail cases while keeping a
+failure reproducible from its test name.
 
 ## Key design decisions (the WHY)
 

@@ -18,12 +18,16 @@ die()  { echo "${C_YELLOW}error:${C_RESET} $*" >&2; exit 1; }
 
 # ── Bench registry ────────────────────────────────────────────────────────────
 # PIR benches take the managed single-config surface (arity/num-buckets/…/backend
-# with auto-derived plaintext-bits + lwe-dim); the segmented-cuckoo filter benches
-# run their own fixed internal config matrix and take no such flags.
+# with auto-derived plaintext-bits + lwe-dim). The segmented-cuckoo benches parse
+# their own flags (see crates/segmented-cuckoo/benches/configs.rs) and default to
+# the paper's Table 2 matrix, so bench.sh forwards their flags unchanged.
 PIR_SERVER_BENCHES=(server_setup server_answer server_mutation headtohead_answer)
 PIR_CLIENT_BENCHES=(client_query client_decode client_mutation headtohead_query headtohead_decode)
-CUCKOO_BENCHES=(load_factor insert_throughput lookup_throughput delete_throughput fpr
-                degree_distribution kv_store_insert_throughput kv_store_lookup_throughput
+# The four that populate Table 2, in the order the table's columns read.
+CUCKOO_TABLE2_BENCHES=(cuckoo_filter_load_factor cuckoo_filter_insert_throughput
+                       cuckoo_filter_lookup_throughput cuckoo_filter_delete_throughput)
+CUCKOO_BENCHES=("${CUCKOO_TABLE2_BENCHES[@]}" cuckoo_filter_false_positive_rate
+                kv_store_insert_throughput kv_store_lookup_throughput
                 kv_store_delete_throughput)
 
 _contains() { local x=$1; shift; local e; for e in "$@"; do [[ "$e" == "$x" ]] && return 0; done; return 1; }
