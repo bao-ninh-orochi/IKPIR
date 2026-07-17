@@ -47,7 +47,7 @@ paper's Table 2).
 
 | Finding | Detail |
 |---|---|
-| Segmentation costs nothing in space | The SCF reaches a *higher* load factor than the standard filter in all six configurations, by 0.02–0.04 pp, peaking at 99.86% |
+| Segmentation costs nothing in space | The SCF reaches a *higher* load factor than the standard filter in all six configurations, by 0.02–0.07 pp, peaking at 99.86% |
 | Close to the theoretical limit | Every configuration lands within 0.7 pp of the k-partite information-theoretic threshold |
 | Segmentation wins big at arity 3 | 2.2–3.3× faster on insert, lookup, and delete — the standard filter needs a modulo (n = 3^k), the SCF a bitmask (n = 3·2^m) |
 | Comparable at arities 2 and 4 | Both layouts fall on powers of two; they differ by at most ~13% with neither consistently ahead, the exception being lookup at (2, 4) where standard is ~1.5× faster |
@@ -308,7 +308,7 @@ Walzer 2022. Bold marks the better filter on each metric.
 ### Load factor
 
 The SCF attains a slightly higher load factor in **all six** configurations
-(+0.02 to +0.04 pp) and stays within 0.7 pp of the k-partite threshold, peaking
+(+0.02 to +0.07 pp) and stays within 0.7 pp of the k-partite threshold, peaking
 at 99.86%. Segmentation removes placement freedom the standard filter has — each
 candidate is pinned to its own segment — yet costs nothing in storage
 efficiency. Higher arity and larger `b` both help sharply: (4, 3) reaches 99.86%,
