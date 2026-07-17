@@ -175,7 +175,7 @@ Hao et al. 2025; the others fix the DB geometry and populate to `TableFull`
 adds eight filter / KV-store benches — five `cuckoo_filter_*`
 (`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,
 `false_positive_rate`) and three `kv_store_*`. Their flags are all optional:
-with none, each runs the paper's **Table 2** matrix (six `(arity, bucket_size)`
+with none, each runs the paper's **Table 2** matrix (five `(arity, bucket_size)`
 pairs, `fingerprint_bits = 32`, `max_kicks = 2500`, ~10⁶ buckets), defined once
 in `crates/segmented-cuckoo/benches/configs.rs`.
 
@@ -186,35 +186,47 @@ in `crates/segmented-cuckoo/benches/configs.rs`.
 and `--lwe-dim`, and writing the CSV under `results/<crate>/`:
 
 ```bash
-./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --bucket-size 4 --value-bits 256
+./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --bucket-size 4 --value-bits 8192
 ./scripts/bench.sh client_decode --backend simple
 ./scripts/bench.sh server_mutation --patch-mode entry,row
 ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
-./scripts/bench.sh cuckoo_filter_insert_throughput               # all six Table 2 configs
+./scripts/bench.sh cuckoo_filter_insert_throughput               # all five Table 2 configs
 ./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2   # one cell
 ./scripts/bench.sh                              # -h: full flag + bench list
 ```
 
 All flags are optional — for the PIR benches, omitted geometry falls back to a
-small default config; for the `segmented-cuckoo` benches, to the paper's Table 2
-matrix.
+small **dev-scale** config (~2¹⁶ slots, sub-second), *not* the paper's; for the
+`segmented-cuckoo` benches, to the paper's Table 2 matrix. To run the paper's
+PIR geometry, use the table sweeps below rather than this one-off runner.
 
-### Reproduce the paper's Table 2
+### Reproduce a paper table
 
-`scripts/table2.sh` runs the four `cuckoo_filter_*` benches behind Table 2's
-columns (load factor + insert/lookup/delete throughput, SCF vs standard filter
-across all six configs). Any flags are forwarded to each bench:
+One sweep per table. Each resolves the paper's config matrix, then loops
+`bench.sh` over it — so a table is one command, not twenty:
+
+| Script | Table | Benches behind it |
+|---|---|---|
+| `scripts/table2.sh` | filter: load factor + insert/lookup/delete throughput, SCF vs standard | the four `cuckoo_filter_*` |
+| `scripts/table3.sh` | online: query / response / answer latency | `headtohead_{answer,query,decode}` |
+| `scripts/table4.sh` | mutation throughput (insert/update/delete) | `{server,client}_mutation` |
+| `scripts/table5.sh` | setup: the static rebuild cost table 4 replaces | `server_setup` |
+
+`table2.sh` forwards any flags to each bench; `table{3,4,5}.sh` additionally
+accept `--arity` / `--bucket-size` / `--value-bits` / `--backend` to narrow the
+matrix, and forward anything else:
 
 ```bash
 ./scripts/table2.sh                              # the full published table (~1-2 h)
 ./scripts/table2.sh --arity 4                    # just the arity-4 rows
-./scripts/table2.sh --trials 3                   # faster, noisier
+./scripts/table4.sh                              # all 5 configs × 2 widths × 2 backends
+./scripts/table3.sh --arity 3                    # the full-paper arity-3 cells
+./scripts/table5.sh --estimate --backend frodo   # RisePIR-F, one segment × arity
 ```
 
-There is intentionally **no full-matrix sweep script for the PIR benches**:
-reproducing that dataset means looping `bench.sh` over the config matrix below
-(hours), which a reader rarely wants. Run the handful of points you care about
-instead.
+The PIR matrix (`PAPER_*` in `scripts/lib.sh`) is the single source of truth for
+what those three sweep, mirroring what `benches/configs.rs` is for Table 2. A
+bare `bench.sh` is *not* affected by it — that stays dev-scale on purpose.
 
 ### Quick smoke / correctness check
 
@@ -245,20 +257,34 @@ operating point depend on `value_bits`. The single source of truth is
 cargo test -p ikpir-common --release -- --ignored noise_margin --nocapture
 ```
 
-The paper evaluates 12 throughput configs (6 `(arity, bucket_size)` pairs × 2 DB
-sizes, all > 1 M entries) × 3 value widths, plus a fixed-N head-to-head matrix:
+The paper evaluates five `(arity, bucket_size)` KV-SCF shapes × 2 value widths ×
+2 backends. Each shape runs at one size, defined once by `paper_num_buckets` in
+`scripts/lib.sh`:
 
-| arity `d` | bucket_size `b` | num_buckets `n_b` | total entries |
-|---|---|---|---|
-| 2 | 4 | 262144 / 1048576 | 2²⁰ / 2²² |
-| 4 | 1 | 1048576 / 4194304 | 2²⁰ / 2²² |
-| 4 | 2 | 524288 / 2097152 | 2²⁰ / 2²² |
-| 3 | 2 | 786432 / 1572864 | 3·2¹⁹ / 3·2²⁰ |
-| 3 | 3 | 393216 / 1572864 | 9·2¹⁷ / 9·2¹⁹ |
-| 4 | 3 | 524288 / 1048576 | 3·2¹⁹ / 3·2²⁰ |
+| arity `d` | bucket_size `b` | num_buckets `n_b` | slots `N = n_b·b` | online keys `m` |
+|---|---|---|---|---|
+| 2 | 4 | 262144 = 2¹⁸ | 1 048 576 = 2²⁰ | 10⁶ |
+| 4 | 1 | 1048576 = 2²⁰ | 1 048 576 = 2²⁰ | 10⁶ |
+| 4 | 2 | 524288 = 2¹⁹ | 1 048 576 = 2²⁰ | 10⁶ |
+| 3 | 2 | 786432 = 3·2¹⁸ | 1 572 864 = 3·2¹⁹ | 1 415 577 (fill 0.90) |
+| 3 | 3 | 393216 = 3·2¹⁷ | 1 179 648 = 9·2¹⁷ | 1 061 683 (fill 0.90) |
 
-value widths: `--value-bits 256 / 2048 / 8192` (32 B / 256 B / 1 kB);
-head-to-head fixes `--num-keys` ∈ {1 M, 1.5 M, 3 M, 4 M} at ~95 % load.
+The three arity-2/4 shapes share `N = 2²⁰`, so they differ only in shape, and
+the online table fixes `m = 10⁶` — the count ChalametPIR and KPIR^index publish
+at, filling those tables to 0.954, under every achieved load factor of Table 2.
+
+Arity 3 is a **full-paper addition** and does not appear in the submitted
+version. It cannot reach `N = 2²⁰`: a segmented 3-ary table needs `n_b = 3·2^t`,
+so `N = 3·2^t·b` lands on a coarser ladder. Each arity-3 shape takes the
+smallest rung still holding 10⁶ keys at fill 0.90 (one rung down gives 707 k
+slots for (3,2), 531 k for (3,3) — both short), and reports at that fill rather
+than at a fixed `m`, having no baseline to line up against. It is covered by
+`table3.sh` and `table4.sh`, but not by `table5.sh`.
+
+Value widths: `--value-bits 2048 / 8192` (256 B / 1 kB). The mutation and setup
+tables seed to fill 0.90; mutation applies one batch of τ = 1 % of the slots
+(10 485 at `N = 2²⁰`). Narrower values (e.g. `--value-bits 256` = 32 B) still
+run — they are simply not a paper config.
 
 ### Low-level: `cargo bench` directly
 

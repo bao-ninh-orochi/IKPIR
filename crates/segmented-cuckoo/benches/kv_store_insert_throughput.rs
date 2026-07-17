@@ -14,13 +14,13 @@
 //!
 //! **Relation to the paper.** This measures the KV-SCF, the primitive layer
 //! under RisePIR, and is *not* one of the paper's tables. It borrows Table 2's
-//! six `(arity, bucket_size)` pairs so the geometry lines up with the filter
+//! five `(arity, bucket_size)` pairs so the geometry lines up with the filter
 //! benches, but sizes the table from `--target-items` rather than Table 2's ~10^6
 //! buckets: a KV slot carries `fp ‖ value`, so at 10^6 buckets and
 //! `value_bits = 1024` the table alone would run to gigabytes. Pass
 //! `--num-buckets` to size it explicitly instead.
 //!
-//! **Arguments (CLI):** all optional; with none, runs the paper's six configs.
+//! **Arguments (CLI):** all optional; with none, runs the paper's five configs.
 //! `--arity`, `--bucket-size`, `--fingerprint-bits`, `--max-kicks`, `--warmup`,
 //! `--trials` (see `benches/configs.rs`), plus `--value-bits` (comma-separated,
 //! default `8,64,256,1024`), `--plaintext-bits` (default 8), `--target-items`

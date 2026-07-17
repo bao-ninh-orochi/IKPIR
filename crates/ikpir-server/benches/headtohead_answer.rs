@@ -1,7 +1,12 @@
 //! **Intent:** Head-to-head counterpart of `server_answer` — measure
-//! server-side `answer` throughput and wire sizes at a **fixed keyword count**
-//! (1 M / 1.5 M / 3 M / 4 M), for the fair comparison against ChalametPIR and
-//! Hao et al. 2025.
+//! server-side `answer` throughput and wire sizes at a **fixed keyword count**,
+//! for the fair comparison against ChalametPIR and Hao et al. 2025.
+//!
+//! The paper reports it at `--num-keys` = 10^6, the count both baselines
+//! publish at (`scripts/table3.sh`). The arity-3 KV-SCF shapes cannot hold 10^6
+//! keys at a comparable fill and have no baseline to match, so that sweep runs
+//! them at 90% fill instead — a different `--num-keys`, same bench. The CSV's
+//! `num_keys` / `db_size` columns record which regime a row came from.
 //!
 //! **Motivation:** `server_answer` fixes `num_buckets` (and thus DB size) and
 //! populates `until_full`, so different schemes store different keyword counts
@@ -49,15 +54,17 @@ struct Cli {
     backend: Backend,
     /// Required: number of keys to populate. The DB size (= `num_buckets ×
     /// bucket_size`) is fixed by `--num-buckets` / `--bucket-size`; the caller
-    /// picks those so capacity ≥ `num_keys` at a reasonable load factor
-    /// (~95% for the head-to-head matrix).
+    /// picks those so capacity ≥ `num_keys` at a reasonable load factor — 0.954
+    /// for the paper's arity-2/4 shapes at 10^6 keys, 0.90 for its arity-3
+    /// ones. Both stay under every achieved load factor of Table 2.
     #[arg(long)]
     num_keys: u64,
     #[arg(long, default_value_t = 16_384)]
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
     bucket_size: u32,
-    #[arg(long, default_value_t = 256)]
+    /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
+    #[arg(long, default_value_t = 2048)]
     value_bits: u32,
     #[arg(long, default_value_t = 32)]
     fingerprint_bits: u32,

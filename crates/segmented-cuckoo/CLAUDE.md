@@ -33,7 +33,7 @@ Two filter families plus a KV-store layer. No PIR, crypto, or network I/O
 
 Five `cuckoo_filter_*` benches (load factor, insert/lookup/delete throughput,
 false-positive rate) and three `kv_store_*` benches. Every flag is optional;
-with none, each bench runs the paper's Table 2 matrix — the six
+with none, each bench runs the paper's Table 2 matrix — the five
 `(arity, bucket_size)` pairs at `fingerprint_bits = 32`, `max_kicks = 2500`, and
 ~10^6 buckets. `../../scripts/table2.sh` is the entry point that reproduces the
 table; `../../scripts/bench.sh <name> [flags]` runs one bench.
@@ -42,9 +42,11 @@ Two things to keep straight when touching them:
 
 - **`benches/configs.rs` owns every default.** Add a knob there, not in a bench.
   Table 2's `num_buckets` depends only on *arity*, not bucket size, so it is
-  computed from arity rather than repeated per row — the six rows cannot drift
-  apart.
-- **`kv_store_*` benches are not a paper table.** They borrow Table 2's six
+  computed from arity rather than repeated per row — the five rows cannot drift
+  apart. `PAPER_CONFIGS` is mirrored on the PIR side by `PAPER_PIR_CONFIGS` in
+  `../../scripts/lib.sh`, which pairs each cell with the bucket count the
+  keyword-PIR benches run it at; adding or dropping a cell means editing both.
+- **`kv_store_*` benches are not a paper table.** They borrow Table 2's five
   `(arity, bucket_size)` pairs so the geometry lines up, but size from
   `--target-items` (default 2^16): a KV slot carries `fp ‖ value`, so Table 2's
   ~10^6 buckets at `value_bits = 1024` would run to gigabytes.

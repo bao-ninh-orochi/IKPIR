@@ -4,14 +4,14 @@
 //! # Purpose
 //!
 //! Single source of truth for *what configuration a bench runs at*. Every
-//! bench in this crate defaults to the six `(arity, bucket_size)` pairs of
+//! bench in this crate defaults to the five `(arity, bucket_size)` pairs of
 //! Table 2 in the CANS 2026 paper and accepts CLI flags to narrow or override
 //! them. Keeping the matrix here means the benches agree on geometry by
 //! construction, and a paper revision is a one-file edit.
 //!
 //! # Design / architecture
 //!
-//! - [`PAPER_CONFIGS`] — the six rows of Table 2, as [`FilterConfig`] values.
+//! - [`PAPER_CONFIGS`] — the five rows of Table 2, as [`FilterConfig`] values.
 //! - [`ConfigCli`] — the shared flag set, `#[command(flatten)]`ed into each
 //!   bench's own `Cli` so bench-specific flags (`--value-bits`, `--hit-rate`,
 //!   …) live with the bench that uses them.
@@ -90,9 +90,9 @@ pub const DEFAULT_BUCKET_SIZE: u32 = 4;
 // closest pair above 10^6. Every value exceeds 2^20 buckets, so each filter
 // holds ≥ 10^6 slots even at `bucket_size = 1`.
 //
-// Note these depend only on arity, not on bucket_size: Table 2's six rows carry
+// Note these depend only on arity, not on bucket_size: Table 2's five rows carry
 // three distinct (segmented, standard) pairs between them. They are computed
-// from arity below rather than repeated per row, so the six rows cannot drift.
+// from arity below rather than repeated per row, so the five rows cannot drift.
 
 /// Bucket count for a segmented filter of the given arity, per Table 2.
 ///
@@ -166,21 +166,25 @@ impl FilterConfig {
     }
 }
 
-/// The six `(arity, bucket_size)` configurations of Table 2 — the ones RisePIR
-/// uses, and the default matrix for every bench in this crate.
+/// The five `(arity, bucket_size)` configurations of Table 2 — the ones RisePIR
+/// is instantiated at, and the default matrix for every bench in this crate.
 ///
-/// Only these six are reported: they are the configurations whose load factor
-/// makes them worth instantiating RisePIR at. Lower bucket sizes at a given
-/// arity waste table space (2-ary at `b = 1` peaks near 50%), and the omitted
-/// cells add no information about the segmented-vs-standard comparison. Pass
-/// `--arity` / `--bucket-size` to run a cell outside this set.
+/// Only these five are reported: they are the configurations whose load factor
+/// makes them worth instantiating RisePIR at, and each one carries a matching
+/// row in the keyword-PIR tables. Lower bucket sizes at a given arity waste
+/// table space (2-ary at `b = 1` peaks near 50%), and the omitted cells add no
+/// information about the segmented-vs-standard comparison. Pass `--arity` /
+/// `--bucket-size` to run a cell outside this set.
+///
+/// The set is mirrored on the PIR side by `PAPER_PIR_CONFIGS` in
+/// `../../scripts/lib.sh`, which pairs each cell with the bucket count the
+/// keyword-PIR benches run it at. Adding or dropping a cell means editing both.
 pub const PAPER_CONFIGS: &[FilterConfig] = &[
     FilterConfig::new(2, 4),
     FilterConfig::new(3, 2),
     FilterConfig::new(3, 3),
     FilterConfig::new(4, 1),
     FilterConfig::new(4, 2),
-    FilterConfig::new(4, 3),
 ];
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────

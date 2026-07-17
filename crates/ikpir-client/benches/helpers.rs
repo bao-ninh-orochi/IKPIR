@@ -219,6 +219,15 @@ pub fn backend_shape_estimate(backend: Backend, n_rows_per_seg: u64, row_width: 
 
 // ── Default num_buckets per arity ────────────────────────────────────────────
 
+/// Default `num_buckets` for a one-off run: **dev scale** (≈2^16 slots),
+/// sub-second per bench.
+/// 2-ary: 2^14 buckets × bucket_size=4 → 65536 slots.
+/// 3-ary: 3·2^13 buckets × bucket_size=4 → 98304 slots.
+/// 4-ary: 2^14 buckets × bucket_size=4 → 65536 slots.
+///
+/// This is **not** the paper's geometry, which is ~2^20 slots and lives in
+/// `scripts/lib.sh::paper_num_buckets` — the `table{3,4,5}.sh` sweeps pass it
+/// explicitly. Mirrors `default_num_buckets` in that file.
 #[allow(dead_code)]
 pub fn default_num_buckets_for_arity(arity: u32) -> u32 {
     match arity {

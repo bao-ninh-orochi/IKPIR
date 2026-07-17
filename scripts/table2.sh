@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Reproduce Table 2 of the CANS 2026 paper: maximum load factor and
 # insert/lookup/delete throughput for the d-ary Segmented Cuckoo Filter against a
-# standard cuckoo filter, across the six (arity, bucket_size) configurations
-# RisePIR uses.
+# standard cuckoo filter, across the five (arity, bucket_size) configurations
+# RisePIR is instantiated at.
 #
 # This is the default entry point for the table. It runs the four benches that
-# feed its columns, each of which sweeps all six configs on its own (the matrix
+# feed its columns, each of which sweeps all five configs on its own (the matrix
 # and the tunables live in crates/segmented-cuckoo/benches/configs.rs, the single
 # source of truth). With no arguments it reproduces the published table:
 #
@@ -21,6 +21,10 @@
 # run — e.g. `--arity 4` for the three arity-4 rows only. The false-positive-rate
 # and kv_store_* benches are not part of Table 2; run those via
 # ./scripts/bench.sh <name>.
+#
+# This is the filter table; the keyword-PIR tables have their own sweeps
+# (table3.sh online, table4.sh mutation, table5.sh setup), driven by the PIR
+# config matrix in scripts/lib.sh.
 #
 # Runtime: ~1-2 hours on the paper's machine (an Apple M1 MacBook Pro, 16 GiB).
 # Every config fills a ~10^6-bucket table to capacity, repeatedly: the load-factor
