@@ -36,6 +36,14 @@
 //!   2× *slower* than unblocked — while narrow rows need large `R` to
 //!   amortise the per-row overhead (`R = 16` at `width = 29` is 2.7×
 //!   faster than unblocked).
+//! - **x86-64 exception.** Measured on Zen 4 (EPYC 9R14, AWS
+//!   `r7a.xlarge`, the 2026-07 paper run), every blocked level loses at
+//!   the paper's shapes: `R ∈ {2, 4, 8}` at `width ∈ [208, 832]`
+//!   streamed the DB at 6–9 GB/s against 22–26 GB/s for the unblocked
+//!   pass over the same bytes, and the deficit tracked the chosen `R`,
+//!   not the total size. So on `x86_64` only `width ≤ 128` blocks; the
+//!   M1 table stands elsewhere. Re-measure per-µarch before widening
+//!   either side of this split.
 //! - **Bit-exact.** `u32` wrapping addition is associative and
 //!   commutative, so regrouping the `i`-summation by blocks leaves every
 //!   `acc[j]` bit-identical to the naive loop for any `R`. The unit
@@ -80,13 +88,17 @@
 pub(crate) fn matvec_accumulate(acc: &mut [u32], d: &[u32], q: &[u32]) {
     debug_assert_eq!(d.len(), q.len() * acc.len(), "matvec shape mismatch");
     // R = largest power of two ≤ 16 with R · width ≤ 2048 cells (8 KiB
-    // block footprint) — see the module docs for the measured cliffs
-    // that pin both ends of this rule.
+    // block footprint) — except on x86-64, where the measured Zen 4
+    // cliffs cap blocking at width ≤ 128. See the module docs for the
+    // measurements that pin both ends of each rule.
     match acc.len() {
         0 => (),
         1..=128 => block_pass::<16>(acc, d, q),
+        #[cfg(not(target_arch = "x86_64"))]
         129..=256 => block_pass::<8>(acc, d, q),
+        #[cfg(not(target_arch = "x86_64"))]
         257..=512 => block_pass::<4>(acc, d, q),
+        #[cfg(not(target_arch = "x86_64"))]
         513..=1024 => block_pass::<2>(acc, d, q),
         _ => block_pass::<1>(acc, d, q),
     }
