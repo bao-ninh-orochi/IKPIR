@@ -41,9 +41,19 @@
 //!   the paper's shapes: `R ∈ {2, 4, 8}` at `width ∈ [208, 832]`
 //!   streamed the DB at 6–9 GB/s against 22–26 GB/s for the unblocked
 //!   pass over the same bytes, and the deficit tracked the chosen `R`,
-//!   not the total size. So on `x86_64` only `width ≤ 128` blocks; the
-//!   M1 table stands elsewhere. Re-measure per-µarch before widening
-//!   either side of this split.
+//!   not the total size. So on `x86_64` widths `129..=4096` never
+//!   block; the M1 table stands elsewhere. Re-measure per-µarch before
+//!   widening either side of this split.
+//! - **x86-64 wide widths block again.** The Zen 4 cliff above is a
+//!   stream-spacing effect, not a blocking effect: at `width = 11138`
+//!   (rows 44 KiB apart, one prefetch stream per page) blocking pays
+//!   off exactly as designed, because past `width = 4096` the
+//!   accumulator outgrows a 16 KiB half-L1 and its per-row
+//!   read-modify-write otherwise runs through L2. Measured on the same
+//!   Zen 4 at that width: `R ∈ {1, 2, 4, 8, 16}` streamed
+//!   13.3 / 18.3 / 22.2 / 23.0 / 21.2 GB/s, so wide widths take
+//!   `R = 8` on `x86_64` and join the ~23 GB/s streaming class of the
+//!   narrow-row passes.
 //! - **Bit-exact.** `u32` wrapping addition is associative and
 //!   commutative, so regrouping the `i`-summation by blocks leaves every
 //!   `acc[j]` bit-identical to the naive loop for any `R`. The unit
@@ -89,8 +99,11 @@ pub(crate) fn matvec_accumulate(acc: &mut [u32], d: &[u32], q: &[u32]) {
     debug_assert_eq!(d.len(), q.len() * acc.len(), "matvec shape mismatch");
     // R = largest power of two ≤ 16 with R · width ≤ 2048 cells (8 KiB
     // block footprint) — except on x86-64, where the measured Zen 4
-    // cliffs cap blocking at width ≤ 128. See the module docs for the
-    // measurements that pin both ends of each rule.
+    // cliffs pin a different table: width ≤ 128 blocks at R = 16,
+    // 129..=4096 streams unblocked (the accumulator is L1-resident),
+    // and wider takes R = 8 (the accumulator would spill L1, and the
+    // R streams sit a page or more apart). See the module docs for the
+    // measurements behind every boundary.
     match acc.len() {
         0 => (),
         1..=128 => block_pass::<16>(acc, d, q),
@@ -100,6 +113,11 @@ pub(crate) fn matvec_accumulate(acc: &mut [u32], d: &[u32], q: &[u32]) {
         257..=512 => block_pass::<4>(acc, d, q),
         #[cfg(not(target_arch = "x86_64"))]
         513..=1024 => block_pass::<2>(acc, d, q),
+        #[cfg(target_arch = "x86_64")]
+        129..=4096 => block_pass::<1>(acc, d, q),
+        #[cfg(target_arch = "x86_64")]
+        _ => block_pass::<8>(acc, d, q),
+        #[cfg(not(target_arch = "x86_64"))]
         _ => block_pass::<1>(acc, d, q),
     }
 }
@@ -183,6 +201,10 @@ mod tests {
             (65, 1024),
             (5, 2049),
             (3, 208),
+            (5, 4096),
+            (5, 4097),
+            (3, 12000),
+            (17, 11138),
         ];
         for (n, width) in shapes {
             let mut d = vec![0u32; n * width];
