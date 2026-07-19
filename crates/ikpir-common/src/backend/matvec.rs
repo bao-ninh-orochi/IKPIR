@@ -36,24 +36,15 @@
 //!   2× *slower* than unblocked — while narrow rows need large `R` to
 //!   amortise the per-row overhead (`R = 16` at `width = 29` is 2.7×
 //!   faster than unblocked).
-//! - **x86-64 exception.** Measured on Zen 4 (EPYC 9R14, AWS
-//!   `r7a.xlarge`, the 2026-07 paper run), every blocked level loses at
-//!   the paper's shapes: `R ∈ {2, 4, 8}` at `width ∈ [208, 832]`
-//!   streamed the DB at 6–9 GB/s against 22–26 GB/s for the unblocked
-//!   pass over the same bytes, and the deficit tracked the chosen `R`,
-//!   not the total size. So on `x86_64` widths `129..=4096` never
-//!   block; the M1 table stands elsewhere. Re-measure per-µarch before
-//!   widening either side of this split.
-//! - **x86-64 wide widths block again.** The Zen 4 cliff above is a
-//!   stream-spacing effect, not a blocking effect: at `width = 11138`
-//!   (rows 44 KiB apart, one prefetch stream per page) blocking pays
-//!   off exactly as designed, because past `width = 4096` the
-//!   accumulator outgrows a 16 KiB half-L1 and its per-row
-//!   read-modify-write otherwise runs through L2. Measured on the same
-//!   Zen 4 at that width: `R ∈ {1, 2, 4, 8, 16}` streamed
-//!   13.3 / 18.3 / 22.2 / 23.0 / 21.2 GB/s, so wide widths take
-//!   `R = 8` on `x86_64` and join the ~23 GB/s streaming class of the
-//!   narrow-row passes.
+//! - **Per-µarch tables.** The dispatch is selected by target
+//!   architecture at compile time, because the profitable schedule is
+//!   a property of the cache hierarchy and prefetchers, not of the
+//!   arithmetic: the same blocked pass that wins on Apple M1 collapses
+//!   3× on AMD Zen 4 at narrow widths, and vice versa the unblocked
+//!   wide pass Zen 4 prefers leaves 1.7× on the table against `R = 8`.
+//!   The `# Tuning` section below records both shipped tables, the
+//!   cost model behind every boundary, the measured evidence, and the
+//!   recipe for porting to a new microarchitecture.
 //! - **Bit-exact.** `u32` wrapping addition is associative and
 //!   commutative, so regrouping the `i`-summation by blocks leaves every
 //!   `acc[j]` bit-identical to the naive loop for any `R`. The unit
@@ -62,6 +53,80 @@
 //!   schedule depends only on the public shape `(n, width)`, never on
 //!   the values of `q` or `d` — safe for secret-dependent inputs
 //!   (`client_decode`, `compute_c`).
+//!
+//! # Tuning — the dispatch table is a measured, per-µarch object
+//!
+//! Nothing in the table is derived from first principles alone; every
+//! boundary was chosen by running this kernel on the machines we
+//! publish numbers from. Two tables ship:
+//!
+//! - **`aarch64`** (measured on Apple M1, 128 KiB L1d): the footprint
+//!   ladder — `R` = largest power of two `≤ 16` with
+//!   `R · width ≤ 2048` cells.
+//! - **`x86_64`** (measured on AMD Zen 4, EPYC 9R14, AWS
+//!   `r7a.xlarge`, 32 KiB L1d; spot-validated on Zen 2, EPYC 7R32,
+//!   AWS `c5a`): `width ≤ 128 → R = 16`, `129..=4096 → R = 1`,
+//!   `> 4096 → R = 8`.
+//!
+//! ## The cost model behind the boundaries
+//!
+//! Per cell the pass pays one streamed DB read plus `1/R` of an
+//! accumulator load and store. Three regimes follow:
+//!
+//! 1. **`width ≤ 128`** — rows are so short that per-row loop
+//!    overhead dominates; a large `R` amortises it (M1: `R = 16` at
+//!    `width = 29` measured 2.7× over unblocked).
+//! 2. **Middle band, accumulator fits L1** — we cap it at half the
+//!    cache, `width ≤ L1d_bytes / 8` cells (= 4096 at 32 KiB): the
+//!    accumulator read-modify-write hits L1 and is nearly free, so
+//!    blocking has nothing to amortise, and `R = 1`, one perfectly
+//!    sequential DB stream, is optimal (Zen 4: 22–27 GB/s). Blocking
+//!    here is actively harmful when the row stride `4 · width` is
+//!    under a page or two: the `R` streams then interleave inside the
+//!    same pages, the per-page sequential prefetchers cannot classify
+//!    them, and throughput collapses (Zen 4: 6–9 GB/s at
+//!    `width ∈ [208, 832]`, `R ∈ {2, 4, 8}` — the regression the
+//!    2026-07 paper run caught).
+//! 3. **`width > L1d_bytes / 8`** — the accumulator spills L1, its
+//!    per-row read-modify-write runs through L2 and roughly halves
+//!    the rate (Zen 4: 13.3 GB/s at `width = 11138`), so blocking
+//!    pays again — and is safe, because the same threshold guarantees
+//!    the `R` streams sit `≥ 16` KiB apart, on distinct pages the
+//!    prefetchers track as independent sequential streams. `R = 8`
+//!    balances amortisation (accumulator traffic ÷ 8) against stream
+//!    count and per-column register pressure.
+//!
+//! ## Measured reference curves (wide arm, GB/s by `R` = 1/2/4/8/16)
+//!
+//! At the SimplePIR paper shape (`width = 11138`, ~0.5 GiB/segment,
+//! far past every cache):
+//!
+//! - Zen 4 (EPYC 9R14): 13.3 / 18.3 / 22.2 / **23.0** / 21.2 — peak
+//!   at `R = 8`.
+//! - Zen 2 (EPYC 7R32): 12.7 / 16.5 / **18.4** / 17.5 / 17.1 — peak
+//!   at `R = 4`, `R = 8` within 5%, so one shared `R = 8` serves both.
+//!
+//! A single interior peak is the expected shape: rising while the
+//! remaining accumulator traffic halves per step, falling once stream
+//! count and the `R` live sums per column outrun the prefetchers and
+//! the register file.
+//!
+//! ## Porting to a new microarchitecture
+//!
+//! - Move the middle-band boundary with the data cache:
+//!   `L1d_bytes / 8` cells (48 KiB L1d → 6144; 128 KiB → 16384).
+//! - Re-measure the wide arm before trusting `R = 8`: point the `_`
+//!   dispatch arm at each `block_pass::<R>` for
+//!   `R ∈ {1, 2, 4, 8, 16}` in turn and run the server-answer bench
+//!   at a wide shape (`scripts/bench.sh server_answer --backend simple`
+//!   at paper geometry), expecting a curve like the references above.
+//! - Never ship a blocked arm at sub-page stride (`4 · width` under
+//!   ~1–2 pages) without measuring it on the target: that is exactly
+//!   the configuration behind the Zen 4 collapse.
+//! - Re-tuning can never change an answer, only its speed: wrapping
+//!   `u32` addition is associative and commutative, and the unit
+//!   tests pin every arm against the naive loop bit for bit. Tune
+//!   freely.
 //!
 //! # Related files
 //!
