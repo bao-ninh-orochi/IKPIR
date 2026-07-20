@@ -724,8 +724,8 @@ fn compute_hint_parallel(
 /// Optimized setup for SimplePIR: same `(ServerParams, HintMaterial,
 /// Hint)`, computed across cores.
 ///
-/// Both heavy kernels fan out — [`sample_a_parallel`] for `A` and
-/// [`compute_hint_parallel`] for `H = Aᵀ·D` over the reshaped database
+/// Both heavy kernels fan out — `sample_a_parallel` (in `sampler.rs`) for
+/// `A` and `compute_hint_parallel` (above) for `H = Aᵀ·D` over the reshaped database
 /// — and both are bit-identical to their reference twins, so a server
 /// set up on this path is indistinguishable from one set up on
 /// [`IndexPirBackend::server_setup`].

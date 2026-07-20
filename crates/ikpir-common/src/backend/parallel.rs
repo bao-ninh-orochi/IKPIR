@@ -61,7 +61,7 @@ pub const SETUP_THREADS_ENV: &str = "IKPIR_SETUP_THREADS";
 /// The fan-out spawns **one thread per chunk**, and chunk count follows
 /// the requested worker count, not the machine. Without a ceiling, a
 /// mistyped `IKPIR_SETUP_THREADS=1000000` would ask
-/// [`par_chunks_mut`] for a million chunks of the keystream — the
+/// `par_chunks_mut` (below) for a million chunks of the keystream — the
 /// keystream partition's `unit` is only 64 words, so nothing else caps
 /// it — and the loop would issue ~10⁵ `spawn` calls before the first
 /// join, failing on thread exhaustion rather than on anything the
