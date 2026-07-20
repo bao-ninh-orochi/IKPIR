@@ -81,6 +81,7 @@
 pub mod frodo;
 pub(crate) mod matvec;
 pub mod parallel;
+pub(crate) mod patch;
 pub mod simple;
 pub use frodo::{FrodoConfig, FrodoPirBackend};
 pub use simple::{SimpleConfig, SimplePirBackend};
@@ -207,6 +208,13 @@ pub trait IndexPirBackend {
 /// database `ω` grows with the database size, so only the entry-level
 /// patch keeps the per-mutation cost independent of the database size.
 /// The default is [`EntryLevel`](Self::EntryLevel).
+///
+/// Realizing that asymptotic advantage as wall-clock takes care with the
+/// execution order — `H` is row-major, so patching one column at a time
+/// sweeps the whole hint once *per touched column*. Both backends
+/// therefore run the entry-level patch through the crate-internal
+/// `backend::patch::TouchedRuns`, which inverts the loops and coalesces
+/// touched columns into contiguous runs; see its module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HintPatchMode {
     /// Dense per-row rank-one update, `Θ(n·ω)` per touched row — the

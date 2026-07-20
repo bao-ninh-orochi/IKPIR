@@ -25,6 +25,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
 | `src/backend/matvec.rs` | `matvec_accumulate` — shared width-adaptive register-blocked `acc += qᵀ·D` kernel used by every online hot loop (`server_answer`, `client_decode` cold path, `compute_c`) in both backends; bit-exact vs the naive loop, no explicit SIMD/threads |
+| `src/backend/patch.rs` | `TouchedRuns` — the entry-level hint patch's inner loop, shared by both backends: coalesces one row's touched hint columns into contiguous runs, then applies `H[k, c] += A[row, k] · Δ_c` with `k` outermost, sweeping the hint once instead of once per touched column |
 | `src/backend/parallel.rs` | `setup_threads` / `balanced_chunk_len` / `par_chunks_mut` — `std::thread::scope` fan-out behind the optimized setup path; no dependency, static disjoint-output partition, worker count via `IKPIR_SETUP_THREADS` |
 | `src/backend/frodo/arith.rs` | `round_p_to_q` / `round_q_to_p` — plaintext ↔ ciphertext modulus conversion |
 | `src/backend/frodo/sampler.rs` | `sample_a` (LWE public matrix) + `sample_ternary_into` (LWE secret / error sampling) |
@@ -102,6 +103,23 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
   cost — the two mutation-phase columns of the paper's asymptotic
   table. `patch_slot_c` (Phase-C maintenance) is deliberately
   mode-independent: it is inherently sparse and identical either way.
+
+  **Execution order is what makes the entry-level cost real.** `H` is
+  row-major, so the literal reading of `H[k, c] += A[row, k] · Δ_c` —
+  one touched column at a time, `k` inside — strides `hint_row_width`
+  per step and drags `lwe_dim` distinct cache lines through the machine
+  *per touched column*: `t` columns, `t` full passes over a
+  multi-megabyte hint. Written that way the mode lost in wall-clock to
+  the dense row-level pass it beats on paper (measured: 1.4–4× slower).
+  `backend/patch.rs::TouchedRuns` inverts it — `k` outermost, touched
+  columns coalesced into contiguous runs inside — so the patch sweeps
+  the hint once with the same slice-shaped kernel the row-level pass
+  uses, restricted to the touched part of each row. Same arithmetic,
+  same bits; entry-level now runs 2.3–3.3× *faster* than row-level at
+  the dev geometry, in the direction the asymptotics predict. A slot's
+  cells are contiguous by construction (`cell_offset = slot ·
+  cells_per_slot + c`, and SimplePIR's reshape translation is affine in
+  the offset), which is what makes the runs long enough to matter.
 
 - **No I/O, no serialisation in the wire types** — bundles are plain
   data crossing process boundaries by value within tests and examples.
@@ -234,6 +252,7 @@ composition.
 | Shared error variants | `error.rs::IkpirError` |
 | Round-trip cell-modulus conversion | `backend/frodo/arith.rs` (also duplicated in `backend/simple/arith.rs`) |
 | Online matvec hot loop (`acc += qᵀ·D`) | `backend/matvec.rs::matvec_accumulate` — shared by both backends (unlike `arith.rs`, deliberately *not* duplicated: it is backend-agnostic linear algebra whose blocking tunables must never diverge) |
+| Entry-level patch inner loop | `backend/patch.rs::TouchedRuns` — shared for the same reason as `matvec.rs`; the backends differ only in the `column_of` closure they pass (identity for FrodoPIR, the reshape translation for SimplePIR) |
 | Optimized (multi-threaded) setup | `backend/mod.rs::ParallelSetupBackend` (contract) → `compute_hint_parallel` in each `backend/*/backend.rs` + `sample_a_parallel` in each `backend/*/sampler.rs`; fan-out in `backend/parallel.rs` |
 | Worker count for the optimized setup | `backend/parallel.rs::setup_threads` — `IKPIR_SETUP_THREADS`, else `available_parallelism()`; set to `1` to force the reference schedule when bisecting |
 | LWE sampling (FrodoPIR) | `backend/frodo/sampler.rs` (`sample_a`, `sample_a_parallel`, `sample_ternary_into`) |

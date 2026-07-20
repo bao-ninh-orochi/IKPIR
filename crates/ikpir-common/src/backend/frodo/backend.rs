@@ -45,8 +45,8 @@ use super::{
 };
 use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
-    parallel, BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend,
-    ParallelSetupBackend, PrecomputingPirBackend,
+    parallel, patch::TouchedRuns, BackendWireSize, HintPatchMode, IncrementalPirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend,
 };
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
@@ -804,17 +804,18 @@ fn apply_patch(
 /// or written. No `aik == 0` shortcut — see [`compute_hint`] for why `A`
 /// carries no exploitable sparsity.
 ///
-/// Note the access pattern: `idx = k · row_width + cell` strides one
-/// hint row per step, so a single touched cell walks `lwe_dim` distinct
-/// cache lines. The arithmetic is `bucket_size×` cheaper than
-/// [`apply_patch_row_level`], but that mode's contiguous walk recovers
-/// part of the gap in practice.
+/// The execution order is [`TouchedRuns`]': `k` (the hint row) outside,
+/// the row's touched columns — coalesced into contiguous runs — inside,
+/// so the patch sweeps the hint once. FrodoPIR patches column
+/// `cell_offset` directly; there is no reshape to translate through.
 ///
 /// # Complexity
 ///
 /// `O(touched_cells · lwe_dim)` wrapping multiply-add — `Θ(n)` per
 /// touched cell, the paper's entry-level cost. Vastly cheaper than a
-/// full `compute_hint` when the mutation count is small.
+/// full `compute_hint` when the mutation count is small, and
+/// `bucket_size×` cheaper than [`apply_patch_row_level`] on the same
+/// batch.
 fn apply_patch_entry_level(
     a: &[u32],
     lwe_dim: u32,
@@ -828,29 +829,27 @@ fn apply_patch_entry_level(
     debug_assert_eq!(a.len(), (n_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * row_width_us);
 
+    // Hoisted out of the row loop: a batch of mutations allocates at most
+    // once, however many rows it touches.
+    let mut touched = TouchedRuns::new();
+
     for (row_idx, cells) in row_deltas {
         debug_assert!(
             (*row_idx as usize) < n_rows as usize,
             "row_idx {row_idx} out of range (n_rows={n_rows})",
         );
-        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
-
-        for (cell_offset, delta) in cells {
+        touched.rebuild(cells, |off| {
             debug_assert!(
-                (*cell_offset as usize) < row_width_us,
-                "cell_offset {cell_offset} out of range (row_width={row_width})",
+                (off as usize) < row_width_us,
+                "cell_offset {off} out of range (row_width={row_width})",
             );
-            if *delta == 0 {
-                continue;
-            }
-            let delta_u32 = *delta as u32;
-            let cell_us = *cell_offset as usize;
-
-            for (k, &aik) in a_row.iter().enumerate() {
-                let idx = k * row_width_us + cell_us;
-                hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
-            }
+            off as usize
+        });
+        if touched.is_empty() {
+            continue;
         }
+        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
+        touched.apply(a_row, hint, row_width_us);
     }
 }
 
