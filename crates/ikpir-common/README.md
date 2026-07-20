@@ -24,7 +24,7 @@ under all three paths.
 
 | Module | Items |
 |---|---|
-| `backend` | `IndexPirBackend`, `IncrementalPirBackend`, `PrecomputingPirBackend`, `BackendWireSize` traits + the `HintPatchMode` realization selector |
+| `backend` | `IndexPirBackend`, `IncrementalPirBackend`, `PrecomputingPirBackend`, `ParallelSetupBackend`, `BackendWireSize` traits + the `HintPatchMode` realization selector |
 | `backend::frodo` | `FrodoPirBackend`, `FrodoConfig`, `FrodoParams`, plus the associated `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` types (ternary LWE, tall-skinny `n_rows × row_width` matrix; default `lwe_dim = 1566`) |
 | `backend::simple` | `SimplePirBackend`, `SimpleConfig`, `SimpleParams`, plus the associated `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` types (discrete-Gaussian LWE with σ = 6.4, internal `√N × √N` reshape; default `lwe_dim = 1275`) |
 | `wire` | `ServerSetupBundle`, `PirQueryBundle`, `PirResponseBundle`, `HintDeltaBundle`, `SegmentRowDeltas` type alias |
@@ -48,17 +48,23 @@ IndexPirBackend (mandatory)
 │   client_precompute_decodes (Phase C: sᵀ·H)
 │   prepared_slot_count / in_flight_slot_count
 │
+├── ParallelSetupBackend            (same setup results, across cores)
+│   server_setup_parallel / expand_hint_material_parallel / client_setup_parallel
+│   (bit-identical to the single-threaded twins for the same seed; the
+│    base trait stays single-threaded because the paper reports that
+│    regime and `benches/server_setup.rs` times it)
+│
 └── BackendWireSize                 (byte-size accounting)
     query_byte_size / response_byte_size / hint_byte_size / server_params_byte_size
 ```
 
-Both `FrodoPirBackend` and `SimplePirBackend` implement all four traits.
+Both `FrodoPirBackend` and `SimplePirBackend` implement all five traits.
 
 ## Implementing a new backend
 
 Implement `IndexPirBackend` (mandatory) and optionally
-`IncrementalPirBackend`, `PrecomputingPirBackend`, `BackendWireSize`.
-Minimal correctness contract:
+`IncrementalPirBackend`, `PrecomputingPirBackend`, `ParallelSetupBackend`,
+`BackendWireSize`. Minimal correctness contract:
 
 ```text
 client_decode(server_answer(client_query(state, row)))
