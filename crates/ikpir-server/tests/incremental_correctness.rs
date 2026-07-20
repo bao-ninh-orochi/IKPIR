@@ -76,37 +76,46 @@ fn mutation_log_drained_inner<S>(
 ) where
     S: IndexScheme + SchemeMeta + 'static,
 {
+    // The insert that *reports* `TableFull` is the one under test — a
+    // table that rejected one key may still accept another (cuckoo kick
+    // victims are chosen at random), so probing with some extra key would
+    // be a coin flip. Snapshot the epoch after each success instead, and
+    // let the fill loop's own failure be the failed insert.
+    let mut epoch_before_fail = server.epoch();
+    let mut hit_full = false;
     for k in 0u32..2000 {
         match server.insert(&k.to_le_bytes(), &[k as u8]) {
-            Ok(_) => {}
-            Err(IkpirError::TableFull) => break,
+            Ok(_) => epoch_before_fail = server.epoch(),
+            Err(IkpirError::TableFull) => {
+                hit_full = true;
+                break;
+            }
             Err(other) => panic!("unexpected {other:?}"),
         }
     }
-    let epoch_after_fill = server.epoch();
-
-    // A second failed insert must NOT advance the epoch.
-    let err = match server.insert(&999_999u32.to_le_bytes(), &[0]) {
-        Err(e) => e,
-        Ok(_) => panic!("expected TableFull, got Ok"),
-    };
-    assert!(matches!(err, IkpirError::TableFull));
+    assert!(hit_full, "fixture must reach TableFull within 2000 inserts");
     assert_eq!(
         server.epoch(),
-        epoch_after_fill,
+        epoch_before_fail,
         "failed insert must not advance epoch (mutation log leaked)"
     );
 
     // Verify: hints before and after a failing insert must be identical.
+    // Same shape — the snapshot tracks the last success, so the compare
+    // straddles exactly the failing insert.
+    let mut hints_before = fresh.setup().hints;
+    let mut hit_full = false;
     for k in 0u32..2000 {
         match fresh.insert(&k.to_le_bytes(), &[k as u8]) {
-            Ok(_) => {}
-            Err(IkpirError::TableFull) => break,
+            Ok(_) => hints_before = fresh.setup().hints,
+            Err(IkpirError::TableFull) => {
+                hit_full = true;
+                break;
+            }
             Err(other) => panic!("unexpected {other:?}"),
         }
     }
-    let hints_before = fresh.setup().hints;
-    let _ = fresh.insert(&999_999u32.to_le_bytes(), &[0]); // intentional failure
+    assert!(hit_full, "fixture must reach TableFull within 2000 inserts");
     let hints_after = fresh.setup().hints;
     assert_eq!(
         hints_before, hints_after,
@@ -125,23 +134,29 @@ where
     S: IndexScheme + SchemeMeta + 'static,
 {
     // Fill to TableFull, remembering the last key that was inserted OK.
+    // The failing insert is the fill loop's own — see
+    // `mutation_log_drained_inner` for why probing with an extra key
+    // would be a coin flip.
     let mut last_ok: Option<u32> = None;
+    let mut epoch_full = server.epoch();
+    let mut hit_full = false;
     for k in 0u32..2000 {
         match server.insert(&k.to_le_bytes(), &[k as u8]) {
-            Ok(_) => last_ok = Some(k),
-            Err(IkpirError::TableFull) => break,
+            Ok(_) => {
+                last_ok = Some(k);
+                epoch_full = server.epoch();
+            }
+            Err(IkpirError::TableFull) => {
+                hit_full = true;
+                break;
+            }
             Err(other) => panic!("unexpected {other:?}"),
         }
     }
+    assert!(hit_full, "fixture must reach TableFull within 2000 inserts");
     let key = last_ok.expect("at least one insert must succeed before TableFull");
-    let epoch_full = server.epoch();
 
-    // A further insert must fail and must NOT advance the epoch.
-    match server.insert(&999_999u32.to_le_bytes(), &[0]) {
-        Err(IkpirError::TableFull) => {}
-        Err(other) => panic!("expected TableFull, got {other:?}"),
-        Ok(_) => panic!("expected TableFull, got Ok"),
-    }
+    // That failed insert must NOT have advanced the epoch.
     assert_eq!(
         server.epoch(),
         epoch_full,
