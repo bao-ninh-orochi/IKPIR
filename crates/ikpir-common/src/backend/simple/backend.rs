@@ -605,12 +605,12 @@ impl PrecomputingPirBackend for SimplePirBackend {
 /// row_width)` shape so the flat `db` slice is read sequentially per
 /// original row. Each original row contributes to a `row_width`-wide
 /// sub-segment of one reshape row, starting at `off_within = (r % k) *
-/// row_width`. The `aik == 0` early-exit is a sparsity shortcut on the
-/// public matrix `A` (safe to branch on since `A` is public). With `A`
-/// sampled uniformly over `Z_q` via ChaCha20, this branch fires only
-/// when ChaCha20 produces a literal zero `u32` — i.e. ~2⁻³² of cells,
-/// so the early-exit is effectively dead code on the hot path but
-/// retained for parity with FrodoPIR's `compute_hint`.
+/// row_width`.
+///
+/// There is deliberately **no `aik == 0` shortcut**: `A` is uniform over
+/// `Z_q` via ChaCha20, so a zero cell occurs with probability `2⁻³²` and
+/// the test can never pay for itself. FrodoPIR's `compute_hint` omits it
+/// on the same grounds, so the two backends stay comparable.
 ///
 /// # Complexity
 ///
@@ -639,9 +639,6 @@ fn compute_hint(
         let d_row = &db[r * row_width_us..(r + 1) * row_width_us];
         for k_idx in 0..lwe_dim_us {
             let aik = a_row[k_idx];
-            if aik == 0 {
-                continue;
-            }
             let h_row = &mut h[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
             for j in 0..row_width_us {
                 h_row[off_within + j] =
@@ -716,9 +713,6 @@ fn compute_hint_parallel(
                 &a[reshape_row * lwe_dim_us + k0..reshape_row * lwe_dim_us + k0 + band_rows];
             let d_row = &db[r * row_width_us..(r + 1) * row_width_us];
             for (k_idx, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
                 let h_row =
                     &mut band[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
                 for j in 0..row_width_us {
@@ -1013,8 +1007,8 @@ fn apply_patch(
 /// `(reshape_row, reshape_off) = translate(orig_row, orig_off, k,
 /// row_width)`. Iterates touched `(orig_row, orig_off, Δ)` triples and
 /// slides `A`'s `reshape_row`-th column against the hint column at
-/// `reshape_off`. The `aik == 0` early-exit is a sparsity optimisation
-/// safe under public `A`.
+/// `reshape_off`. No `aik == 0` shortcut — see [`compute_hint`] for why
+/// `A` carries no exploitable sparsity.
 ///
 /// # Complexity
 ///
@@ -1059,9 +1053,6 @@ fn apply_patch_entry_level(
             let cell_us = reshape_off as usize;
 
             for (k_idx, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
                 let idx = k_idx * reshape_row_width_us + cell_us;
                 hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
             }
@@ -1083,10 +1074,7 @@ fn apply_patch_entry_level(
 /// columns), and applied as
 /// `H[k_idx, ·] += A[reshape_row, k_idx] · δ[·] mod 2³²` across the
 /// entire hint width. `BTreeMap` keeps the update order deterministic.
-/// The `aik == 0` early-exit matches [`apply_patch_entry_level`] so the
-/// two realizations share the same micro-optimisation policy (on the
-/// uniform-`Z_q` `A` it fires with probability `2⁻³²` — kept for parity
-/// with FrodoPIR).
+/// No `aik == 0` shortcut — see [`compute_hint`].
 ///
 /// # Complexity
 ///
@@ -1136,9 +1124,6 @@ fn apply_patch_row_level(
         let a_row =
             &a[(*reshape_row as usize) * lwe_dim_us..(*reshape_row as usize + 1) * lwe_dim_us];
         for (k_idx, &aik) in a_row.iter().enumerate() {
-            if aik == 0 {
-                continue;
-            }
             let h_row = &mut hint[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
             for (h, &d) in h_row.iter_mut().zip(dense.iter()) {
                 *h = h.wrapping_add(aik.wrapping_mul(d));

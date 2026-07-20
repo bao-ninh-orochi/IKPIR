@@ -453,9 +453,13 @@ impl PrecomputingPirBackend for FrodoPirBackend {
 /// # Rationale
 ///
 /// Loop nest is `i, k, j` to keep `A` and `D` row accesses sequential
-/// per `i` — the inner-loop pattern LLVM auto-vectorises. The
-/// `aik == 0` early-exit is a sparsity shortcut on the random ternary
-/// `A` (about 1/3 of cells); harmless to timing since `A` is public.
+/// per `i` — the inner-loop pattern LLVM auto-vectorises.
+///
+/// There is deliberately **no `aik == 0` shortcut**. `A` is uniform over
+/// `Z_{2³²}` (`sample_a` draws raw `next_u32` words), so a zero cell
+/// occurs with probability `2⁻³²` and skipping it can never pay for the
+/// test. The ternary distribution in this backend belongs to the LWE
+/// *secret and error* (`sample_ternary_into`), not to `A`.
 ///
 /// # Complexity
 ///
@@ -470,9 +474,6 @@ fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32
         let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
         for k in 0..lwe_dim_us {
             let aik = a_row[k];
-            if aik == 0 {
-                continue;
-            }
             let h_row = &mut h[k * row_width_us..(k + 1) * row_width_us];
             for j in 0..row_width_us {
                 h_row[j] = h_row[j].wrapping_add(aik.wrapping_mul(d_row[j]));
@@ -545,9 +546,6 @@ fn compute_hint_parallel(
             let a_row = &a[i * lwe_dim_us + k0..i * lwe_dim_us + k0 + band_rows];
             let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
             for (k, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
                 let h_row = &mut band[k * row_width_us..(k + 1) * row_width_us];
                 for j in 0..row_width_us {
                     h_row[j] = h_row[j].wrapping_add(aik.wrapping_mul(d_row[j]));
@@ -803,8 +801,14 @@ fn apply_patch(
 /// Math: `H[k, cell] += A[row_idx, k] · Δ mod 2³²`. Iterates touched
 /// `(row, cell, Δ)` triples and slides `A`'s `row_idx`-th column
 /// against the hint column at `cell`; untouched columns are never read
-/// or written. The `aik == 0` early-exit captures sparsity in the
-/// random ternary `A` (public, so the branch leaks nothing secret).
+/// or written. No `aik == 0` shortcut — see [`compute_hint`] for why `A`
+/// carries no exploitable sparsity.
+///
+/// Note the access pattern: `idx = k · row_width + cell` strides one
+/// hint row per step, so a single touched cell walks `lwe_dim` distinct
+/// cache lines. The arithmetic is `bucket_size×` cheaper than
+/// [`apply_patch_row_level`], but that mode's contiguous walk recovers
+/// part of the gap in practice.
 ///
 /// # Complexity
 ///
@@ -843,9 +847,6 @@ fn apply_patch_entry_level(
             let cell_us = *cell_offset as usize;
 
             for (k, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
                 let idx = k * row_width_us + cell_us;
                 hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
             }
@@ -864,10 +865,8 @@ fn apply_patch_entry_level(
 /// `H[k, ·] += A[row_idx, k] · δ[·] mod 2³²` across the entire hint
 /// width. Columns with `δ = 0` are still multiplied — that is the
 /// point: this is the row-granular patch of SimplePIR, kept as the
-/// baseline the entry-level sharpening is measured against. The
-/// `aik == 0` early-exit matches [`apply_patch_entry_level`] so the two
-/// realizations share the same micro-optimisation policy on the public
-/// ternary `A`.
+/// baseline the entry-level sharpening is measured against. No
+/// `aik == 0` shortcut — see [`compute_hint`].
 ///
 /// # Complexity
 ///
@@ -904,9 +903,6 @@ fn apply_patch_row_level(
         let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
 
         for (k, &aik) in a_row.iter().enumerate() {
-            if aik == 0 {
-                continue;
-            }
             let h_row = &mut hint[k * row_width_us..(k + 1) * row_width_us];
             for (h, &d) in h_row.iter_mut().zip(delta_row.iter()) {
                 *h = h.wrapping_add(aik.wrapping_mul(d));
