@@ -359,24 +359,30 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         let row_width = self.params.bucket_size * self.params.cells_per_slot();
         let pb = self.params.plaintext_bits;
         let seg_cells = segment_size as usize * row_width as usize;
-        // Snapshot to avoid a borrow conflict with self.backend_params / self.hints writes.
-        let cells: Vec<u32> = self.store.as_cells().to_vec();
 
         let mut backend_params = Vec::with_capacity(arity);
         let mut backend_hint_material = Vec::with_capacity(arity);
         let mut hints = Vec::with_capacity(arity);
-        for j in 0..arity {
-            let start = j * seg_cells;
-            let (sp, mat, h) = setup(
-                &self.backend_config,
-                &cells[start..start + seg_cells],
-                segment_size,
-                row_width,
-                pb,
-            );
-            backend_params.push(sp);
-            backend_hint_material.push(Some(mat));
-            hints.push(h);
+        // Borrowed, never snapshotted: `self.store` and the three fields
+        // assigned below are disjoint places, so a shared borrow of the
+        // store cannot conflict with those writes. Scoped exactly as in
+        // `Self::build` so the borrow ends before `drain_mutations` takes
+        // `&mut self.store`.
+        {
+            let cells = self.store.as_cells();
+            for j in 0..arity {
+                let start = j * seg_cells;
+                let (sp, mat, h) = setup(
+                    &self.backend_config,
+                    &cells[start..start + seg_cells],
+                    segment_size,
+                    row_width,
+                    pb,
+                );
+                backend_params.push(sp);
+                backend_hint_material.push(Some(mat));
+                hints.push(h);
+            }
         }
         self.backend_params = backend_params;
         self.backend_hint_material = backend_hint_material;
