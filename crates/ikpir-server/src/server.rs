@@ -41,8 +41,31 @@ use segmented_cuckoo::{
 use crate::hint_patch::fold_mutations_into_row_deltas;
 use ikpir_common::{
     HintDeltaBundle, HintPatchMode, IkpirError, IncrementalPirBackend, IndexPirBackend,
-    PirQueryBundle, PirResponseBundle, ServerSetupBundle,
+    ParallelSetupBackend, PirQueryBundle, PirResponseBundle, ServerSetupBundle,
 };
+
+/// The per-segment setup primitive, as a function pointer.
+///
+/// # Purpose
+///
+/// [`IndexPirBackend::server_setup`] (the single-threaded reference)
+/// and [`ParallelSetupBackend::server_setup_parallel`] (the optimized
+/// twin) have identical signatures and, by the latter's equivalence
+/// contract, identical results. Passing one of them as a value lets
+/// [`IkpirServer::new`] / [`IkpirServer::full_rebuild`] and their
+/// `_parallel` counterparts share a single body, so the two paths
+/// cannot drift in how they slice segments or thread state.
+type SegmentSetup<B> = fn(
+    &<B as IndexPirBackend>::Config,
+    &[u32],
+    u32,
+    u32,
+    u32,
+) -> (
+    <B as IndexPirBackend>::ServerParams,
+    <B as IndexPirBackend>::HintMaterial,
+    <B as IndexPirBackend>::Hint,
+);
 
 /// Server-side IKPIR engine, generic over the SCF scheme `S` and PIR
 /// backend `B`.
@@ -134,7 +157,20 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
     /// per-segment seed sample. This is the hot path during cold start;
     /// for FrodoPIR with `lwe_dim = 1566` and a 2-ary 16k-bucket store
     /// it dominates the first-query latency.
+    ///
+    /// Runs **single-threaded** — the regime the paper reports and the
+    /// one `benches/server_setup.rs` measures. Callers that only need
+    /// the resulting server, not an honest setup timing, should use
+    /// [`Self::new_parallel`] instead: same state, same bytes, across
+    /// all cores.
     pub fn new(store: CuckooKVStore<S>, backend_config: B::Config) -> Self {
+        Self::build(store, backend_config, B::server_setup)
+    }
+
+    /// Shared body of [`Self::new`] and [`Self::new_parallel`]:
+    /// slice the store into `arity` segments, run `setup` on each, and
+    /// arm the mutation log.
+    fn build(store: CuckooKVStore<S>, backend_config: B::Config, setup: SegmentSetup<B>) -> Self {
         let params = store.params();
         let arity = params.arity();
         let segment_size = params.segment_size();
@@ -149,7 +185,7 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
             let cells = store.as_cells();
             for j in 0..arity {
                 let start = j * seg_cells;
-                let (sp, mat, h) = B::server_setup(
+                let (sp, mat, h) = setup(
                     &backend_config,
                     &cells[start..start + seg_cells],
                     segment_size,
@@ -309,8 +345,15 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
     /// # Complexity
     ///
     /// Same as [`Self::new`]:
-    /// `O(arity × n_rows × lwe_dim × row_width)`.
+    /// `O(arity × n_rows × lwe_dim × row_width)`, single-threaded. See
+    /// [`Self::full_rebuild_parallel`] for the optimized twin.
     pub fn full_rebuild(&mut self) -> ServerSetupBundle<B> {
+        self.rebuild_with(B::server_setup)
+    }
+
+    /// Shared body of [`Self::full_rebuild`] and
+    /// [`Self::full_rebuild_parallel`].
+    fn rebuild_with(&mut self, setup: SegmentSetup<B>) -> ServerSetupBundle<B> {
         let arity = self.params.arity();
         let segment_size = self.params.segment_size();
         let row_width = self.params.bucket_size * self.params.cells_per_slot();
@@ -324,7 +367,7 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         let mut hints = Vec::with_capacity(arity);
         for j in 0..arity {
             let start = j * seg_cells;
-            let (sp, mat, h) = B::server_setup(
+            let (sp, mat, h) = setup(
                 &self.backend_config,
                 &cells[start..start + seg_cells],
                 segment_size,
@@ -582,6 +625,46 @@ where
         }
         self.epoch += 1;
         HintDeltaBundle::new(self.epoch, row_deltas)
+    }
+}
+
+/// Optimized (multi-threaded) setup entry points, available for every
+/// backend implementing [`ParallelSetupBackend`] — both shipped LWE
+/// backends do.
+///
+/// # Purpose
+///
+/// Setup is `Θ(arity · n_rows · lwe_dim · row_width)`: minutes to hours
+/// at paper scale, and by far the largest cost of *reaching* the state
+/// most benchmarks want to measure. These twins of [`IkpirServer::new`]
+/// and [`IkpirServer::full_rebuild`] compute the identical state across
+/// all cores.
+///
+/// # Constraints
+///
+/// The resulting server is **indistinguishable** from one built by the
+/// reference path — same `ServerParams`, same `HintMaterial`, same
+/// `Hint`, same epoch, same wire bytes (see the equivalence contract on
+/// [`ParallelSetupBackend`]). The only thing that changes is how long
+/// the call took, so:
+///
+/// - `benches/server_setup.rs`, which *reports* setup cost, must keep
+///   using [`IkpirServer::new`] / [`IndexPirBackend::server_setup`];
+/// - every other bench preamble should use these.
+///
+/// Worker count follows `IKPIR_SETUP_THREADS`, else the machine's
+/// available parallelism.
+impl<S: IndexScheme + SchemeMeta, B: ParallelSetupBackend> IkpirServer<S, B> {
+    /// Multi-threaded twin of [`Self::new`] — identical resulting
+    /// server, computed across cores.
+    pub fn new_parallel(store: CuckooKVStore<S>, backend_config: B::Config) -> Self {
+        Self::build(store, backend_config, B::server_setup_parallel)
+    }
+
+    /// Multi-threaded twin of [`Self::full_rebuild`] — identical
+    /// resulting state and bundle, computed across cores.
+    pub fn full_rebuild_parallel(&mut self) -> ServerSetupBundle<B> {
+        self.rebuild_with(B::server_setup_parallel)
     }
 }
 

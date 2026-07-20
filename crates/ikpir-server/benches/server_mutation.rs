@@ -35,7 +35,7 @@ mod helpers;
 use helpers::{Backend, CloneStore, PatchMode};
 use ikpir_server::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer, IncrementalPirBackend,
-    IndexPirBackend, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, SimpleConfig, SimplePirBackend,
 };
 use segmented_cuckoo::{
     CuckooParams, Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme,
@@ -129,7 +129,7 @@ fn run_kind<S, B>(
 ) -> KindResult
 where
     S: CloneStore,
-    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + BackendWireSize,
 {
     let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
@@ -139,7 +139,7 @@ where
     // 2_500 budget the populate helper used so the timed insert loop runs with
     // the same cuckoo-eviction headroom as the populate phase.
     store.set_max_kicks(2_500);
-    let mut server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
+    let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store, make_config());
     server.set_hint_patch_mode(mode.to_hint_patch_mode());
 
     let mut delta_bytes_total = 0usize;
@@ -191,7 +191,7 @@ fn run_one<S, B>(
     make_config: impl Fn() -> B::Config,
 ) where
     S: CloneStore,
-    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + BackendWireSize,
 {
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();

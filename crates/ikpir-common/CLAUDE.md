@@ -25,6 +25,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
 | `src/backend/matvec.rs` | `matvec_accumulate` — shared width-adaptive register-blocked `acc += qᵀ·D` kernel used by every online hot loop (`server_answer`, `client_decode` cold path, `compute_c`) in both backends; bit-exact vs the naive loop, no explicit SIMD/threads |
+| `src/backend/parallel.rs` | `setup_threads` / `balanced_chunk_len` / `par_chunks_mut` — `std::thread::scope` fan-out behind the optimized setup path; no dependency, static disjoint-output partition, worker count via `IKPIR_SETUP_THREADS` |
 | `src/backend/frodo/arith.rs` | `round_p_to_q` / `round_q_to_p` — plaintext ↔ ciphertext modulus conversion |
 | `src/backend/frodo/sampler.rs` | `sample_a` (LWE public matrix) + `sample_ternary_into` (LWE secret / error sampling) |
 | `src/backend/simple/mod.rs` | Re-exports the SimplePIR backend's public surface + math summary |
@@ -55,10 +56,38 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
   is optional and adds `server_patch_hint / client_patch_state` for
   full-rebuild-free DB mutations. `PrecomputingPirBackend` is optional
   and adds Phase B / Phase C precomputation for amortising per-query
-  LWE work (FrodoPIR Fig. 1). `BackendWireSize` is optional and reports
-  per-type byte sizes for wire-size benches. A backend that doesn't
-  implement an optional extension is simply unavailable on the
-  corresponding code path.
+  LWE work (FrodoPIR Fig. 1). `ParallelSetupBackend` is optional and
+  adds a multi-threaded realization of the three setup entry points.
+  `BackendWireSize` is optional and reports per-type byte sizes for
+  wire-size benches. A backend that doesn't implement an optional
+  extension is simply unavailable on the corresponding code path.
+
+- **Two setup implementations, one result** — setup is
+  `Θ(n_rows · lwe_dim · row_width)`, minutes to hours at paper scale,
+  and it is the price of *reaching* the state most benchmarks want to
+  measure rather than anything they measure. So the base trait's
+  `server_setup` / `expand_hint_material` / `client_setup` stay
+  single-threaded and non-SIMD — the regime the paper reports and
+  `benches/server_setup.rs` times — and `ParallelSetupBackend` supplies
+  `server_setup_parallel` / `expand_hint_material_parallel` /
+  `client_setup_parallel` alongside them. Both shipped backends
+  implement it; measured speedup on 8 cores is 4.8× (FrodoPIR) and
+  6.3× (SimplePIR).
+
+  The optimized path is **bit-identical, not merely equivalent**, and
+  by construction rather than by argument: it partitions only the
+  *output* — disjoint bands of `H` rows, disjoint runs of the ChaCha20
+  keystream (`set_word_pos`) — so each output cell still accumulates
+  the same terms in the same order. That is what lets a server built
+  on one path interoperate with a client built on the other, which
+  `ikpir-server/tests/parallel_setup_equivalence.rs` pins for every
+  combination. Threading is `std::thread::scope`: the partition is
+  already balanced, so a work-stealing runtime would buy nothing and
+  cost a dependency in a crypto crate.
+
+  The schedule depends only on public shape and the core count, never
+  on cell values, so the parallel path inherits the base trait's
+  side-channel posture.
 
 - **Two hint-patch realizations, one wire format** — both
   `IncrementalPirBackend` methods take a `HintPatchMode` selecting the
@@ -127,6 +156,11 @@ IndexPirBackend (mandatory)
 │   prepared_slot_count(state) -> usize
 │   in_flight_slot_count(state) -> usize
 │
+├── ParallelSetupBackend        — same results, across cores
+│   server_setup_parallel(config, db, n_rows, row_width, plaintext_bits)
+│   expand_hint_material_parallel(params) -> HintMaterial
+│   client_setup_parallel(params, hint) -> ClientState
+│
 └── BackendWireSize
     query_byte_size(q) / response_byte_size(r) / hint_byte_size(h) / server_params_byte_size(p)
 ```
@@ -143,7 +177,11 @@ determinism contract on `expand_hint_material` is load-bearing — the
 server and client both rely on the same seed reproducing the same `A`
 bit-for-bit.
 
-Both `FrodoPirBackend` and `SimplePirBackend` implement all four traits.
+`expand_hint_material_parallel` sits under the *same* determinism
+contract, and across the two methods: whichever path expanded `A` last,
+the bytes are the same, so server and client may pick independently.
+
+Both `FrodoPirBackend` and `SimplePirBackend` implement all five traits.
 They are drop-in alternatives at the `B: IndexPirBackend` type parameter
 on `IkpirServer<S, B>` / `IkpirClient<B>`. The per-bench `--backend
 frodo|simple` flag (default `frodo`) selects between them at runtime;
@@ -187,7 +225,7 @@ composition.
 
 | Task | Where to look |
 |---|---|
-| Backend trait contract | `backend/mod.rs::IndexPirBackend` + the three extension traits |
+| Backend trait contract | `backend/mod.rs::IndexPirBackend` + the four extension traits |
 | Max safe `plaintext_bits` for a geometry | `pir_params.rs` (library) / `examples/max_plaintext_bits.rs` (CLI); empirical validation via the `#[ignore]`d `noise_margin` tests in both `backend/*/backend.rs` |
 | FrodoPIR config knobs | `backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
 | SimplePIR config knobs | `backend/simple/params.rs::SimpleConfig` (`lwe_dim`, `sigma`) |
@@ -196,8 +234,10 @@ composition.
 | Shared error variants | `error.rs::IkpirError` |
 | Round-trip cell-modulus conversion | `backend/frodo/arith.rs` (also duplicated in `backend/simple/arith.rs`) |
 | Online matvec hot loop (`acc += qᵀ·D`) | `backend/matvec.rs::matvec_accumulate` — shared by both backends (unlike `arith.rs`, deliberately *not* duplicated: it is backend-agnostic linear algebra whose blocking tunables must never diverge) |
-| LWE sampling (FrodoPIR) | `backend/frodo/sampler.rs` (`sample_a`, `sample_ternary_into`) |
-| LWE sampling (SimplePIR) | `backend/simple/sampler.rs` (`sample_a`, `sample_uniform_zq_into`, `sample_discrete_gaussian_into`) |
+| Optimized (multi-threaded) setup | `backend/mod.rs::ParallelSetupBackend` (contract) → `compute_hint_parallel` in each `backend/*/backend.rs` + `sample_a_parallel` in each `backend/*/sampler.rs`; fan-out in `backend/parallel.rs` |
+| Worker count for the optimized setup | `backend/parallel.rs::setup_threads` — `IKPIR_SETUP_THREADS`, else `available_parallelism()`; set to `1` to force the reference schedule when bisecting |
+| LWE sampling (FrodoPIR) | `backend/frodo/sampler.rs` (`sample_a`, `sample_a_parallel`, `sample_ternary_into`) |
+| LWE sampling (SimplePIR) | `backend/simple/sampler.rs` (`sample_a`, `sample_a_parallel`, `sample_uniform_zq_into`, `sample_discrete_gaussian_into`) |
 | Cross-crate integration tests | `ikpir-server/tests/frodo_compose.rs` + `simple_compose.rs` exercise each backend end-to-end against `IkpirServer` |
 
 **Backend-author checklist** — a new `IndexPirBackend` impl must:
@@ -237,3 +277,12 @@ composition.
    little-endian byte size — no framing, no compression. **Do not
    include `HintMaterial`** in `server_params_byte_size`; it never
    travels on the wire.
+10. If implementing `ParallelSetupBackend`: the three `*_parallel`
+   methods must return what their reference twins would have returned
+   for the same seed — **bit-identical**, not just decode-equivalent.
+   Get that by partitioning the *output* only (disjoint hint bands,
+   disjoint keystream runs via `set_word_pos`) so accumulation order is
+   unchanged; never by a reduction tree. Keep the schedule a function of
+   public shape alone. Reuse `backend/parallel.rs` rather than spawning
+   threads directly, and keep a sequential fallback below a size
+   threshold so tiny unit-test shapes don't pay for thread spawn.

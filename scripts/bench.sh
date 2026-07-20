@@ -22,6 +22,17 @@
 #     --lwe-dim N                           (default: 1566 frodo / 1275 simple)
 #   server_setup and the mutation benches also take:
 #     --load-factor F      (default 0.90)
+#   server_setup also takes:
+#     --setup-impl I       reference | parallel              (default reference)
+#                          `reference` is the single-threaded, non-SIMD path the
+#                          paper reports, and the ONLY thing server_setup should
+#                          normally time. `parallel` times the byte-identical
+#                          multi-threaded twin that every OTHER bench already
+#                          uses in its untimed preamble — diagnostic, never a
+#                          paper number. The CSV's setup_mode column records it
+#                          (full_parallel / per_segment_parallel).
+#                          IKPIR_SETUP_THREADS caps the worker count everywhere;
+#                          set it to 1 to force the reference schedule.
 #   Mutation benches also take:
 #     --n-mutations N      (default: 1% of the table's slots — the paper's τ)
 #     --patch-mode M       entry | row | entry,row           (default entry,row)

@@ -1,6 +1,16 @@
 //! **Intent:** Measure server-side setup cost (deriving matrix A from seed
 //! and computing the hint matrix) across both backends (FrodoPIR / SimplePIR).
 //!
+//! **This is the one bench that times setup**, so it is also the one bench
+//! that must run setup on the *reference* (single-threaded, non-SIMD)
+//! implementation — the paper's reported regime. Every other PIR bench builds
+//! its server and client through `IkpirServer::new_parallel` /
+//! `IkpirClient::from_setup_parallel`, which produce byte-identical state
+//! across all cores; setup is preamble there, never a measurement.
+//! `--setup-impl parallel` opts *this* bench into that optimized path too, to
+//! quantify the speedup — it is never the default, and the CSV always records
+//! which implementation produced the row.
+//!
 //! **Method:** Two interchangeable timing paths producing the *same*
 //! single-threaded, non-SIMD setup number (the paper's reported regime):
 //!
@@ -29,7 +39,8 @@
 //! (default 0.90 — matches `server_mutation`, the bench this one is the
 //! static baseline for; setup time itself is fill-independent), `--trials`,
 //! `--warmup`, `--estimate` (time one segment × arity instead of the full
-//! `IkpirServer::new`; default off = full ground truth).
+//! `IkpirServer::new`; default off = full ground truth), `--setup-impl`
+//! (`reference` | `parallel`, default `reference`).
 //!
 //! **Output:** `results/ikpir_server_setup.csv`
 //! Columns: backend, arity, num_buckets, bucket_size, value_bits, plaintext_bits,
@@ -42,10 +53,15 @@
 //! single-threaded time** in every row — measured directly on the full path,
 //! and the `arity ×` one-segment estimate on the `--estimate` path — so
 //! existing analyses read the right number unchanged. The two trailing
-//! columns are for traceability: `setup_mode` is `full|per_segment`, and
-//! `measured_ms` is the raw per-call time *before* the `arity ×` scaling
-//! (equals `mean_setup_ms` on the full path; the one-segment time on the
-//! estimate path).
+//! columns are for traceability: `setup_mode` is
+//! `full|per_segment|full_parallel|per_segment_parallel` (which timing path ×
+//! which setup implementation), and `measured_ms` is the raw per-call time
+//! *before* the `arity ×` scaling (equals `mean_setup_ms` on the full path;
+//! the one-segment time on the estimate path).
+//!
+//! A `*_parallel` row is **not** a paper number: the geometry columns still
+//! describe the same configuration, but `mean_setup_ms` is then wall-clock on
+//! `IKPIR_SETUP_THREADS` (default: all) cores, not the single-threaded cost.
 //!
 //! `db_rows` / `db_cols` report the per-segment PIR matrix shape **after** any
 //! backend-specific reshape. For FrodoPIR this is `(segment_rows, row_width)`;
@@ -56,7 +72,7 @@ mod helpers;
 use helpers::{Backend, CloneStore};
 use ikpir_server::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirServer, IncrementalPirBackend,
-    IndexPirBackend, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, SimpleConfig, SimplePirBackend,
 };
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
 use std::io::Write;
@@ -67,6 +83,24 @@ const HEADER: &str = "backend,arity,num_buckets,bucket_size,value_bits,plaintext
     setup_bundle_bytes,hint_bytes_per_segment,server_params_bytes_per_segment,\
     cells_per_slot,row_width,segment_rows,db_rows,db_cols,load_factor,\
     setup_mode,measured_ms";
+
+/// Which realization of the setup phase to time.
+///
+/// The two produce byte-identical state (see `ParallelSetupBackend`);
+/// only the wall-clock differs. Keeping the choice explicit — and
+/// recording it in the CSV's `setup_mode` column — is what stops an
+/// accidentally-parallel run from being read as a paper number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SetupImpl {
+    /// `IndexPirBackend::server_setup` — single-threaded, non-SIMD.
+    /// **The paper's regime**, and the default.
+    Reference,
+    /// `ParallelSetupBackend::server_setup_parallel` — same output,
+    /// fanned out over `IKPIR_SETUP_THREADS` (default: all) cores.
+    /// Diagnostic only: quantifies what the other benches' preambles
+    /// save.
+    Parallel,
+}
 
 #[derive(clap::Parser)]
 #[command(
@@ -124,6 +158,14 @@ struct Cli {
     /// is exact and ~`arity×` faster. The store is still built (real `D`).
     #[arg(long, default_value_t = false)]
     estimate: bool,
+    /// Which setup implementation to time. `reference` (default) is the
+    /// single-threaded, non-SIMD path the paper reports. `parallel` times
+    /// the byte-identical multi-threaded twin that every *other* bench
+    /// uses in its (untimed) preamble — useful to quantify that saving,
+    /// never a paper number. The CSV's `setup_mode` column records the
+    /// choice as a `_parallel` suffix.
+    #[arg(long, value_enum, default_value_t = SetupImpl::Reference)]
+    setup_impl: SetupImpl,
 }
 
 fn effective_lwe_dim(cli: &Cli) -> u32 {
@@ -139,7 +181,7 @@ fn run_one<S, B>(
     make_config: impl Fn() -> B::Config,
 ) where
     S: CloneStore,
-    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + BackendWireSize,
 {
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
@@ -148,7 +190,13 @@ fn run_one<S, B>(
     let lwe_dim_eff = effective_lwe_dim(cli);
     let pb = cli.plaintext_bits;
 
-    let setup_mode_str = if cli.estimate { "per_segment" } else { "full" };
+    let parallel = cli.setup_impl == SetupImpl::Parallel;
+    let setup_mode_str = match (cli.estimate, parallel) {
+        (false, false) => "full",
+        (false, true) => "full_parallel",
+        (true, false) => "per_segment",
+        (true, true) => "per_segment_parallel",
+    };
 
     // Both paths build the full store: the full path feeds it to
     // `IkpirServer::new`; the estimate path slices segment 0's real `D` out of
@@ -180,7 +228,11 @@ fn run_one<S, B>(
             let store = S::clone_from_cells(cells.clone(), params, n_inserted).expect("from_cells");
             let cfg = make_config();
             let t = Instant::now();
-            let server: IkpirServer<S, B> = IkpirServer::new(store, cfg);
+            let server: IkpirServer<S, B> = if parallel {
+                IkpirServer::new_parallel(store, cfg)
+            } else {
+                IkpirServer::new(store, cfg)
+            };
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if trial == cli.warmup {
                 let bundle = server.setup();
@@ -203,7 +255,11 @@ fn run_one<S, B>(
         for trial in 0..(cli.warmup + cli.trials) {
             let cfg = make_config();
             let t = Instant::now();
-            let (sp, _mat, hint) = B::server_setup(&cfg, seg_db, segment_rows, row_width, pb);
+            let (sp, _mat, hint) = if parallel {
+                B::server_setup_parallel(&cfg, seg_db, segment_rows, row_width, pb)
+            } else {
+                B::server_setup(&cfg, seg_db, segment_rows, row_width, pb)
+            };
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if trial == cli.warmup {
                 hint_bytes = B::hint_byte_size(&hint);
@@ -308,7 +364,7 @@ fn run_one<S, B>(
         helpers::Knob {
             name: "setup_mode",
             value: setup_mode_str.to_string(),
-            is_default: !cli.estimate,
+            is_default: !cli.estimate && !parallel,
         },
     ];
     helpers::print_preamble("server_setup", &knobs, &store_state, &geom);

@@ -67,6 +67,6 @@ pub use error::IkpirClientError;
 
 pub use ikpir_common::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError,
-    IncrementalPirBackend, IndexPirBackend, PirQueryBundle, PirResponseBundle,
-    PrecomputingPirBackend, ServerSetupBundle, SimpleConfig, SimplePirBackend,
+    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, PirQueryBundle,
+    PirResponseBundle, PrecomputingPirBackend, ServerSetupBundle, SimpleConfig, SimplePirBackend,
 };

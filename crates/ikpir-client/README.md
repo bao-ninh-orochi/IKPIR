@@ -106,6 +106,22 @@ from_setup(bundle)                  — initialise from server's setup bundle
         reset_from(new_bundle)      — replace all internal state
 ```
 
+`from_setup` re-expands each segment's LWE matrix `A` from the wire-shipped
+seed, which is the whole cost of bootstrapping — gigabytes of keystream at
+paper scale, single-threaded. For any backend implementing
+`ParallelSetupBackend` (both shipped ones do), `from_setup_parallel` and
+`reset_from_parallel` build the identical client across all cores:
+
+```rust
+// Interchangeable — same queries, same decodes, same epoch.
+let client = IkpirClient::<FrodoPirBackend>::from_setup(bundle);
+let client = IkpirClient::<FrodoPirBackend>::from_setup_parallel(bundle);
+```
+
+Worker count comes from `IKPIR_SETUP_THREADS`, else the machine's available
+parallelism. All five benches use the parallel path — none of them reports
+client-bootstrap cost.
+
 ## Status and wire-format stability
 
 Two backends ship: `FrodoPirBackend` (default `lwe_dim = 1566`, ternary

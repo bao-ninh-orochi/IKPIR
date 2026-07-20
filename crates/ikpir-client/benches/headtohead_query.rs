@@ -23,7 +23,7 @@ use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -87,7 +87,12 @@ fn run_one<S, B>(
     backend_config: B::Config,
 ) where
     S: MakeStore,
-    B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend
+        + ParallelSetupBackend
+        + IncrementalPirBackend
+        + PrecomputingPirBackend
+        + BackendWireSize
+        + Clone,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -132,12 +137,12 @@ fn run_one<S, B>(
     // ── 2. Server setup; the query path never touches the server's `A`, so
     //       free it right after taking the bundle to keep peak RAM to the
     //       single client-side copy. ────────────────────────────────────────────
-    let mut server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
+    let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store, backend_config);
     let bundle = server.setup();
     server.drop_hint_material();
 
     let query_bytes = {
-        let mut probe: IkpirClient<B> = IkpirClient::from_setup(bundle.clone());
+        let mut probe: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle.clone());
         probe.build_query(&0u32.to_le_bytes()).wire_byte_size()
     };
 
@@ -223,7 +228,7 @@ fn run_one<S, B>(
     // ── 4. Measure build_query (warm-bc) ─────────────────────────────────────────
     let n = n_inserted as u32;
     let keys: Vec<[u8; 4]> = (0..cli.batch).map(|i| (i % n).to_le_bytes()).collect();
-    let mut client: IkpirClient<B> = IkpirClient::from_setup(bundle);
+    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle);
 
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut idx = 0usize;

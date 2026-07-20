@@ -20,7 +20,7 @@ pub mod wire;
 
 pub use backend::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, HintPatchMode, IncrementalPirBackend,
-    IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
 };
 pub use error::IkpirError;
 pub use wire::{

@@ -31,10 +31,25 @@
 //! - `ikpir-server::IkpirServer` — counterpart on the server side.
 
 use ikpir_common::{
-    HintDeltaBundle, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PirQueryBundle,
-    PirResponseBundle, PrecomputingPirBackend, ServerSetupBundle,
+    HintDeltaBundle, HintPatchMode, IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend,
+    PirQueryBundle, PirResponseBundle, PrecomputingPirBackend, ServerSetupBundle,
 };
 use segmented_cuckoo::{unpack_slot_cells, CuckooParams};
+
+/// The per-segment client-setup primitive, as a function pointer.
+///
+/// # Purpose
+///
+/// [`IndexPirBackend::client_setup`] (the single-threaded reference)
+/// and [`ParallelSetupBackend::client_setup_parallel`] (the optimized
+/// twin) have identical signatures and, by the latter's equivalence
+/// contract, produce observationally identical `ClientState`s. Passing
+/// one as a value lets [`IkpirClient::from_setup`] and
+/// [`IkpirClient::from_setup_parallel`] share a single body.
+type PerSegmentClientSetup<B> = fn(
+    &<B as IndexPirBackend>::ServerParams,
+    &<B as IndexPirBackend>::Hint,
+) -> <B as IndexPirBackend>::ClientState;
 
 use crate::error::IkpirClientError;
 
@@ -108,8 +123,18 @@ impl<B: IndexPirBackend> IkpirClient<B> {
     ///
     /// `O(arity)` calls to
     /// [`B::client_setup`](IndexPirBackend::client_setup), each of
-    /// which clones one `ServerParams` and one `Hint`.
+    /// which clones one `ServerParams` and one `Hint` — and, for both
+    /// shipped LWE backends, re-expands that segment's public matrix
+    /// `A` from its seed. That expansion is the whole cost and it runs
+    /// **single-threaded** here; see [`Self::from_setup_parallel`] for
+    /// the optimized twin.
     pub fn from_setup(bundle: ServerSetupBundle<B>) -> Self {
+        Self::assemble(bundle, B::client_setup)
+    }
+
+    /// Shared body of [`Self::from_setup`] and
+    /// [`Self::from_setup_parallel`].
+    fn assemble(bundle: ServerSetupBundle<B>, client_setup: PerSegmentClientSetup<B>) -> Self {
         let arity = bundle.params.arity();
         debug_assert_eq!(bundle.backend_params.len(), arity);
         debug_assert_eq!(bundle.hints.len(), arity);
@@ -122,7 +147,7 @@ impl<B: IndexPirBackend> IkpirClient<B> {
             .backend_params
             .iter()
             .zip(bundle.hints.iter())
-            .map(|(p, h)| B::client_setup(p, h))
+            .map(|(p, h)| client_setup(p, h))
             .collect();
 
         Self {
@@ -190,6 +215,44 @@ impl<B: IndexPirBackend> IkpirClient<B> {
     /// SimplePIR-style baseline the benches compare against. Survives
     /// [`Self::reset_from`].
     pub fn set_hint_patch_mode(&mut self, mode: HintPatchMode) {
+        self.hint_patch_mode = mode;
+    }
+}
+
+/// Optimized (multi-threaded) bootstrap, available for every backend
+/// implementing [`ParallelSetupBackend`] — both shipped LWE backends
+/// do.
+///
+/// # Purpose
+///
+/// Bootstrapping a client re-expands the public matrix `A` from each
+/// segment's seed — `Θ(arity · n_rows · lwe_dim)` ChaCha20 words, which
+/// is the entire cost of [`IkpirClient::from_setup`] and reaches
+/// gigabytes at paper scale. These twins produce the identical client
+/// across all cores.
+///
+/// # Constraints
+///
+/// The resulting client is **observationally identical** to one built
+/// by the reference path: same queries, same decodes, same patch
+/// behaviour, same epoch (see the equivalence contract on
+/// [`ParallelSetupBackend`]). Only the wall-clock differs, so any
+/// bench that does not itself report client-bootstrap cost should
+/// prefer these. Worker count follows `IKPIR_SETUP_THREADS`, else the
+/// machine's available parallelism.
+impl<B: ParallelSetupBackend> IkpirClient<B> {
+    /// Multi-threaded twin of [`Self::from_setup`] — identical
+    /// resulting client, computed across cores.
+    pub fn from_setup_parallel(bundle: ServerSetupBundle<B>) -> Self {
+        Self::assemble(bundle, B::client_setup_parallel)
+    }
+
+    /// Multi-threaded twin of [`Self::reset_from`]. Like it, the
+    /// configured [`HintPatchMode`] is a client preference and survives
+    /// the reset.
+    pub fn reset_from_parallel(&mut self, bundle: ServerSetupBundle<B>) {
+        let mode = self.hint_patch_mode;
+        *self = Self::from_setup_parallel(bundle);
         self.hint_patch_mode = mode;
     }
 }

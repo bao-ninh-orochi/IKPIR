@@ -33,7 +33,7 @@ use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -86,7 +86,12 @@ fn run_one<S, B>(
     backend_config: B::Config,
 ) where
     S: MakeStore,
-    B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend
+        + ParallelSetupBackend
+        + IncrementalPirBackend
+        + PrecomputingPirBackend
+        + BackendWireSize
+        + Clone,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -105,7 +110,7 @@ fn run_one<S, B>(
         return;
     }
 
-    let server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
+    let server: IkpirServer<S, B> = IkpirServer::new_parallel(store, backend_config);
     let bundle = server.setup();
 
     // Probe scope: build one query + answer it just to measure `query_bytes`
@@ -114,7 +119,7 @@ fn run_one<S, B>(
     // live to end-of-function and coexist with `client` — doubling peak `A`
     // RAM at paper-scale configs.
     let (query_bytes, response_bytes) = {
-        let mut probe: IkpirClient<B> = IkpirClient::from_setup(bundle.clone());
+        let mut probe: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle.clone());
         let probe_q = probe.build_query(&0u32.to_le_bytes());
         let rb = server.answer(&probe_q).expect("answer ok").wire_byte_size();
         let qb = probe_q.wire_byte_size();
@@ -193,7 +198,7 @@ fn run_one<S, B>(
         .map(|i| (i % n).to_le_bytes().to_vec())
         .collect();
 
-    let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
+    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(server.setup());
     // No upfront precompute — refill per criterion sample (see iter_custom below).
 
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));

@@ -25,7 +25,7 @@ use helpers::{Backend, MakeStore};
 use ikpir_client::IkpirClient;
 use ikpir_server::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirServer, IncrementalPirBackend,
-    IndexPirBackend, PirQueryBundle, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PirQueryBundle, SimpleConfig, SimplePirBackend,
 };
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
 use std::io::Write;
@@ -73,7 +73,7 @@ fn run_one<S, B>(
     backend_config: B::Config,
 ) where
     S: MakeStore,
-    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + BackendWireSize,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -87,8 +87,8 @@ fn run_one<S, B>(
         cli.value_bits,
         cli.plaintext_bits,
     );
-    let server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
-    let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
+    let server: IkpirServer<S, B> = IkpirServer::new_parallel(store, backend_config);
+    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(server.setup());
 
     let queries: Vec<PirQueryBundle<B>> = (0..cli.batch)
         .map(|i| client.build_query(&((i % n_inserted as u32).to_le_bytes())))

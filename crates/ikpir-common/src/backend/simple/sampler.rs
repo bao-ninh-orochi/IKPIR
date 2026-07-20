@@ -27,14 +27,22 @@
 //!   never taken (the tail probability beyond `±i32::MAX` is on the
 //!   order of `exp(-(2³¹/16)² / 2)`, i.e. unobservably small).
 //!
+//! [`sample_a_parallel`] is the optimized-setup twin of [`sample_a`]:
+//! same keystream, same bytes, split across cores by seeking each
+//! worker to its own offset in the ChaCha20 stream. Duplicated from
+//! `frodo/sampler.rs` under the same rule as [`sample_a`] itself.
+//!
 //! # Related files
 //!
 //! - `params.rs` — `SimpleParams::seed` is the input to `sample_a`;
 //!   `SimpleParams::sigma` is the width fed to the Gaussian sampler.
 //! - `backend.rs` — sole caller for all three samplers.
+//! - `backend/parallel.rs` — fan-out used by [`sample_a_parallel`].
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+
+use crate::backend::parallel;
 
 /// Build a ChaCha20Rng from a 16-byte seed (zero-padded to 32 bytes).
 ///
@@ -81,6 +89,63 @@ pub fn sample_a(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32> {
     for cell in &mut out {
         *cell = rng.next_u32();
     }
+    out
+}
+
+/// Words `ChaCha20Rng` regenerates per internal refill (4 blocks ×
+/// 16 words). Chunk boundaries are snapped to it so a worker's seek
+/// lands on a buffer edge and costs no extra block generation.
+const CHACHA_BUFFER_WORDS: usize = 64;
+
+/// Below this many words, expanding `A` on one thread beats paying for
+/// thread spawn + seek. ~1 MiB of output; the crossover is flat around
+/// it, so the exact value is not critical.
+const PAR_MIN_WORDS: usize = 1 << 18;
+
+/// Multi-threaded twin of [`sample_a`] — **byte-identical output**.
+///
+/// # Purpose
+///
+/// The optimized setup path's `A` expansion (see
+/// [`ParallelSetupBackend`](crate::ParallelSetupBackend)). At paper
+/// scale `A` is `reshape_rows × lwe_dim` words — gigabytes of keystream
+/// — and a client's `client_setup` does nothing else.
+///
+/// # Rationale
+///
+/// `ChaCha20Rng` is seekable: `set_word_pos(i)` positions the stream at
+/// its `i`-th 32-bit output. So worker `t`, owning output words
+/// `[o, o + len)`, seeds an RNG from the *same* seed, seeks to `o`, and
+/// fills its slice — reproducing exactly the words [`sample_a`] would
+/// have written there. This is what keeps the server's and client's
+/// independently expanded copies of `A` identical regardless of which
+/// path either side used.
+///
+/// Falls back to [`sample_a`] on a single core or below
+/// [`PAR_MIN_WORDS`].
+///
+/// # Complexity
+///
+/// Same `O(n_rows · lwe_dim)` ChaCha20 words as [`sample_a`], spread
+/// over [`parallel::setup_threads`] workers.
+pub fn sample_a_parallel(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32> {
+    let len = (n_rows as usize)
+        .checked_mul(lwe_dim as usize)
+        .expect("A dimensions overflow usize");
+    let threads = parallel::setup_threads();
+    if threads <= 1 || len < PAR_MIN_WORDS {
+        return sample_a(seed, n_rows, lwe_dim);
+    }
+
+    let mut out = vec![0u32; len];
+    let chunk = parallel::balanced_chunk_len(len, CHACHA_BUFFER_WORDS, threads);
+    parallel::par_chunks_mut(&mut out, chunk, |offset, part| {
+        let mut rng = rng_from_seed(seed);
+        rng.set_word_pos(offset as u128);
+        for cell in part {
+            *cell = rng.next_u32();
+        }
+    });
     out
 }
 
@@ -224,6 +289,43 @@ mod tests {
         let a1 = sample_a(&seed, 4, LWE_DIM);
         let a2 = sample_a(&seed, 4, LWE_DIM);
         assert_eq!(a1, a2);
+    }
+
+    /// The optimized path is byte-identical to the reference. Shaped
+    /// above `PAR_MIN_WORDS` so the fan-out actually runs.
+    #[test]
+    fn sample_a_parallel_matches_sequential() {
+        let seed = [0x5Au8; 16];
+        let n_rows = 256u32;
+        assert!(
+            (n_rows as usize) * (LWE_DIM as usize) >= PAR_MIN_WORDS,
+            "test shape must exceed the parallel threshold"
+        );
+        assert_eq!(
+            sample_a_parallel(&seed, n_rows, LWE_DIM),
+            sample_a(&seed, n_rows, LWE_DIM)
+        );
+    }
+
+    /// Pins the primitive `sample_a_parallel` rests on: a fresh RNG
+    /// seeked to word `o` emits exactly the words the sequential stream
+    /// has at `o` — for chunk lengths on and off the 64-word buffer
+    /// edge, and for a chunk longer than the whole output.
+    #[test]
+    fn chacha_seek_reproduces_stream_at_every_chunking() {
+        let seed = [0xC3u8; 16];
+        let expected = sample_a(&seed, 8, 512);
+        for chunk in [1usize, 15, 16, 63, 64, 100, 4096, 9000] {
+            let mut got = vec![0u32; expected.len()];
+            for (i, part) in got.chunks_mut(chunk).enumerate() {
+                let mut rng = rng_from_seed(&seed);
+                rng.set_word_pos((i * chunk) as u128);
+                for cell in part {
+                    *cell = rng.next_u32();
+                }
+            }
+            assert_eq!(got, expected, "chunk={chunk}");
+        }
     }
 
     #[test]

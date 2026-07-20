@@ -58,6 +58,14 @@ has the paper config matrix; there is no full-matrix sweep script.
 `num_buckets` constraints differ per arity: 2-ary `2^t`, 3-ary `3·2^t`,
 4-ary `2^t ≥ 4`.
 
+`server_setup` is the only bench that runs setup on the **reference**
+(single-threaded, non-SIMD) implementation, because it is the only one that
+reports setup cost. The others build their server with
+`IkpirServer::new_parallel` — byte-identical state across all cores, untimed
+preamble. `--setup-impl parallel` points `server_setup` at that path too, to
+quantify the saving; the CSV's `setup_mode` column then carries a `_parallel`
+suffix so the row cannot be misread as a paper number.
+
 ### Flags
 
 | Flag | Default | Meaning |
@@ -87,6 +95,25 @@ cargo bench -p ikpir-server --bench server_answer -- --backend simple --plaintex
 cargo bench -p ikpir-server --bench server_mutation -- --patch-mode entry,row --n-mutations 64
 cargo bench -p ikpir-server --bench <name> -- --help
 ```
+
+## Setup: reference and optimized
+
+`IkpirServer::new` and `full_rebuild` compute the per-segment hints
+single-threaded — the regime the paper reports. For any backend implementing
+`ParallelSetupBackend` (both shipped ones do), `new_parallel` and
+`full_rebuild_parallel` produce **byte-identical** state across all cores:
+
+```rust
+// Interchangeable — same ServerParams, same Hint, same epoch, same wire bytes.
+let server = Segmented2aryIkpirServer::new(store, FrodoConfig::default());
+let server = Segmented2aryIkpirServer::new_parallel(store, FrodoConfig::default());
+```
+
+Use the reference path when the setup timing itself is the result; use the
+parallel path whenever you just need a server. Worker count comes from
+`IKPIR_SETUP_THREADS`, else the machine's available parallelism (set it to `1`
+to force the reference schedule). Measured on 8 cores: 4.8× (FrodoPIR),
+6.3× (SimplePIR).
 
 ## Per-segment architecture
 

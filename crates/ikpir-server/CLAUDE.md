@@ -77,8 +77,27 @@ without a full rebuild.
   `B::expand_hint_material`. Callers observe nothing different other
   than a one-time first-mutation re-expansion cost.
 
-- **Sync API; no async, no `Arc`** — all calls are synchronous and
-  single-threaded. Concurrency wrapping is the caller's responsibility.
+- **Sync API; no async, no `Arc`** — all calls are synchronous.
+  Concurrency wrapping is the caller's responsibility. The one place
+  the crate spawns threads itself is `new_parallel` / `full_rebuild_parallel`
+  (below), and those join before returning, so the API stays synchronous.
+
+- **Two setup implementations, one result** — `IkpirServer::new` and
+  `full_rebuild` run `B::server_setup` per segment **single-threaded**:
+  the regime the paper reports and `benches/server_setup.rs` times.
+  `new_parallel` / `full_rebuild_parallel` (available whenever
+  `B: ParallelSetupBackend`, which both shipped backends are) do the
+  same work over all cores and produce byte-identical state — same
+  `ServerParams`, same `HintMaterial`, same `Hint`, same epoch, same
+  wire bundle. Both pairs share one body via a `SegmentSetup<B>` fn
+  pointer, so segment slicing cannot drift between them.
+
+  Setup is `Θ(arity · n_rows · lwe_dim · row_width)` — by far the
+  largest cost of *reaching* the state the other benches measure, and
+  contributing nothing to what they report. So every bench except
+  `server_setup` builds its server with `new_parallel`. Measured on 8
+  cores: 4.8× (FrodoPIR), 6.3× (SimplePIR). Worker count follows
+  `IKPIR_SETUP_THREADS`, else `available_parallelism()`.
 
 - **Two shipped backends** — both LWE-based, post-quantum, with full incremental hint patching:
   `FrodoPirBackend` (ternary errors, tall-skinny `n_rows × row_width`
@@ -130,9 +149,11 @@ without a full rebuild.
 | Task | Where to look |
 |---|---|
 | Setup + answer flow | `server.rs::IkpirServer::{new, setup, answer}` |
+| Optimized (multi-threaded) setup | `server.rs::IkpirServer::{new_parallel, full_rebuild_parallel}` — byte-identical state, all cores; contract in `ikpir-common::ParallelSetupBackend` |
+| Cross-path interop test | `tests/parallel_setup_equivalence.rs` — every `{reference, parallel}` server × `{reference, parallel}` client combination, both backends |
 | Mutation + incremental hint | `server.rs::commit_mutations` → `hint_patch.rs::fold_mutations_into_row_deltas` |
 | Hint-patch realization knob | `server.rs::IkpirServer::{hint_patch_mode, set_hint_patch_mode}` + `ikpir-common::HintPatchMode` |
-| Backend trait contract | `ikpir-common/src/backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` + `PrecomputingPirBackend` + `BackendWireSize` |
+| Backend trait contract | `ikpir-common/src/backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` + `PrecomputingPirBackend` + `ParallelSetupBackend` + `BackendWireSize` |
 | FrodoPIR config knobs | `ikpir-common/src/backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
 | FrodoPIR backend implementation | `ikpir-common/src/backend/frodo/backend.rs` |
 | SimplePIR config knobs | `ikpir-common/src/backend/simple/params.rs::SimpleConfig` (`lwe_dim`, `sigma`) |
@@ -181,6 +202,15 @@ Four focused benches covering classical and incremental server criteria for the 
 | `server_answer` | `TableFull` | PIR matvec answer rate (queries/sec, criterion); query_bytes, response_bytes | `ikpir_server_answer.csv` |
 | `server_mutation` | `--load-factor` (0.90) | Per-(kind, patch-mode) throughput (insert/update/delete × entry/row), wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
 | `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `server_answer` + `num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
+
+> **`server_setup` is the only bench that runs the reference setup.** It is
+> the one that *reports* setup cost, so it must. Every other bench builds its
+> server with `IkpirServer::new_parallel` and its client with
+> `IkpirClient::from_setup_parallel` — untimed preamble, byte-identical state,
+> minutes to hours saved at paper scale. `server_setup --setup-impl parallel`
+> opts into the optimized path to quantify that saving; the CSV's `setup_mode`
+> column then carries a `_parallel` suffix (`full_parallel` /
+> `per_segment_parallel`) so such a row can never be misread as a paper number.
 
 - Each bench is `harness = false` and parses CLI via `clap` (see helpers
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
