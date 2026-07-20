@@ -76,7 +76,7 @@ The root [README](../../README.md#benches) has the paper config matrix.
 Bench-specific: `client_query` / `client_decode` / `headtohead_*` take `--batch`
 (key-pool size); `client_mutation` takes `--patch-mode entry\|row` (comma list,
 default `entry`), `--n-mutations`, `--load-factor`; `headtohead_query` /
-`headtohead_decode` require `--num-keys` and take `--max-mem-gb`.
+`headtohead_decode` require `--num-keys`.
 
 ### Low-level: `cargo bench`
 

@@ -250,6 +250,21 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         }
     }
 
+    /// Borrow the per-segment backend [`ServerParams`](IndexPirBackend::ServerParams),
+    /// one entry per segment, in segment order.
+    ///
+    /// # Purpose
+    ///
+    /// Read-only introspection of what the backend actually chose at setup
+    /// time — most usefully its matrix geometry via
+    /// [`IndexPirBackend::db_matrix_shape`], which the benches report in
+    /// their `db_rows` / `db_cols` columns. [`Self::setup`] exposes the same
+    /// values but deep-clones every hint to do it, which at paper scale is
+    /// hundreds of megabytes for a two-integer answer.
+    pub fn backend_params(&self) -> &[B::ServerParams] {
+        &self.backend_params
+    }
+
     /// Answer a per-segment PIR query bundle.
     ///
     /// # Purpose
@@ -359,24 +374,30 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         let row_width = self.params.bucket_size * self.params.cells_per_slot();
         let pb = self.params.plaintext_bits;
         let seg_cells = segment_size as usize * row_width as usize;
-        // Snapshot to avoid a borrow conflict with self.backend_params / self.hints writes.
-        let cells: Vec<u32> = self.store.as_cells().to_vec();
 
         let mut backend_params = Vec::with_capacity(arity);
         let mut backend_hint_material = Vec::with_capacity(arity);
         let mut hints = Vec::with_capacity(arity);
-        for j in 0..arity {
-            let start = j * seg_cells;
-            let (sp, mat, h) = setup(
-                &self.backend_config,
-                &cells[start..start + seg_cells],
-                segment_size,
-                row_width,
-                pb,
-            );
-            backend_params.push(sp);
-            backend_hint_material.push(Some(mat));
-            hints.push(h);
+        // Borrowed, never snapshotted: `self.store` and the three fields
+        // assigned below are disjoint places, so a shared borrow of the
+        // store cannot conflict with those writes. Scoped exactly as in
+        // `Self::build` so the borrow ends before `drain_mutations` takes
+        // `&mut self.store`.
+        {
+            let cells = self.store.as_cells();
+            for j in 0..arity {
+                let start = j * seg_cells;
+                let (sp, mat, h) = setup(
+                    &self.backend_config,
+                    &cells[start..start + seg_cells],
+                    segment_size,
+                    row_width,
+                    pb,
+                );
+                backend_params.push(sp);
+                backend_hint_material.push(Some(mat));
+                hints.push(h);
+            }
         }
         self.backend_params = backend_params;
         self.backend_hint_material = backend_hint_material;

@@ -18,6 +18,7 @@
 //! seed each setup actually produced (the backend unit tests), and
 //! interoperability is asserted here.
 
+use ikpir_common::backend::parallel::PAR_MIN_HINT_MACS;
 use ikpir_server::{
     FrodoConfig, FrodoPirBackend, IkpirServer, IncrementalPirBackend, IndexPirBackend,
     ParallelSetupBackend, SimpleConfig, SimplePirBackend,
@@ -26,10 +27,55 @@ use segmented_cuckoo::{Segmented2aryCuckooKVStore, Segmented2aryScheme};
 
 use ikpir_client::IkpirClient;
 
-/// Small but non-degenerate store: 64 buckets × 4 slots, 12-bit
+/// Buckets in the fixture store. Sized so that **both** backends clear
+/// [`PAR_MIN_HINT_MACS`] and genuinely fan the hint precompute out —
+/// see [`assert_fixture_fans_out`]. At 64 buckets (the original value)
+/// the whole file ran the sequential fallback and pinned nothing about
+/// the parallel schedule.
+const NUM_BUCKETS: u32 = 256;
+const BUCKET_SIZE: u32 = 4;
+const FINGERPRINT_BITS: u32 = 12;
+const VALUE_BITS: u32 = 8;
+const PLAINTEXT_BITS: u32 = 8;
+
+/// Small but non-degenerate store: 256 buckets × 4 slots, 12-bit
 /// fingerprints, 8-bit values, `plaintext_bits = 8`.
 fn store() -> Segmented2aryCuckooKVStore {
-    Segmented2aryCuckooKVStore::new(64, 4, 12, 8, 8).unwrap()
+    Segmented2aryCuckooKVStore::new(
+        NUM_BUCKETS,
+        BUCKET_SIZE,
+        FINGERPRINT_BITS,
+        VALUE_BITS,
+        PLAINTEXT_BITS,
+    )
+    .unwrap()
+}
+
+/// Fail loudly if the fixture is too small to reach the parallel hint
+/// kernel for `lwe_dim`.
+///
+/// The optimized entry points fall back to the reference schedule below
+/// [`PAR_MIN_HINT_MACS`], and that fallback is silent — a fixture that
+/// drifts under the threshold turns every test in this file into an
+/// expensive way of testing the reference path twice. The backend unit
+/// tests guard themselves the same way; this is the integration-level
+/// counterpart.
+///
+/// `macs` mirrors what `compute_hint_parallel` computes: per-segment
+/// rows × `lwe_dim` × `row_width`, on the *pre-reshape* dimensions that
+/// both backends use for the decision.
+fn assert_fixture_fans_out(lwe_dim: u32, backend: &str) {
+    let segment_rows = u64::from(NUM_BUCKETS) / 2; // arity 2
+    let cells_per_slot =
+        u64::from(FINGERPRINT_BITS + VALUE_BITS).div_ceil(u64::from(PLAINTEXT_BITS));
+    let row_width = u64::from(BUCKET_SIZE) * cells_per_slot;
+    let macs = segment_rows * u64::from(lwe_dim) * row_width;
+    assert!(
+        macs >= PAR_MIN_HINT_MACS,
+        "{backend} fixture only reaches {macs} MACs, under the \
+         PAR_MIN_HINT_MACS={PAR_MIN_HINT_MACS} fan-out threshold — this \
+         file would silently test the sequential path; grow NUM_BUCKETS",
+    );
 }
 
 /// Look `key` up end to end and assert it decodes to `expected`.
@@ -106,10 +152,14 @@ where
 
 #[test]
 fn frodo_setup_paths_interoperate() {
-    paths_interoperate::<FrodoPirBackend>(FrodoConfig::default());
+    let config = FrodoConfig::default();
+    assert_fixture_fans_out(config.lwe_dim, "frodo");
+    paths_interoperate::<FrodoPirBackend>(config);
 }
 
 #[test]
 fn simple_setup_paths_interoperate() {
-    paths_interoperate::<SimplePirBackend>(SimpleConfig::default());
+    let config = SimpleConfig::default();
+    assert_fixture_fans_out(config.lwe_dim, "simple");
+    paths_interoperate::<SimplePirBackend>(config);
 }

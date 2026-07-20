@@ -180,8 +180,14 @@ result mismatch. Measured on 8 cores: **4.8× (FrodoPIR), 6.3×
 
 `server_setup --setup-impl parallel` times the optimized path instead, to
 quantify what the other benches save. Such a row is not a paper number,
-and says so: the CSV's `setup_mode` column gains a `_parallel` suffix
-(`full_parallel` / `per_segment_parallel`).
+and says so: the CSV's `setup_mode` column reads `full_parallel` rather
+than `full`.
+
+Either way the number is a whole `IkpirServer::new`, timed end to end.
+No bench times a fraction of an operation and scales the result up —
+that shortcut existed while the geometry was `N = 2²²` and was dropped
+once `N = 2²⁰` made single-threaded setup affordable to measure
+outright.
 
 ## The paper's PIR config matrix
 
@@ -222,7 +228,7 @@ Why these, and not others:
 ./scripts/table2.sh                    # filter: SCF vs standard, five configs
 ./scripts/table3.sh                    # online: query / response / answer
 ./scripts/table4.sh --arity 3          # mutation: the full-paper arity-3 cells
-./scripts/table5.sh --estimate         # setup: one segment × arity, ~arity× faster
+./scripts/table5.sh --backend frodo    # setup: RisePIR-F rows only
 
 # One segmented-cuckoo bench: no flags = the full Table 2 matrix.
 ./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2

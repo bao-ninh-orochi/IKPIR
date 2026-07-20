@@ -49,9 +49,54 @@
 
 /// Environment variable overriding the optimized path's worker count.
 ///
-/// Parsed as a `usize ≥ 1`; anything else is ignored. `1` forces the
-/// sequential schedule everywhere in the optimized path.
+/// Parsed as a `usize ≥ 1`, then clamped to [`MAX_SETUP_THREADS`];
+/// anything else is ignored. `1` forces the sequential schedule
+/// everywhere in the optimized path.
 pub const SETUP_THREADS_ENV: &str = "IKPIR_SETUP_THREADS";
+
+/// Upper bound on the optimized path's worker count.
+///
+/// # Rationale
+///
+/// The fan-out spawns **one thread per chunk**, and chunk count follows
+/// the requested worker count, not the machine. Without a ceiling, a
+/// mistyped `IKPIR_SETUP_THREADS=1000000` would ask
+/// `par_chunks_mut` (below) for a million chunks of the keystream — the
+/// keystream partition's `unit` is only 64 words, so nothing else caps
+/// it — and the loop would issue ~10⁵ `spawn` calls before the first
+/// join, failing on thread exhaustion rather than on anything the
+/// caller could diagnose. (The hint partition is accidentally immune:
+/// its `unit` is a whole hint row, so it can never exceed `lwe_dim`
+/// chunks.)
+///
+/// The value is far above any real core count, so it constrains typos
+/// and nothing else; deliberate oversubscription up to this bound still
+/// works.
+pub const MAX_SETUP_THREADS: usize = 1024;
+
+/// Minimum multiply-accumulate count worth fanning the hint precompute
+/// out over. Below it, `compute_hint_parallel` runs the reference
+/// schedule instead — thread spawn would dominate the arithmetic at
+/// unit-test shapes.
+///
+/// Single source of truth for both backends. Exposed (hidden) so tests
+/// outside this crate can assert that their fixture is large enough to
+/// actually exercise the parallel path; a test that quietly falls back
+/// pins nothing.
+#[doc(hidden)]
+pub const PAR_MIN_HINT_MACS: u64 = 1 << 20;
+
+/// Minimum keystream length, in `u32` words, worth fanning the public
+/// matrix expansion out over. Below it, `sample_a_parallel` runs the
+/// reference schedule. Single source of truth for both backends; see
+/// [`PAR_MIN_HINT_MACS`] for why it is reachable from outside.
+#[doc(hidden)]
+pub const PAR_MIN_WORDS: usize = 1 << 18;
+
+/// ChaCha20's refill-buffer size in `u32` words — the indivisible unit
+/// of the keystream partition, so that every worker's `set_word_pos`
+/// seek lands on a buffer boundary.
+pub(crate) const CHACHA_BUFFER_WORDS: usize = 64;
 
 /// Worker count the optimized setup path fans out to.
 ///
@@ -69,11 +114,16 @@ pub fn setup_threads() -> usize {
     if let Ok(raw) = std::env::var(SETUP_THREADS_ENV) {
         if let Ok(n) = raw.trim().parse::<usize>() {
             if n >= 1 {
-                return n;
+                // Clamped, not rejected: a too-large value is a typo, and
+                // silently doing sane work beats spawning a thread per
+                // keystream buffer. See `MAX_SETUP_THREADS`.
+                return n.min(MAX_SETUP_THREADS);
             }
         }
     }
-    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_SETUP_THREADS)
 }
 
 /// Chunk length that splits `total` elements into **at most** `parts`

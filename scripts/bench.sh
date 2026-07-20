@@ -30,16 +30,18 @@
 #                          multi-threaded twin that every OTHER bench already
 #                          uses in its untimed preamble — diagnostic, never a
 #                          paper number. The CSV's setup_mode column records it
-#                          (full_parallel / per_segment_parallel).
-#                          IKPIR_SETUP_THREADS caps the worker count everywhere;
-#                          set it to 1 to force the reference schedule.
+#                          (full vs full_parallel).
+#                          IKPIR_SETUP_THREADS sets the worker count everywhere
+#                          (default: the machine's available parallelism, and
+#                          clamped to MAX_SETUP_THREADS = 1024); set it to 1 to
+#                          force the reference schedule.
 #   Mutation benches also take:
 #     --n-mutations N      (default: 1% of the table's slots — the paper's τ)
 #     --patch-mode M       entry | row | entry,row           (default entry,row)
 #   Head-to-head benches also take:
 #     --num-keys N         (default: ~90% of capacity)
-#   Any other flag (--batch, --fingerprint-bits, --estimate, --max-mem-gb,
-#   --trials, --warmup, …) is forwarded to the bench unchanged.
+#   Any other flag (--batch, --fingerprint-bits, --trials, --warmup, …) is
+#   forwarded to the bench unchanged.
 #
 # Geometry defaults here are DEV SCALE (~2^16 slots), not the paper's. This is
 # the everyday one-config runner; the paper's matrix lives in scripts/lib.sh and

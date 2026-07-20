@@ -24,15 +24,15 @@
 #
 # Runtime: this is the slow one — a full run is hours. Setup is the Θ(nNw) hint
 # rebuild the whole paper is about avoiding, and the 1 kB × SimplePIR cells run
-# to several minutes each on the paper's machine. Pass `--estimate` to time one
-# segment and scale by arity (exact, ~arity× faster), or narrow with
-# --value-bits / --backend.
+# to several minutes each on the paper's machine. Every run times a whole
+# IkpirServer::new; narrow the sweep with --value-bits / --backend rather than
+# shortening the measurement.
 #
 # Usage:
 #   ./scripts/table5.sh                        # the full table (hours)
-#   ./scripts/table5.sh --estimate             # same numbers, ~arity× faster
 #   ./scripts/table5.sh --backend frodo        # RisePIR-F rows only
-#   ./scripts/table5.sh --trials 3             # tighter error bars, slower
+#   ./scripts/table5.sh --arity 4              # the arity-4 cells only
+#   ./scripts/table5.sh --trials 5             # tighter error bars, slower
 #
 # Output: results/ikpir-server/ikpir_server_setup.csv
 #         — one row per (config, value width, backend).

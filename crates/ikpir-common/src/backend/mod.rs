@@ -81,6 +81,7 @@
 pub mod frodo;
 pub(crate) mod matvec;
 pub mod parallel;
+pub(crate) mod patch;
 pub mod simple;
 pub use frodo::{FrodoConfig, FrodoPirBackend};
 pub use simple::{SimpleConfig, SimplePirBackend};
@@ -136,6 +137,19 @@ pub trait IndexPirBackend {
         row_width: u32,
         plaintext_bits: u32,
     ) -> (Self::ServerParams, Self::HintMaterial, Self::Hint);
+
+    /// Shape `(rows, cols)` of the matrix the backend actually multiplies
+    /// for one segment, read back from `params`.
+    ///
+    /// A backend may reshape the `(n_rows, row_width)` segment it was
+    /// handed into whatever layout its algorithm wants: FrodoPIR keeps the
+    /// tall-skinny original, SimplePIR folds it into a near-square matrix.
+    /// The reshape is chosen inside [`Self::server_setup`] and recorded in
+    /// `params`, so this must *report* those stored dimensions — never
+    /// recompute them. Callers that need the real geometry (the benches'
+    /// `db_rows` / `db_cols` CSV columns) then cannot drift from the
+    /// backend's own choice.
+    fn db_matrix_shape(params: &Self::ServerParams) -> (u32, u32);
 
     /// Re-derive [`Self::HintMaterial`] from [`Self::ServerParams`].
     ///
@@ -207,6 +221,13 @@ pub trait IndexPirBackend {
 /// database `ω` grows with the database size, so only the entry-level
 /// patch keeps the per-mutation cost independent of the database size.
 /// The default is [`EntryLevel`](Self::EntryLevel).
+///
+/// Realizing that asymptotic advantage as wall-clock takes care with the
+/// execution order — `H` is row-major, so patching one column at a time
+/// sweeps the whole hint once *per touched column*. Both backends
+/// therefore run the entry-level patch through the crate-internal
+/// `backend::patch::TouchedRuns`, which inverts the loops and coalesces
+/// touched columns into contiguous runs; see its module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HintPatchMode {
     /// Dense per-row rank-one update, `Θ(n·ω)` per touched row — the

@@ -92,16 +92,6 @@ pub fn sample_a(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32> {
     out
 }
 
-/// Words `ChaCha20Rng` regenerates per internal refill (4 blocks ×
-/// 16 words). Chunk boundaries are snapped to it so a worker's seek
-/// lands on a buffer edge and costs no extra block generation.
-const CHACHA_BUFFER_WORDS: usize = 64;
-
-/// Below this many words, expanding `A` on one thread beats paying for
-/// thread spawn + seek. ~1 MiB of output; the crossover is flat around
-/// it, so the exact value is not critical.
-const PAR_MIN_WORDS: usize = 1 << 18;
-
 /// Multi-threaded twin of [`sample_a`] — **byte-identical output**.
 ///
 /// # Purpose
@@ -122,7 +112,7 @@ const PAR_MIN_WORDS: usize = 1 << 18;
 /// path either side used.
 ///
 /// Falls back to [`sample_a`] on a single core or below
-/// [`PAR_MIN_WORDS`].
+/// [`parallel::PAR_MIN_WORDS`].
 ///
 /// # Complexity
 ///
@@ -133,12 +123,12 @@ pub fn sample_a_parallel(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32>
         .checked_mul(lwe_dim as usize)
         .expect("A dimensions overflow usize");
     let threads = parallel::setup_threads();
-    if threads <= 1 || len < PAR_MIN_WORDS {
+    if threads <= 1 || len < parallel::PAR_MIN_WORDS {
         return sample_a(seed, n_rows, lwe_dim);
     }
 
     let mut out = vec![0u32; len];
-    let chunk = parallel::balanced_chunk_len(len, CHACHA_BUFFER_WORDS, threads);
+    let chunk = parallel::balanced_chunk_len(len, parallel::CHACHA_BUFFER_WORDS, threads);
     parallel::par_chunks_mut(&mut out, chunk, |offset, part| {
         let mut rng = rng_from_seed(seed);
         rng.set_word_pos(offset as u128);
@@ -292,13 +282,13 @@ mod tests {
     }
 
     /// The optimized path is byte-identical to the reference. Shaped
-    /// above `PAR_MIN_WORDS` so the fan-out actually runs.
+    /// above `parallel::PAR_MIN_WORDS` so the fan-out actually runs.
     #[test]
     fn sample_a_parallel_matches_sequential() {
         let seed = [0x5Au8; 16];
         let n_rows = 256u32;
         assert!(
-            (n_rows as usize) * (LWE_DIM as usize) >= PAR_MIN_WORDS,
+            (n_rows as usize) * (LWE_DIM as usize) >= parallel::PAR_MIN_WORDS,
             "test shape must exceed the parallel threshold"
         );
         assert_eq!(

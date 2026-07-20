@@ -45,8 +45,8 @@ use super::{
 };
 use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
-    parallel, BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend,
-    ParallelSetupBackend, PrecomputingPirBackend,
+    parallel, patch::TouchedRuns, BackendWireSize, HintPatchMode, IncrementalPirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend,
 };
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
@@ -251,6 +251,11 @@ impl IndexPirBackend for FrodoPirBackend {
         )
     }
 
+    fn db_matrix_shape(params: &FrodoServerParams) -> (u32, u32) {
+        // FrodoPIR multiplies the segment as handed to it — no reshape.
+        (params.n_rows, params.row_width)
+    }
+
     fn expand_hint_material(params: &FrodoServerParams) -> FrodoHintMaterial {
         let a = sample_a(&params.params.seed, params.n_rows, params.params.lwe_dim);
         FrodoHintMaterial { a }
@@ -453,9 +458,13 @@ impl PrecomputingPirBackend for FrodoPirBackend {
 /// # Rationale
 ///
 /// Loop nest is `i, k, j` to keep `A` and `D` row accesses sequential
-/// per `i` — the inner-loop pattern LLVM auto-vectorises. The
-/// `aik == 0` early-exit is a sparsity shortcut on the random ternary
-/// `A` (about 1/3 of cells); harmless to timing since `A` is public.
+/// per `i` — the inner-loop pattern LLVM auto-vectorises.
+///
+/// There is deliberately **no `aik == 0` shortcut**. `A` is uniform over
+/// `Z_{2³²}` (`sample_a` draws raw `next_u32` words), so a zero cell
+/// occurs with probability `2⁻³²` and skipping it can never pay for the
+/// test. The ternary distribution in this backend belongs to the LWE
+/// *secret and error* (`sample_ternary_into`), not to `A`.
 ///
 /// # Complexity
 ///
@@ -470,9 +479,6 @@ fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32
         let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
         for k in 0..lwe_dim_us {
             let aik = a_row[k];
-            if aik == 0 {
-                continue;
-            }
             let h_row = &mut h[k * row_width_us..(k + 1) * row_width_us];
             for j in 0..row_width_us {
                 h_row[j] = h_row[j].wrapping_add(aik.wrapping_mul(d_row[j]));
@@ -481,17 +487,6 @@ fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32
     }
     h
 }
-
-/// Below this much setup work, computing `H` on one thread beats
-/// paying for thread spawn. ~1M multiply-adds — a millisecond or so
-/// sequential, against tens of microseconds to spawn. Every realistic
-/// segment shape clears it by orders of magnitude, so the guard only
-/// matters for the tiny shapes used in unit tests.
-///
-/// Gating on the **work** (`n_rows · lwe_dim · row_width`) rather than
-/// on the output size matters: a tall segment with a narrow row can
-/// have a small hint and still be minutes of arithmetic.
-const PAR_MIN_HINT_MACS: u64 = 1 << 20;
 
 /// Multi-threaded twin of [`compute_hint`] — **bit-identical output**.
 ///
@@ -517,7 +512,7 @@ const PAR_MIN_HINT_MACS: u64 = 1 << 20;
 /// cache levels.
 ///
 /// Falls back to [`compute_hint`] on a single core or below
-/// [`PAR_MIN_HINT_MACS`].
+/// [`parallel::PAR_MIN_HINT_MACS`].
 fn compute_hint_parallel(
     a: &[u32],
     db: &[u32],
@@ -529,7 +524,7 @@ fn compute_hint_parallel(
     let row_width_us = row_width as usize;
     let macs = u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width);
     let threads = parallel::setup_threads();
-    if threads <= 1 || macs < PAR_MIN_HINT_MACS {
+    if threads <= 1 || macs < parallel::PAR_MIN_HINT_MACS {
         return compute_hint(a, db, n_rows, lwe_dim, row_width);
     }
 
@@ -540,14 +535,17 @@ fn compute_hint_parallel(
     let chunk = parallel::balanced_chunk_len(h.len(), row_width_us, threads);
     parallel::par_chunks_mut(&mut h, chunk, |offset, band| {
         let k0 = offset / row_width_us;
+        // Whole hint rows per band: `balanced_chunk_len` was given
+        // `row_width` as its unit and `h.len()` is `lwe_dim · row_width`,
+        // so every chunk — including the ragged last one — divides
+        // exactly. The floor below would silently drop the tail rows if
+        // that ever stopped holding.
+        debug_assert_eq!(band.len() % row_width_us, 0, "band must be whole hint rows");
         let band_rows = band.len() / row_width_us;
         for i in 0..n_rows as usize {
             let a_row = &a[i * lwe_dim_us + k0..i * lwe_dim_us + k0 + band_rows];
             let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
             for (k, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
                 let h_row = &mut band[k * row_width_us..(k + 1) * row_width_us];
                 for j in 0..row_width_us {
                     h_row[j] = h_row[j].wrapping_add(aik.wrapping_mul(d_row[j]));
@@ -561,8 +559,8 @@ fn compute_hint_parallel(
 /// Optimized setup for FrodoPIR: same `(ServerParams, HintMaterial,
 /// Hint)`, computed across cores.
 ///
-/// Both heavy kernels fan out — [`sample_a_parallel`] for `A` and
-/// [`compute_hint_parallel`] for `H = Aᵀ·D` — and both are bit-identical
+/// Both heavy kernels fan out — `sample_a_parallel` (in `sampler.rs`) for
+/// `A` and `compute_hint_parallel` (above) for `H = Aᵀ·D` — and both are bit-identical
 /// to their reference twins, so a server set up on this path is
 /// indistinguishable from one set up on [`IndexPirBackend::server_setup`].
 impl ParallelSetupBackend for FrodoPirBackend {
@@ -803,14 +801,21 @@ fn apply_patch(
 /// Math: `H[k, cell] += A[row_idx, k] · Δ mod 2³²`. Iterates touched
 /// `(row, cell, Δ)` triples and slides `A`'s `row_idx`-th column
 /// against the hint column at `cell`; untouched columns are never read
-/// or written. The `aik == 0` early-exit captures sparsity in the
-/// random ternary `A` (public, so the branch leaks nothing secret).
+/// or written. No `aik == 0` shortcut — see [`compute_hint`] for why `A`
+/// carries no exploitable sparsity.
+///
+/// The execution order is [`TouchedRuns`]': `k` (the hint row) outside,
+/// the row's touched columns — coalesced into contiguous runs — inside,
+/// so the patch sweeps the hint once. FrodoPIR patches column
+/// `cell_offset` directly; there is no reshape to translate through.
 ///
 /// # Complexity
 ///
 /// `O(touched_cells · lwe_dim)` wrapping multiply-add — `Θ(n)` per
 /// touched cell, the paper's entry-level cost. Vastly cheaper than a
-/// full `compute_hint` when the mutation count is small.
+/// full `compute_hint` when the mutation count is small, and
+/// `bucket_size×` cheaper than [`apply_patch_row_level`] on the same
+/// batch.
 fn apply_patch_entry_level(
     a: &[u32],
     lwe_dim: u32,
@@ -824,32 +829,27 @@ fn apply_patch_entry_level(
     debug_assert_eq!(a.len(), (n_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * row_width_us);
 
+    // Hoisted out of the row loop: a batch of mutations allocates at most
+    // once, however many rows it touches.
+    let mut touched = TouchedRuns::new();
+
     for (row_idx, cells) in row_deltas {
         debug_assert!(
             (*row_idx as usize) < n_rows as usize,
             "row_idx {row_idx} out of range (n_rows={n_rows})",
         );
-        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
-
-        for (cell_offset, delta) in cells {
+        touched.rebuild(cells, |off| {
             debug_assert!(
-                (*cell_offset as usize) < row_width_us,
-                "cell_offset {cell_offset} out of range (row_width={row_width})",
+                (off as usize) < row_width_us,
+                "cell_offset {off} out of range (row_width={row_width})",
             );
-            if *delta == 0 {
-                continue;
-            }
-            let delta_u32 = *delta as u32;
-            let cell_us = *cell_offset as usize;
-
-            for (k, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
-                let idx = k * row_width_us + cell_us;
-                hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
-            }
+            off as usize
+        });
+        if touched.is_empty() {
+            continue;
         }
+        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
+        touched.apply(a_row, hint, row_width_us);
     }
 }
 
@@ -864,10 +864,8 @@ fn apply_patch_entry_level(
 /// `H[k, ·] += A[row_idx, k] · δ[·] mod 2³²` across the entire hint
 /// width. Columns with `δ = 0` are still multiplied — that is the
 /// point: this is the row-granular patch of SimplePIR, kept as the
-/// baseline the entry-level sharpening is measured against. The
-/// `aik == 0` early-exit matches [`apply_patch_entry_level`] so the two
-/// realizations share the same micro-optimisation policy on the public
-/// ternary `A`.
+/// baseline the entry-level sharpening is measured against. No
+/// `aik == 0` shortcut — see [`compute_hint`].
 ///
 /// # Complexity
 ///
@@ -904,9 +902,6 @@ fn apply_patch_row_level(
         let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
 
         for (k, &aik) in a_row.iter().enumerate() {
-            if aik == 0 {
-                continue;
-            }
             let h_row = &mut hint[k * row_width_us..(k + 1) * row_width_us];
             for (h, &d) in h_row.iter_mut().zip(delta_row.iter()) {
                 *h = h.wrapping_add(aik.wrapping_mul(d));
@@ -944,7 +939,7 @@ mod tests {
     }
 
     /// The optimized hint kernel is bit-identical to the reference.
-    /// Every shape exceeds `PAR_MIN_HINT_MACS` (asserted, so the test
+    /// Every shape exceeds `parallel::PAR_MIN_HINT_MACS` (asserted, so the test
     /// cannot silently go vacuous if the threshold moves) and the
     /// `lwe_dim` values are both multiples and non-multiples of any
     /// plausible worker count, exercising the ragged last band.
@@ -954,7 +949,8 @@ mod tests {
             [(37u32, 257u32, 256u32), (32, 64, 1031), (24, 4096, 17)]
         {
             assert!(
-                u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width) >= PAR_MIN_HINT_MACS,
+                u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width)
+                    >= parallel::PAR_MIN_HINT_MACS,
                 "shape ({n_rows}, {row_width}, {lwe_dim}) must exceed the parallel threshold"
             );
             let db = make_db(n_rows, row_width, 8);

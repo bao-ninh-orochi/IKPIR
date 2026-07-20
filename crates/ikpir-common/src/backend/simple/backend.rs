@@ -45,7 +45,7 @@
 //! - `sampler.rs` — `sample_a` / `sample_uniform_zq_into`
 //!   / `sample_discrete_gaussian_into`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use rand::RngCore;
 
@@ -55,8 +55,8 @@ use super::{
 };
 use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
-    parallel, BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend,
-    ParallelSetupBackend, PrecomputingPirBackend,
+    parallel, patch::TouchedRuns, BackendWireSize, HintPatchMode, IncrementalPirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend,
 };
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
@@ -307,6 +307,11 @@ impl IndexPirBackend for SimplePirBackend {
             SimpleHintMaterial { a },
             SimpleHint { data: hint_data },
         )
+    }
+
+    fn db_matrix_shape(params: &SimpleServerParams) -> (u32, u32) {
+        // Post-reshape dims as `reshape_dims` fixed them at setup time.
+        (params.reshape_rows, params.reshape_row_width)
     }
 
     fn expand_hint_material(params: &SimpleServerParams) -> SimpleHintMaterial {
@@ -605,12 +610,12 @@ impl PrecomputingPirBackend for SimplePirBackend {
 /// row_width)` shape so the flat `db` slice is read sequentially per
 /// original row. Each original row contributes to a `row_width`-wide
 /// sub-segment of one reshape row, starting at `off_within = (r % k) *
-/// row_width`. The `aik == 0` early-exit is a sparsity shortcut on the
-/// public matrix `A` (safe to branch on since `A` is public). With `A`
-/// sampled uniformly over `Z_q` via ChaCha20, this branch fires only
-/// when ChaCha20 produces a literal zero `u32` — i.e. ~2⁻³² of cells,
-/// so the early-exit is effectively dead code on the hot path but
-/// retained for parity with FrodoPIR's `compute_hint`.
+/// row_width`.
+///
+/// There is deliberately **no `aik == 0` shortcut**: `A` is uniform over
+/// `Z_q` via ChaCha20, so a zero cell occurs with probability `2⁻³²` and
+/// the test can never pay for itself. FrodoPIR's `compute_hint` omits it
+/// on the same grounds, so the two backends stay comparable.
 ///
 /// # Complexity
 ///
@@ -639,9 +644,6 @@ fn compute_hint(
         let d_row = &db[r * row_width_us..(r + 1) * row_width_us];
         for k_idx in 0..lwe_dim_us {
             let aik = a_row[k_idx];
-            if aik == 0 {
-                continue;
-            }
             let h_row = &mut h[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
             for j in 0..row_width_us {
                 h_row[off_within + j] =
@@ -651,17 +653,6 @@ fn compute_hint(
     }
     h
 }
-
-/// Below this much setup work, computing `H` on one thread beats
-/// paying for thread spawn. ~1M multiply-adds — a millisecond or so
-/// sequential, against tens of microseconds to spawn. Every realistic
-/// segment shape clears it by orders of magnitude, so the guard only
-/// matters for the tiny shapes used in unit tests.
-///
-/// Gating on the **work** (`n_rows · lwe_dim · row_width`) rather than
-/// on the output size matters: a tall segment with a narrow row can
-/// have a small hint and still be minutes of arithmetic.
-const PAR_MIN_HINT_MACS: u64 = 1 << 20;
 
 /// Multi-threaded twin of [`compute_hint`] — **bit-identical output**.
 ///
@@ -681,7 +672,7 @@ const PAR_MIN_HINT_MACS: u64 = 1 << 20;
 /// `r` in the reference's order, making the result bit-identical.
 ///
 /// Falls back to [`compute_hint`] on a single core or below
-/// [`PAR_MIN_HINT_MACS`].
+/// [`parallel::PAR_MIN_HINT_MACS`].
 fn compute_hint_parallel(
     a: &[u32],
     db: &[u32],
@@ -697,7 +688,7 @@ fn compute_hint_parallel(
     let k_us = k as usize;
     let macs = u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width);
     let threads = parallel::setup_threads();
-    if threads <= 1 || macs < PAR_MIN_HINT_MACS {
+    if threads <= 1 || macs < parallel::PAR_MIN_HINT_MACS {
         return compute_hint(a, db, n_rows, row_width, k, lwe_dim, reshape_row_width);
     }
 
@@ -708,6 +699,13 @@ fn compute_hint_parallel(
     let chunk = parallel::balanced_chunk_len(h.len(), reshape_row_width_us, threads);
     parallel::par_chunks_mut(&mut h, chunk, |offset, band| {
         let k0 = offset / reshape_row_width_us;
+        // Whole hint rows per band — see the FrodoPIR twin for why the
+        // floor is safe and why it is asserted anyway.
+        debug_assert_eq!(
+            band.len() % reshape_row_width_us,
+            0,
+            "band must be whole hint rows"
+        );
         let band_rows = band.len() / reshape_row_width_us;
         for r in 0..n_rows as usize {
             let reshape_row = r / k_us;
@@ -716,9 +714,6 @@ fn compute_hint_parallel(
                 &a[reshape_row * lwe_dim_us + k0..reshape_row * lwe_dim_us + k0 + band_rows];
             let d_row = &db[r * row_width_us..(r + 1) * row_width_us];
             for (k_idx, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
                 let h_row =
                     &mut band[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
                 for j in 0..row_width_us {
@@ -734,8 +729,8 @@ fn compute_hint_parallel(
 /// Optimized setup for SimplePIR: same `(ServerParams, HintMaterial,
 /// Hint)`, computed across cores.
 ///
-/// Both heavy kernels fan out — [`sample_a_parallel`] for `A` and
-/// [`compute_hint_parallel`] for `H = Aᵀ·D` over the reshaped database
+/// Both heavy kernels fan out — `sample_a_parallel` (in `sampler.rs`) for
+/// `A` and `compute_hint_parallel` (above) for `H = Aᵀ·D` over the reshaped database
 /// — and both are bit-identical to their reference twins, so a server
 /// set up on this path is indistinguishable from one set up on
 /// [`IndexPirBackend::server_setup`].
@@ -1013,13 +1008,23 @@ fn apply_patch(
 /// `(reshape_row, reshape_off) = translate(orig_row, orig_off, k,
 /// row_width)`. Iterates touched `(orig_row, orig_off, Δ)` triples and
 /// slides `A`'s `reshape_row`-th column against the hint column at
-/// `reshape_off`. The `aik == 0` early-exit is a sparsity optimisation
-/// safe under public `A`.
+/// `reshape_off`. No `aik == 0` shortcut — see [`compute_hint`] for why
+/// `A` carries no exploitable sparsity.
+///
+/// The execution order is [`TouchedRuns`]': `k_idx` (the hint row)
+/// outside, the row's touched columns — coalesced into contiguous runs —
+/// inside, so the patch sweeps the hint once. `translate` is affine in
+/// `orig_off` at fixed `orig_row`, so one slot's cells stay contiguous
+/// after the reshape and coalesce into a single run. Getting this order
+/// right matters most for this backend: the reshape makes the hint the
+/// widest, so a per-column sweep of it is the most expensive.
 ///
 /// # Complexity
 ///
 /// `O(touched_cells · lwe_dim)` wrapping multiply-add — `Θ(n)` per
-/// touched cell, independent of the reshape width.
+/// touched cell, independent of the reshape width, against
+/// [`apply_patch_row_level`]'s `Θ(n · reshape_row_width)` per touched
+/// reshape row.
 #[allow(clippy::too_many_arguments)]
 fn apply_patch_entry_level(
     a: &[u32],
@@ -1037,35 +1042,29 @@ fn apply_patch_entry_level(
     debug_assert_eq!(a.len(), (reshape_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * reshape_row_width_us);
 
+    // Hoisted out of the row loop: a batch of mutations allocates at most
+    // once, however many rows it touches.
+    let mut touched = TouchedRuns::new();
+
     for (orig_row, cells) in row_deltas {
         debug_assert!(
             *orig_row < n_rows,
             "orig_row {orig_row} out of range (n_rows={n_rows})",
         );
+        touched.rebuild(cells, |orig_off| {
+            debug_assert!(
+                (orig_off as u32) < row_width,
+                "orig_off {orig_off} out of range (row_width={row_width})",
+            );
+            translate(*orig_row, orig_off, k, row_width).1 as usize
+        });
+        if touched.is_empty() {
+            continue;
+        }
         let (reshape_row, _) = translate(*orig_row, 0, k, row_width);
         let a_row =
             &a[(reshape_row as usize) * lwe_dim_us..(reshape_row as usize + 1) * lwe_dim_us];
-
-        for (orig_off, delta) in cells {
-            debug_assert!(
-                (*orig_off as u32) < row_width,
-                "orig_off {orig_off} out of range (row_width={row_width})",
-            );
-            if *delta == 0 {
-                continue;
-            }
-            let (_, reshape_off) = translate(*orig_row, *orig_off, k, row_width);
-            let delta_u32 = *delta as u32;
-            let cell_us = reshape_off as usize;
-
-            for (k_idx, &aik) in a_row.iter().enumerate() {
-                if aik == 0 {
-                    continue;
-                }
-                let idx = k_idx * reshape_row_width_us + cell_us;
-                hint[idx] = hint[idx].wrapping_add(aik.wrapping_mul(delta_u32));
-            }
-        }
+        touched.apply(a_row, hint, reshape_row_width_us);
     }
 }
 
@@ -1077,16 +1076,26 @@ fn apply_patch_entry_level(
 /// The paper's row-level patch operates on rows of the reshaped matrix
 /// `D`, and the reshape packs `k` original (bucket) rows into each
 /// reshape row — so edits from different original rows can land in the
-/// same reshape row and must share **one** dense rank-one update. The
-/// edits are therefore grouped by reshape row first, densified into a
-/// full `reshape_row_width`-wide delta vector (zero at untouched
-/// columns), and applied as
+/// same reshape row and should share **one** dense rank-one update.
+///
+/// Deltas arrive sorted by original row (`fold_mutations_into_row_deltas`
+/// drains a `BTreeMap`), and `reshape_row = orig_row / k` is monotone in
+/// `orig_row`, so the rows sharing a reshape row are already adjacent.
+/// The scan therefore consumes one *run* at a time through a single
+/// reused dense buffer: densify the run into a `reshape_row_width`-wide
+/// delta vector, apply
 /// `H[k_idx, ·] += A[reshape_row, k_idx] · δ[·] mod 2³²` across the
-/// entire hint width. `BTreeMap` keeps the update order deterministic.
-/// The `aik == 0` early-exit matches [`apply_patch_entry_level`] so the
-/// two realizations share the same micro-optimisation policy (on the
-/// uniform-`Z_q` `A` it fires with probability `2⁻³²` — kept for parity
-/// with FrodoPIR).
+/// entire hint width, then clear only the cells that run wrote. Exactly
+/// one dense vector is ever live. Materialising the whole grouping up
+/// front instead would hold one per touched reshape row — ~70 MB against
+/// ~31 KB for a τ = 1 % batch at the (4, 1) paper config.
+///
+/// Unsorted input stays **correct**, and is merely slower: the update is
+/// linear and wrapping `u32` addition is associative, so splitting one
+/// reshape row across several rank-one updates reaches the same hint. It
+/// only costs extra full-width passes, which is why this is a run scan
+/// and not a defensive sort. No `aik == 0` shortcut — see
+/// [`compute_hint`].
 ///
 /// # Complexity
 ///
@@ -1112,36 +1121,51 @@ fn apply_patch_row_level(
     debug_assert_eq!(a.len(), (reshape_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * reshape_row_width_us);
 
-    let mut dense_by_reshape_row: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (orig_row, cells) in row_deltas {
-        debug_assert!(
-            *orig_row < n_rows,
-            "orig_row {orig_row} out of range (n_rows={n_rows})",
-        );
-        for (orig_off, delta) in cells {
-            debug_assert!(
-                (*orig_off as u32) < row_width,
-                "orig_off {orig_off} out of range (row_width={row_width})",
-            );
-            let (reshape_row, reshape_off) = translate(*orig_row, *orig_off, k, row_width);
-            let dense = dense_by_reshape_row
-                .entry(reshape_row)
-                .or_insert_with(|| vec![0u32; reshape_row_width_us]);
-            let cell_us = reshape_off as usize;
-            dense[cell_us] = dense[cell_us].wrapping_add(*delta as u32);
-        }
-    }
+    // The working set, not an accumulator: exactly one dense delta vector
+    // is live at any point, reused across every run.
+    let mut dense = vec![0u32; reshape_row_width_us];
 
-    for (reshape_row, dense) in &dense_by_reshape_row {
-        let a_row =
-            &a[(*reshape_row as usize) * lwe_dim_us..(*reshape_row as usize + 1) * lwe_dim_us];
-        for (k_idx, &aik) in a_row.iter().enumerate() {
-            if aik == 0 {
-                continue;
+    let mut i = 0;
+    while i < row_deltas.len() {
+        let reshape_row = row_deltas[i].0 / k;
+        let run_start = i;
+
+        // Densify the run of original rows sharing this reshape row.
+        while i < row_deltas.len() && row_deltas[i].0 / k == reshape_row {
+            let (orig_row, cells) = &row_deltas[i];
+            debug_assert!(
+                *orig_row < n_rows,
+                "orig_row {orig_row} out of range (n_rows={n_rows})",
+            );
+            // `off_within` is invariant across the row's cells, so it is
+            // hoisted out of the inner loop rather than recomputed per cell.
+            let off_within = (*orig_row % k) * row_width;
+            for (orig_off, delta) in cells {
+                debug_assert!(
+                    (*orig_off as u32) < row_width,
+                    "orig_off {orig_off} out of range (row_width={row_width})",
+                );
+                let cell_us = (off_within + u32::from(*orig_off)) as usize;
+                dense[cell_us] = dense[cell_us].wrapping_add(*delta as u32);
             }
+            i += 1;
+        }
+
+        let a_row =
+            &a[(reshape_row as usize) * lwe_dim_us..(reshape_row as usize + 1) * lwe_dim_us];
+        for (k_idx, &aik) in a_row.iter().enumerate() {
             let h_row = &mut hint[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
             for (h, &d) in h_row.iter_mut().zip(dense.iter()) {
                 *h = h.wrapping_add(aik.wrapping_mul(d));
+            }
+        }
+
+        // Clear only what this run wrote — `O(touched cells)`, not
+        // `O(reshape_row_width)`. Idempotent under duplicate offsets.
+        for (orig_row, cells) in &row_deltas[run_start..i] {
+            let off_within = (*orig_row % k) * row_width;
+            for (orig_off, _) in cells {
+                dense[(off_within + u32::from(*orig_off)) as usize] = 0;
             }
         }
     }
@@ -1161,7 +1185,7 @@ mod tests {
     /// The optimized hint kernel is bit-identical to the reference —
     /// including the reshape coordinate translation and the ragged last
     /// reshape row (`n_rows % k != 0`, which the first shape triggers).
-    /// Every shape exceeds `PAR_MIN_HINT_MACS` (asserted, so the test
+    /// Every shape exceeds `parallel::PAR_MIN_HINT_MACS` (asserted, so the test
     /// cannot silently go vacuous if the threshold moves) and the
     /// `lwe_dim` values are both multiples and non-multiples of any
     /// plausible worker count.
@@ -1171,7 +1195,8 @@ mod tests {
             [(259u32, 33u32, 256u32), (256, 16, 1031), (1024, 64, 17)]
         {
             assert!(
-                u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width) >= PAR_MIN_HINT_MACS,
+                u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width)
+                    >= parallel::PAR_MIN_HINT_MACS,
                 "shape ({n_rows}, {row_width}, {lwe_dim}) must exceed the parallel threshold"
             );
             let (k, reshape_rows, reshape_row_width) = reshape_dims(n_rows, row_width);
@@ -2028,6 +2053,173 @@ mod tests {
             decoded, expected,
             "decode after row-level patch did not recover patched row"
         );
+    }
+
+    /// A zero delta is a no-op under the row-level realization too. Worth
+    /// pinning separately from the entry-level case: row-level does not
+    /// skip zero deltas — it densifies them into the shared buffer and
+    /// runs the full-width pass anyway — so this also catches a buffer
+    /// that the previous run failed to clear.
+    #[test]
+    fn row_level_patch_zero_delta_is_noop() {
+        let pb = 8u32;
+        let n_rows = 16u32;
+        let row_width = 4u32;
+        let cfg = SimpleConfig {
+            lwe_dim: 256,
+            sigma: 6.4,
+        };
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, mut hint) = SimplePirBackend::server_setup(&cfg, &db, n_rows, row_width, pb);
+        assert_eq!(sp.k, 2, "fixture intends a k > 1 reshape");
+
+        // A real edit first, so the second (zero) patch runs against a
+        // buffer the previous run has written to and cleared.
+        let d = apply_cell_delta(&mut db, 4, 1, 9, row_width, pb);
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &[(4u32, vec![(1u16, d)])],
+            HintPatchMode::RowLevel,
+        );
+        let hint_before = hint.data.clone();
+
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint,
+            &[(5u32, vec![(3u16, 0i64)])],
+            HintPatchMode::RowLevel,
+        );
+
+        assert_eq!(hint.data, hint_before, "zero delta must not move the hint");
+    }
+
+    /// Duplicate edits to the same `(row, cell)` within one call must
+    /// accumulate identically under both realizations: entry-level applies
+    /// them one by one, row-level sums them while densifying. The batch
+    /// also spans two original rows sharing one reshape row (`4 / 2 ==
+    /// 5 / 2`), so the duplicates land in the *same* dense buffer that the
+    /// row-level run scan reuses.
+    #[test]
+    fn duplicate_cell_edits_accumulate_identically() {
+        let pb = 8u32;
+        let n_rows = 16u32;
+        let row_width = 4u32;
+        let cfg = SimpleConfig {
+            lwe_dim: 256,
+            sigma: 6.4,
+        };
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, hint0) = SimplePirBackend::server_setup(&cfg, &db, n_rows, row_width, pb);
+        assert_eq!(
+            sp.k, 2,
+            "fixture intends rows 4 and 5 to share reshape row 2"
+        );
+
+        let d1 = apply_cell_delta(&mut db, 4, 2, 3, row_width, pb);
+        let d2 = apply_cell_delta(&mut db, 4, 2, 2, row_width, pb);
+        let d3 = apply_cell_delta(&mut db, 5, 2, -6, row_width, pb);
+        let row_deltas = vec![
+            (4u32, vec![(2u16, d1), (2u16, d2)]),
+            (5u32, vec![(2u16, d3)]),
+        ];
+
+        let mut hint_entry = hint0.clone();
+        let mut hint_row = hint0;
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint_entry,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint_row,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+        assert_eq!(
+            hint_entry.data, hint_row.data,
+            "realizations diverged on duplicate cell edits"
+        );
+
+        let expected = compute_hint(
+            &mat.a,
+            &db,
+            n_rows,
+            row_width,
+            sp.k,
+            sp.params.lwe_dim,
+            sp.reshape_row_width,
+        );
+        assert_eq!(hint_row.data, expected, "patched hint diverged from oracle");
+    }
+
+    /// Full round-trip under `RowLevel` with a **warm** Phase-B/Phase-C
+    /// queue: precompute, patch via `client_patch_state(.., RowLevel)`,
+    /// then decode. Exercises the interplay between the row-level hint
+    /// patch and the (deliberately mode-independent) `patch_slot_c`, which
+    /// the entry-level `patched_c_matches_recomputed_c` test leaves
+    /// uncovered on this side.
+    #[test]
+    fn decode_after_row_level_patch_with_precomputed_c() {
+        let pb = 8u32;
+        let n_rows = 16u32;
+        let row_width = 4u32;
+        let cfg = SimpleConfig {
+            lwe_dim: 256,
+            sigma: 6.4,
+        };
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, hint) = SimplePirBackend::server_setup(&cfg, &db, n_rows, row_width, pb);
+        let mut state = SimplePirBackend::client_setup(&sp, &hint);
+        let mut server_hint = hint;
+
+        SimplePirBackend::client_precompute_queries(&mut state, 4);
+        SimplePirBackend::client_precompute_decodes(&mut state);
+
+        // Rows 4 and 5 share a reshape row; row 11 sits in another one.
+        let raw: &[(u32, &[(u16, i64)])] =
+            &[(4, &[(0, 5), (3, -2)]), (5, &[(2, -4)]), (11, &[(1, 7)])];
+        let row_deltas: Vec<(u32, Vec<(u16, i64)>)> = raw
+            .iter()
+            .map(|&(row, cells)| {
+                let actual: Vec<(u16, i64)> = cells
+                    .iter()
+                    .map(|&(off, dlt)| {
+                        (off, apply_cell_delta(&mut db, row, off, dlt, row_width, pb))
+                    })
+                    .collect();
+                (row, actual)
+            })
+            .collect();
+
+        SimplePirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut server_hint,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+        SimplePirBackend::client_patch_state(&mut state, &row_deltas, HintPatchMode::RowLevel);
+        assert_eq!(
+            state.hint.data, server_hint.data,
+            "server and client row-level patched hints must be identical"
+        );
+
+        for &(target_row, _) in raw {
+            let q = SimplePirBackend::client_query(&mut state, target_row);
+            let r = SimplePirBackend::server_answer(&sp, &db, n_rows, row_width, &q);
+            let decoded = SimplePirBackend::client_decode(&state, &r);
+            let expected = db[target_row as usize * row_width as usize
+                ..(target_row as usize + 1) * row_width as usize]
+                .to_vec();
+            assert_eq!(decoded, expected, "decode failed for row {target_row}");
+        }
     }
 
     // ── Noise-margin probes (paper-scale, `#[ignore]`d) ─────────────────

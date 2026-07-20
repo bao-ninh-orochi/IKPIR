@@ -10,8 +10,7 @@
 //! columns. A once-per-config `verify_decode` guards against silent decode
 //! regressions before the timed loop.
 //!
-//! **Arguments (CLI):** Same as `client_decode`, plus `--num-keys` (required)
-//! and `--max-mem-gb` (OOM guard).
+//! **Arguments (CLI):** Same as `client_decode`, plus `--num-keys` (required).
 //!
 //! **Output:** `results/ikpir_headtohead_client_decode.csv`
 
@@ -69,10 +68,6 @@ struct Cli {
     /// repeated iterations do not reuse hot CPU-cache state from the previous call.
     #[arg(long, default_value_t = 64)]
     batch: u32,
-    /// Skip configs whose estimated peak memory exceeds this limit. Default
-    /// 85.0 is tuned for a ~96 GB server; lower it on smaller machines.
-    #[arg(long, default_value_t = 85.0)]
-    max_mem_gb: f64,
 }
 
 fn effective_lwe_dim(cli: &Cli) -> u32 {
@@ -99,27 +94,6 @@ fn run_one<S, B>(
 {
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
-
-    // ── 0. Memory guard ─────────────────────────────────────────────────────────
-    let lwe_dim_est = effective_lwe_dim(cli) as u64;
-    let cells_per_slot_est =
-        (cli.fingerprint_bits + cli.value_bits).div_ceil(cli.plaintext_bits) as u64;
-    let row_width_est = cli.bucket_size as u64 * cells_per_slot_est;
-    let n_rows_per_seg = num_buckets as u64 / arity as u64;
-    let table_bytes = num_buckets as u64 * cli.bucket_size as u64 * cells_per_slot_est * 4;
-    let (a_rows_per_seg, _c_len_per_seg) =
-        helpers::backend_shape_estimate(cli.backend, n_rows_per_seg, row_width_est);
-    let a_bytes = arity as u64 * a_rows_per_seg * lwe_dim_est * 4;
-    let estimated_gb = (table_bytes + a_bytes) as f64 / 1e9;
-    if estimated_gb > cli.max_mem_gb {
-        eprintln!(
-            "  Skip (OOM guard): estimated peak {:.1} GB > --max-mem-gb {:.1} \
-             (nb={num_buckets} bs={} vb={} lwe_dim={lwe_dim_est} backend={}). \
-             Raise --max-mem-gb on machines with more RAM.",
-            estimated_gb, cli.max_mem_gb, cli.bucket_size, cli.value_bits, cli.backend,
-        );
-        return;
-    }
 
     // ── 1. Populate exactly num_keys ────────────────────────────────────────────
     let (store, n_inserted) = helpers::populate_exact_n_keys::<S>(
@@ -153,8 +127,7 @@ fn run_one<S, B>(
     let cps = params_store.cells_per_slot();
     let row_width = cli.bucket_size * cps;
     let segment_rows = params_store.segment_size();
-    let (db_rows, db_cols) =
-        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
+    let (db_rows, db_cols) = B::db_matrix_shape(&server.backend_params()[0]);
     let db_size = (num_buckets as u64) * (cli.bucket_size as u64);
     let load_factor = n_inserted as f64 / db_size as f64;
     let lwe_dim_eff = effective_lwe_dim(cli);
