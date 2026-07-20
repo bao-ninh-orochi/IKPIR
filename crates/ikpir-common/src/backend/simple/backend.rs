@@ -45,7 +45,7 @@
 //! - `sampler.rs` — `sample_a` / `sample_uniform_zq_into`
 //!   / `sample_discrete_gaussian_into`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use rand::RngCore;
 
@@ -1068,13 +1068,26 @@ fn apply_patch_entry_level(
 /// The paper's row-level patch operates on rows of the reshaped matrix
 /// `D`, and the reshape packs `k` original (bucket) rows into each
 /// reshape row — so edits from different original rows can land in the
-/// same reshape row and must share **one** dense rank-one update. The
-/// edits are therefore grouped by reshape row first, densified into a
-/// full `reshape_row_width`-wide delta vector (zero at untouched
-/// columns), and applied as
+/// same reshape row and should share **one** dense rank-one update.
+///
+/// Deltas arrive sorted by original row (`fold_mutations_into_row_deltas`
+/// drains a `BTreeMap`), and `reshape_row = orig_row / k` is monotone in
+/// `orig_row`, so the rows sharing a reshape row are already adjacent.
+/// The scan therefore consumes one *run* at a time through a single
+/// reused dense buffer: densify the run into a `reshape_row_width`-wide
+/// delta vector, apply
 /// `H[k_idx, ·] += A[reshape_row, k_idx] · δ[·] mod 2³²` across the
-/// entire hint width. `BTreeMap` keeps the update order deterministic.
-/// No `aik == 0` shortcut — see [`compute_hint`].
+/// entire hint width, then clear only the cells that run wrote. Exactly
+/// one dense vector is ever live. Materialising the whole grouping up
+/// front instead would hold one per touched reshape row — ~70 MB against
+/// ~31 KB for a τ = 1 % batch at the (4, 1) paper config.
+///
+/// Unsorted input stays **correct**, and is merely slower: the update is
+/// linear and wrapping `u32` addition is associative, so splitting one
+/// reshape row across several rank-one updates reaches the same hint. It
+/// only costs extra full-width passes, which is why this is a run scan
+/// and not a defensive sort. No `aik == 0` shortcut — see
+/// [`compute_hint`].
 ///
 /// # Complexity
 ///
@@ -1100,33 +1113,51 @@ fn apply_patch_row_level(
     debug_assert_eq!(a.len(), (reshape_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * reshape_row_width_us);
 
-    let mut dense_by_reshape_row: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (orig_row, cells) in row_deltas {
-        debug_assert!(
-            *orig_row < n_rows,
-            "orig_row {orig_row} out of range (n_rows={n_rows})",
-        );
-        for (orig_off, delta) in cells {
-            debug_assert!(
-                (*orig_off as u32) < row_width,
-                "orig_off {orig_off} out of range (row_width={row_width})",
-            );
-            let (reshape_row, reshape_off) = translate(*orig_row, *orig_off, k, row_width);
-            let dense = dense_by_reshape_row
-                .entry(reshape_row)
-                .or_insert_with(|| vec![0u32; reshape_row_width_us]);
-            let cell_us = reshape_off as usize;
-            dense[cell_us] = dense[cell_us].wrapping_add(*delta as u32);
-        }
-    }
+    // The working set, not an accumulator: exactly one dense delta vector
+    // is live at any point, reused across every run.
+    let mut dense = vec![0u32; reshape_row_width_us];
 
-    for (reshape_row, dense) in &dense_by_reshape_row {
+    let mut i = 0;
+    while i < row_deltas.len() {
+        let reshape_row = row_deltas[i].0 / k;
+        let run_start = i;
+
+        // Densify the run of original rows sharing this reshape row.
+        while i < row_deltas.len() && row_deltas[i].0 / k == reshape_row {
+            let (orig_row, cells) = &row_deltas[i];
+            debug_assert!(
+                *orig_row < n_rows,
+                "orig_row {orig_row} out of range (n_rows={n_rows})",
+            );
+            // `off_within` is invariant across the row's cells, so it is
+            // hoisted out of the inner loop rather than recomputed per cell.
+            let off_within = (*orig_row % k) * row_width;
+            for (orig_off, delta) in cells {
+                debug_assert!(
+                    (*orig_off as u32) < row_width,
+                    "orig_off {orig_off} out of range (row_width={row_width})",
+                );
+                let cell_us = (off_within + u32::from(*orig_off)) as usize;
+                dense[cell_us] = dense[cell_us].wrapping_add(*delta as u32);
+            }
+            i += 1;
+        }
+
         let a_row =
-            &a[(*reshape_row as usize) * lwe_dim_us..(*reshape_row as usize + 1) * lwe_dim_us];
+            &a[(reshape_row as usize) * lwe_dim_us..(reshape_row as usize + 1) * lwe_dim_us];
         for (k_idx, &aik) in a_row.iter().enumerate() {
             let h_row = &mut hint[k_idx * reshape_row_width_us..(k_idx + 1) * reshape_row_width_us];
             for (h, &d) in h_row.iter_mut().zip(dense.iter()) {
                 *h = h.wrapping_add(aik.wrapping_mul(d));
+            }
+        }
+
+        // Clear only what this run wrote — `O(touched cells)`, not
+        // `O(reshape_row_width)`. Idempotent under duplicate offsets.
+        for (orig_row, cells) in &row_deltas[run_start..i] {
+            let off_within = (*orig_row % k) * row_width;
+            for (orig_off, _) in cells {
+                dense[(off_within + u32::from(*orig_off)) as usize] = 0;
             }
         }
     }
