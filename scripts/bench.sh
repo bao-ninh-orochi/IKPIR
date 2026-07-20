@@ -31,8 +31,10 @@
 #                          uses in its untimed preamble — diagnostic, never a
 #                          paper number. The CSV's setup_mode column records it
 #                          (full_parallel / per_segment_parallel).
-#                          IKPIR_SETUP_THREADS caps the worker count everywhere;
-#                          set it to 1 to force the reference schedule.
+#                          IKPIR_SETUP_THREADS sets the worker count everywhere
+#                          (default: the machine's available parallelism, and
+#                          clamped to MAX_SETUP_THREADS = 1024); set it to 1 to
+#                          force the reference schedule.
 #   Mutation benches also take:
 #     --n-mutations N      (default: 1% of the table's slots — the paper's τ)
 #     --patch-mode M       entry | row | entry,row           (default entry,row)

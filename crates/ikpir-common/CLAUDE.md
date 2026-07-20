@@ -26,7 +26,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
 | `src/backend/matvec.rs` | `matvec_accumulate` — shared width-adaptive register-blocked `acc += qᵀ·D` kernel used by every online hot loop (`server_answer`, `client_decode` cold path, `compute_c`) in both backends; bit-exact vs the naive loop, no explicit SIMD/threads |
 | `src/backend/patch.rs` | `TouchedRuns` — the entry-level hint patch's inner loop, shared by both backends: coalesces one row's touched hint columns into contiguous runs, then applies `H[k, c] += A[row, k] · Δ_c` with `k` outermost, sweeping the hint once instead of once per touched column |
-| `src/backend/parallel.rs` | `setup_threads` / `balanced_chunk_len` / `par_chunks_mut` — `std::thread::scope` fan-out behind the optimized setup path; no dependency, static disjoint-output partition, worker count via `IKPIR_SETUP_THREADS` |
+| `src/backend/parallel.rs` | `setup_threads` / `balanced_chunk_len` / `par_chunks_mut` — `std::thread::scope` fan-out behind the optimized setup path; no dependency, static disjoint-output partition, worker count via `IKPIR_SETUP_THREADS` (clamped to `MAX_SETUP_THREADS`). Also the single source of truth for the fan-out thresholds `PAR_MIN_HINT_MACS` / `PAR_MIN_WORDS`, which both backends and their tests read |
 | `src/backend/frodo/arith.rs` | `round_p_to_q` / `round_q_to_p` — plaintext ↔ ciphertext modulus conversion |
 | `src/backend/frodo/sampler.rs` | `sample_a` (LWE public matrix) + `sample_ternary_into` (LWE secret / error sampling) |
 | `src/backend/simple/mod.rs` | Re-exports the SimplePIR backend's public surface + math summary |
@@ -254,7 +254,7 @@ composition.
 | Online matvec hot loop (`acc += qᵀ·D`) | `backend/matvec.rs::matvec_accumulate` — shared by both backends (unlike `arith.rs`, deliberately *not* duplicated: it is backend-agnostic linear algebra whose blocking tunables must never diverge) |
 | Entry-level patch inner loop | `backend/patch.rs::TouchedRuns` — shared for the same reason as `matvec.rs`; the backends differ only in the `column_of` closure they pass (identity for FrodoPIR, the reshape translation for SimplePIR) |
 | Optimized (multi-threaded) setup | `backend/mod.rs::ParallelSetupBackend` (contract) → `compute_hint_parallel` in each `backend/*/backend.rs` + `sample_a_parallel` in each `backend/*/sampler.rs`; fan-out in `backend/parallel.rs` |
-| Worker count for the optimized setup | `backend/parallel.rs::setup_threads` — `IKPIR_SETUP_THREADS`, else `available_parallelism()`; set to `1` to force the reference schedule when bisecting |
+| Worker count for the optimized setup | `backend/parallel.rs::setup_threads` — `IKPIR_SETUP_THREADS`, else `available_parallelism()`, clamped to `MAX_SETUP_THREADS` (1024) so a typo cannot spawn a thread per keystream buffer; set to `1` to force the reference schedule when bisecting |
 | LWE sampling (FrodoPIR) | `backend/frodo/sampler.rs` (`sample_a`, `sample_a_parallel`, `sample_ternary_into`) |
 | LWE sampling (SimplePIR) | `backend/simple/sampler.rs` (`sample_a`, `sample_a_parallel`, `sample_uniform_zq_into`, `sample_discrete_gaussian_into`) |
 | Cross-crate integration tests | `ikpir-server/tests/frodo_compose.rs` + `simple_compose.rs` exercise each backend end-to-end against `IkpirServer` |

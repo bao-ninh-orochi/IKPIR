@@ -483,17 +483,6 @@ fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32
     h
 }
 
-/// Below this much setup work, computing `H` on one thread beats
-/// paying for thread spawn. ~1M multiply-adds — a millisecond or so
-/// sequential, against tens of microseconds to spawn. Every realistic
-/// segment shape clears it by orders of magnitude, so the guard only
-/// matters for the tiny shapes used in unit tests.
-///
-/// Gating on the **work** (`n_rows · lwe_dim · row_width`) rather than
-/// on the output size matters: a tall segment with a narrow row can
-/// have a small hint and still be minutes of arithmetic.
-const PAR_MIN_HINT_MACS: u64 = 1 << 20;
-
 /// Multi-threaded twin of [`compute_hint`] — **bit-identical output**.
 ///
 /// # Purpose
@@ -518,7 +507,7 @@ const PAR_MIN_HINT_MACS: u64 = 1 << 20;
 /// cache levels.
 ///
 /// Falls back to [`compute_hint`] on a single core or below
-/// [`PAR_MIN_HINT_MACS`].
+/// [`parallel::PAR_MIN_HINT_MACS`].
 fn compute_hint_parallel(
     a: &[u32],
     db: &[u32],
@@ -530,7 +519,7 @@ fn compute_hint_parallel(
     let row_width_us = row_width as usize;
     let macs = u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width);
     let threads = parallel::setup_threads();
-    if threads <= 1 || macs < PAR_MIN_HINT_MACS {
+    if threads <= 1 || macs < parallel::PAR_MIN_HINT_MACS {
         return compute_hint(a, db, n_rows, lwe_dim, row_width);
     }
 
@@ -541,6 +530,12 @@ fn compute_hint_parallel(
     let chunk = parallel::balanced_chunk_len(h.len(), row_width_us, threads);
     parallel::par_chunks_mut(&mut h, chunk, |offset, band| {
         let k0 = offset / row_width_us;
+        // Whole hint rows per band: `balanced_chunk_len` was given
+        // `row_width` as its unit and `h.len()` is `lwe_dim · row_width`,
+        // so every chunk — including the ragged last one — divides
+        // exactly. The floor below would silently drop the tail rows if
+        // that ever stopped holding.
+        debug_assert_eq!(band.len() % row_width_us, 0, "band must be whole hint rows");
         let band_rows = band.len() / row_width_us;
         for i in 0..n_rows as usize {
             let a_row = &a[i * lwe_dim_us + k0..i * lwe_dim_us + k0 + band_rows];
@@ -939,7 +934,7 @@ mod tests {
     }
 
     /// The optimized hint kernel is bit-identical to the reference.
-    /// Every shape exceeds `PAR_MIN_HINT_MACS` (asserted, so the test
+    /// Every shape exceeds `parallel::PAR_MIN_HINT_MACS` (asserted, so the test
     /// cannot silently go vacuous if the threshold moves) and the
     /// `lwe_dim` values are both multiples and non-multiples of any
     /// plausible worker count, exercising the ragged last band.
@@ -949,7 +944,8 @@ mod tests {
             [(37u32, 257u32, 256u32), (32, 64, 1031), (24, 4096, 17)]
         {
             assert!(
-                u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width) >= PAR_MIN_HINT_MACS,
+                u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width)
+                    >= parallel::PAR_MIN_HINT_MACS,
                 "shape ({n_rows}, {row_width}, {lwe_dim}) must exceed the parallel threshold"
             );
             let db = make_db(n_rows, row_width, 8);
