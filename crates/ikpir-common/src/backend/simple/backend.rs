@@ -309,6 +309,11 @@ impl IndexPirBackend for SimplePirBackend {
         )
     }
 
+    fn db_matrix_shape(params: &SimpleServerParams) -> (u32, u32) {
+        // Post-reshape dims as `reshape_dims` fixed them at setup time.
+        (params.reshape_rows, params.reshape_row_width)
+    }
+
     fn expand_hint_material(params: &SimpleServerParams) -> SimpleHintMaterial {
         let a = sample_a(
             &params.params.seed,

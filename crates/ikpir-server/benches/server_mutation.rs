@@ -116,6 +116,9 @@ struct KindResult {
     n_succeeded: u32,
     total_ms: f64,
     delta_bytes_total: usize,
+    /// `(db_rows, db_cols)` as the backend recorded them at setup — read off
+    /// the server this run built, since `run_one` has no server of its own.
+    db_shape: (u32, u32),
 }
 
 fn run_kind<S, B>(
@@ -141,6 +144,7 @@ where
     store.set_max_kicks(2_500);
     let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store, make_config());
     server.set_hint_patch_mode(mode.to_hint_patch_mode());
+    let db_shape = B::db_matrix_shape(&server.backend_params()[0]);
 
     let mut delta_bytes_total = 0usize;
     let mut n_succeeded = 0u32;
@@ -180,6 +184,7 @@ where
         n_succeeded,
         total_ms,
         delta_bytes_total,
+        db_shape,
     }
 }
 
@@ -217,8 +222,6 @@ fn run_one<S, B>(
     let cps = params.cells_per_slot();
     let row_width = cli.bucket_size * cps;
     let segment_rows = params.segment_size();
-    let (db_rows, db_cols) =
-        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
     let store_state = helpers::StoreState {
         capacity: (num_buckets as u64) * (cli.bucket_size as u64),
         populated: n_seed,
@@ -293,6 +296,7 @@ fn run_one<S, B>(
     for &mode in &modes {
         for &kind in MutationKind::all() {
             let r = run_kind::<S, B>(cli, &cells, params, n_seed, kind, mode, &make_config);
+            let (db_rows, db_cols) = r.db_shape;
             let ops_per_s = if r.total_ms > 0.0 {
                 r.n_succeeded as f64 / r.total_ms * 1e3
             } else {

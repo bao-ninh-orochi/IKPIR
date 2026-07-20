@@ -20,7 +20,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/lib.rs` | Top-level re-exports of `backend`, `wire`, and `error` |
 | `src/error.rs` | `IkpirError` enum (5 variants) — returned by server methods, wrapped by `IkpirClientError::Server` on the client side |
 | `src/wire.rs` | Wire-format bundles `ServerSetupBundle / PirQueryBundle / PirResponseBundle / HintDeltaBundle`, the `SegmentRowDeltas` type alias, and per-bundle `wire_byte_size` helpers |
-| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 5 methods), `IncrementalPirBackend` (+2 methods, both taking a `HintPatchMode`), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods); `HintPatchMode` enum (`RowLevel` / `EntryLevel`, default `EntryLevel`) |
+| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 7 methods), `IncrementalPirBackend` (+2 methods, both taking a `HintPatchMode`), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods); `HintPatchMode` enum (`RowLevel` / `EntryLevel`, default `EntryLevel`) |
 | `src/backend/frodo/mod.rs` | Re-exports the FrodoPIR backend's public surface |
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
@@ -157,6 +157,7 @@ IndexPirBackend (mandatory)
 │   ServerParams / HintMaterial / Hint / ClientState / Query / Response / Config
 │   server_setup(config, db, n_rows, row_width, plaintext_bits)
 │       -> (ServerParams, HintMaterial, Hint)
+│   db_matrix_shape(params) -> (rows, cols)
 │   expand_hint_material(params) -> HintMaterial
 │   client_setup(params, hint) -> ClientState
 │   client_query(state, row) -> Query
@@ -271,17 +272,25 @@ composition.
 3. `server_setup(config, db, n_rows, row_width, plaintext_bits)` returns
    `(ServerParams, HintMaterial, Hint)` from the DB slice and the
    supplied config.
-4. `expand_hint_material(params)` re-derives the `HintMaterial` from
+4. `db_matrix_shape(params)` reports the `(rows, cols)` of the matrix the
+   backend actually multiplies, **read back from `params`** — never
+   recomputed from the caller's `(n_rows, row_width)`. A backend that
+   reshapes (SimplePIR's near-square fold) must have stored its chosen
+   dims in `ServerParams` at `server_setup` time and return those. This
+   is what the benches' `db_rows` / `db_cols` columns report, so a
+   re-derivation here would let the published geometry drift from the
+   real one.
+5. `expand_hint_material(params)` re-derives the `HintMaterial` from
    `ServerParams`. **Determinism contract**: same seed/state inside
    `params` must yield bit-identical output, since the server may drop
    and re-expand mid-protocol and the client materialises its own copy
    independently from the wire seed.
-5. `client_setup` returns `ClientState` from `(ServerParams, Hint)`,
+6. `client_setup` returns `ClientState` from `(ServerParams, Hint)`,
    internally calling `expand_hint_material(params)` and stashing both
    `params` and the materialised state.
-6. The triple `(client_query, server_answer, client_decode)` must satisfy:
+7. The triple `(client_query, server_answer, client_decode)` must satisfy:
    `client_decode(server_answer(client_query(state, row))) == db[row*row_width..(row+1)*row_width]`.
-7. If implementing `IncrementalPirBackend`: `server_patch_hint(params,
+8. If implementing `IncrementalPirBackend`: `server_patch_hint(params,
    material, hint, row_deltas, mode)` and `client_patch_state(state,
    row_deltas, mode)` must keep `Hint` and `ClientState` consistent with
    the updated DB for **all** future queries. `client_patch_state` reads
@@ -289,14 +298,14 @@ composition.
    must produce the same post-patch state — the mode may only change the
    arithmetic schedule (row-level dense pass vs entry-level per-cell
    pass), never the result.
-8. If implementing `PrecomputingPirBackend`: prepared slots are consumed
+9. If implementing `PrecomputingPirBackend`: prepared slots are consumed
    FIFO segment-locally; `client_patch_state` must also update
    already-prepared Phase-C material (see the trait's contract block).
-9. If implementing `BackendWireSize`: return the *minimum* fixed-width
+10. If implementing `BackendWireSize`: return the *minimum* fixed-width
    little-endian byte size — no framing, no compression. **Do not
    include `HintMaterial`** in `server_params_byte_size`; it never
    travels on the wire.
-10. If implementing `ParallelSetupBackend`: the three `*_parallel`
+11. If implementing `ParallelSetupBackend`: the three `*_parallel`
    methods must return what their reference twins would have returned
    for the same seed — **bit-identical**, not just decode-equivalent.
    Get that by partitioning the *output* only (disjoint hint bands,

@@ -36,6 +36,8 @@ under all three paths.
 ```text
 IndexPirBackend (mandatory)
 │   server_setup / client_setup / client_query / server_answer / client_decode
+│   expand_hint_material  — re-derive server-local `A` from the seed
+│   db_matrix_shape       — the (rows, cols) the backend settled on at setup
 │
 ├── IncrementalPirBackend           (sparse hint patching, no full recompute)
 │   server_patch_hint / client_patch_state   — both take a HintPatchMode:

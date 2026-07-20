@@ -128,8 +128,7 @@ fn run_one<S, B>(
     let cps = params_store.cells_per_slot();
     let row_width = cli.bucket_size * cps;
     let segment_rows = params_store.segment_size();
-    let (db_rows, db_cols) =
-        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
+    let (db_rows, db_cols) = B::db_matrix_shape(&server.backend_params()[0]);
     let load_factor = n_inserted as f64 / (num_buckets as f64 * cli.bucket_size as f64);
     let lwe_dim_eff = effective_lwe_dim(cli);
     let store_state = helpers::StoreState {

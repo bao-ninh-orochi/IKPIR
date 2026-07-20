@@ -176,47 +176,6 @@ pub fn patch_modes_label(modes: &[PatchMode]) -> String {
         .join(",")
 }
 
-/// Per-segment database matrix `D` shape `(rows, row_width)` for the
-/// given backend, given the original `(n_rows_per_seg, row_width)`.
-///
-/// # Rationale
-///
-/// The head-to-head benches' OOM guard (and the `db_rows`/`db_cols` shape
-/// columns every bench reports) need the per-segment `D` shape because every
-/// other LWE-PIR buffer derives its dimensions from it:
-/// - `A` is `rows × lwe_dim` — shares `D`'s row count, so `rows` drives
-///   the `A` allocation and the per-slot `b`-vector length
-///   (`b = A·s + e + Δ·u`, length `rows`).
-/// - `H = Aᵀ · D` is `lwe_dim × row_width` — shares `D`'s row width,
-///   so `row_width` drives the hint allocation and the prepared-slot
-///   `c`-vector length (`c = sᵀ · H`, length `row_width`).
-///
-/// FrodoPIR keeps the original layout; SimplePIR reshapes into a
-/// near-square `(reshape_rows × reshape_row_width)` matrix with
-/// `k = max(1, round(√(n_rows_per_seg / row_width)))`. The formula
-/// mirrors `reshape_dims` in `ikpir-common/src/backend/simple/backend.rs`.
-///
-/// # Returns
-///
-/// `(d_rows_per_seg, d_row_width_per_seg)`:
-/// - FrodoPIR:  `(n_rows_per_seg, row_width)`
-/// - SimplePIR: `(⌈n_rows_per_seg / k⌉, k · row_width)`
-#[allow(dead_code)]
-pub fn backend_shape_estimate(backend: Backend, n_rows_per_seg: u64, row_width: u64) -> (u64, u64) {
-    match backend {
-        Backend::Frodo => (n_rows_per_seg, row_width),
-        Backend::Simple => {
-            let k = ((n_rows_per_seg as f64 / row_width as f64)
-                .sqrt()
-                .round()
-                .max(1.0)) as u64;
-            let reshape_rows = n_rows_per_seg.div_ceil(k);
-            let reshape_row_width = k * row_width;
-            (reshape_rows, reshape_row_width)
-        }
-    }
-}
-
 // ── Default num_buckets per arity ────────────────────────────────────────────
 
 /// Default `num_buckets` for a one-off run: **dev scale** (≈2^16 slots),

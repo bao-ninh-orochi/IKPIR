@@ -250,6 +250,21 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
         }
     }
 
+    /// Borrow the per-segment backend [`ServerParams`](IndexPirBackend::ServerParams),
+    /// one entry per segment, in segment order.
+    ///
+    /// # Purpose
+    ///
+    /// Read-only introspection of what the backend actually chose at setup
+    /// time — most usefully its matrix geometry via
+    /// [`IndexPirBackend::db_matrix_shape`], which the benches report in
+    /// their `db_rows` / `db_cols` columns. [`Self::setup`] exposes the same
+    /// values but deep-clones every hint to do it, which at paper scale is
+    /// hundreds of megabytes for a two-integer answer.
+    pub fn backend_params(&self) -> &[B::ServerParams] {
+        &self.backend_params
+    }
+
     /// Answer a per-segment PIR query bundle.
     ///
     /// # Purpose

@@ -222,7 +222,7 @@ matrix, and forward anything else:
 ./scripts/table2.sh --arity 4                    # just the arity-4 rows
 ./scripts/table4.sh                              # all 5 configs × 2 widths × 2 backends
 ./scripts/table3.sh --arity 3                    # the full-paper arity-3 cells
-./scripts/table5.sh --estimate --backend frodo   # RisePIR-F, one segment × arity
+./scripts/table5.sh --backend frodo               # setup: RisePIR-F rows only
 ```
 
 The PIR matrix (`PAPER_*` in `scripts/lib.sh`) is the single source of truth for

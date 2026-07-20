@@ -251,6 +251,11 @@ impl IndexPirBackend for FrodoPirBackend {
         )
     }
 
+    fn db_matrix_shape(params: &FrodoServerParams) -> (u32, u32) {
+        // FrodoPIR multiplies the segment as handed to it — no reshape.
+        (params.n_rows, params.row_width)
+    }
+
     fn expand_hint_material(params: &FrodoServerParams) -> FrodoHintMaterial {
         let a = sample_a(&params.params.seed, params.n_rows, params.params.lwe_dim);
         FrodoHintMaterial { a }

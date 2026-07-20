@@ -50,7 +50,7 @@ has the paper config matrix; there is no full-matrix sweep script.
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
-| `server_setup` | `TableFull` | `IkpirServer::new` wall-clock (trials=1, warmup=0), or `--estimate` = one segment × arity; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
+| `server_setup` | `--load-factor` (0.90) | `IkpirServer::new` wall-clock (trials=3, warmup=1); setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR answer rate (queries/sec, criterion, batch=64); query_bytes, response_bytes | `ikpir_server_answer.csv` |
 | `server_mutation` | `--load-factor` (0.90) | Per-(patch mode, kind) ops/sec, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
 | `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); +`num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
@@ -63,8 +63,9 @@ has the paper config matrix; there is no full-matrix sweep script.
 reports setup cost. The others build their server with
 `IkpirServer::new_parallel` — byte-identical state across all cores, untimed
 preamble. `--setup-impl parallel` points `server_setup` at that path too, to
-quantify the saving; the CSV's `setup_mode` column then carries a `_parallel`
-suffix so the row cannot be misread as a paper number.
+quantify the saving; the CSV's `setup_mode` column then reads `full_parallel`
+rather than `full`, so the row cannot be misread as a paper number. Both modes
+time a whole `IkpirServer::new` — no bench scales a partial measurement up.
 
 ### Flags
 
@@ -78,11 +79,11 @@ suffix so the row cannot be misread as a paper number.
 | `--plaintext-bits <N>` | `8` bench / max via `bench.sh` | PIR cell width |
 | `--lwe-dim <N>` | 1566 (frodo) / 1275 (simple) | LWE dimension |
 
-Bench-specific: `server_setup` takes `--estimate` / `--trials` / `--warmup`;
-`server_answer` and `headtohead_answer` take `--batch`; `server_mutation` takes
-`--patch-mode entry\|row` (comma list, default `entry`), `--n-mutations`,
-`--load-factor`; `headtohead_answer` requires `--num-keys` and takes
-`--max-mem-gb`.
+Bench-specific: `server_setup` takes `--trials` / `--warmup` / `--load-factor`
+/ `--setup-impl reference\|parallel`; `server_answer` and `headtohead_answer`
+take `--batch`; `server_mutation` takes `--patch-mode entry\|row` (comma list,
+default `entry`), `--n-mutations`, `--load-factor`; `headtohead_answer`
+requires `--num-keys`.
 
 ### Low-level: `cargo bench`
 

@@ -138,6 +138,19 @@ pub trait IndexPirBackend {
         plaintext_bits: u32,
     ) -> (Self::ServerParams, Self::HintMaterial, Self::Hint);
 
+    /// Shape `(rows, cols)` of the matrix the backend actually multiplies
+    /// for one segment, read back from `params`.
+    ///
+    /// A backend may reshape the `(n_rows, row_width)` segment it was
+    /// handed into whatever layout its algorithm wants: FrodoPIR keeps the
+    /// tall-skinny original, SimplePIR folds it into a near-square matrix.
+    /// The reshape is chosen inside [`Self::server_setup`] and recorded in
+    /// `params`, so this must *report* those stored dimensions — never
+    /// recompute them. Callers that need the real geometry (the benches'
+    /// `db_rows` / `db_cols` CSV columns) then cannot drift from the
+    /// backend's own choice.
+    fn db_matrix_shape(params: &Self::ServerParams) -> (u32, u32);
+
     /// Re-derive [`Self::HintMaterial`] from [`Self::ServerParams`].
     ///
     /// **Determinism contract.** Implementations must be bit-identically
