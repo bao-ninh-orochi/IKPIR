@@ -36,7 +36,7 @@ mod helpers;
 use helpers::{Backend, CloneStore, PatchMode};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient,
-    IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
+    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
 use segmented_cuckoo::{
@@ -123,10 +123,10 @@ fn collect_deltas_for_kind<S, B>(
 ) -> (Vec<HintDeltaBundle<B>>, u32)
 where
     S: CloneStore,
-    B: IndexPirBackend + IncrementalPirBackend,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend,
 {
     let store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
-    let mut server: IkpirServer<S, B> = IkpirServer::new(store, make_config());
+    let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store, make_config());
     let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
     let mut deltas = Vec::with_capacity(cli.n_mutations as usize);
@@ -169,7 +169,7 @@ fn run_one<S, B>(
     make_config: impl Fn() -> B::Config,
 ) where
     S: CloneStore,
-    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + BackendWireSize + Clone,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -194,7 +194,7 @@ fn run_one<S, B>(
     let params = seed_store.params();
 
     let seed_store2 = S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
-    let seed_server: IkpirServer<S, B> = IkpirServer::new(seed_store2, make_config());
+    let seed_server: IkpirServer<S, B> = IkpirServer::new_parallel(seed_store2, make_config());
     let bundle = seed_server.setup();
 
     let cps = params.cells_per_slot();
@@ -290,7 +290,7 @@ fn run_one<S, B>(
             // patches only the hint H (the queue iteration in
             // `client_patch_state` is a no-op when the queue is empty), so
             // the timing reflects the "compute new hint" cost in isolation.
-            let mut client = IkpirClient::<B>::from_setup(bundle.clone());
+            let mut client = IkpirClient::<B>::from_setup_parallel(bundle.clone());
             client.set_hint_patch_mode(mode.to_hint_patch_mode());
 
             // Clone outside the timed bracket, then wall-clock time the

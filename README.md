@@ -139,6 +139,7 @@ The paper's notation maps onto the code as follows.
 | `UIPIR.Query / Answer / Recover` | online phase | `client_query` / `server_answer` / `client_decode` |
 | `UIPIR.DBMutation + HintUpdate` | mutation phase | server `insert/update/delete` → `IncrementalPirBackend::server_patch_hint`; client `IkpirClient::apply_delta` → `client_patch_state` |
 | `IKPIR.Setup(DB)` | offline phase, all `d` segments | `IkpirServer::new` + `IkpirServer::setup` → `ServerSetupBundle` |
+| (same, computed across cores) | identical output, untimed preamble | `IkpirServer::new_parallel` / `IkpirClient::from_setup_parallel` — see `ParallelSetupBackend` |
 | `IKPIR.Query / Answer / Recover` | keyword online phase | `IkpirClient::build_query` / `IkpirServer::answer` / `IkpirClient::decode` |
 | transcript `trans = (S_j)` | sparse per-segment overwrites | `HintDeltaBundle`, `SegmentRowDeltas` |
 | hint `H = A·D` | client preprocessing material | `B::Hint` (`FrodoHint` / `SimpleHint`) |

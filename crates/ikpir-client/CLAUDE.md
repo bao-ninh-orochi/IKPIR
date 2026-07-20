@@ -52,6 +52,20 @@ setup bundle.
   monotone epoch+1 patch), `reset_from` after `full_rebuild` or after a
   `FutureDelta` gap that cannot be bridged incrementally.
 
+- **Two bootstrap implementations, one result** — `from_setup` /
+  `reset_from` re-expand each segment's `A` **single-threaded**, which is
+  the entire cost of bootstrapping a client (`Θ(arity · n_rows · lwe_dim)`
+  ChaCha20 words — gigabytes at paper scale). `from_setup_parallel` /
+  `reset_from_parallel` (available whenever `B: ParallelSetupBackend`,
+  which both shipped backends are) do the same across all cores and yield
+  an observationally identical client: same queries, same decodes, same
+  patch behaviour, same epoch. Both pairs share one body via a
+  `PerSegmentClientSetup<B>` fn pointer.
+
+  No bench reports client-bootstrap cost, so all five build their client
+  with `from_setup_parallel`. The reference path stays the default so a
+  future bootstrap-cost measurement has something honest to call.
+
 - **Selectable hint-patch realization** — `apply_delta` realizes the
   patch at the client's `hint_patch_mode` (`set_hint_patch_mode`;
   default `HintPatchMode::EntryLevel`, the iSimplePIR per-cell patch;
@@ -93,6 +107,7 @@ setup bundle.
 | Task | Where to look |
 |---|---|
 | Build a fresh client | `client.rs::IkpirClient::from_setup` |
+| Bootstrap a client fast (untimed preamble) | `client.rs::IkpirClient::{from_setup_parallel, reset_from_parallel}` — identical client, all cores; contract in `ikpir-common::ParallelSetupBackend` |
 | Issue a query | `client.rs::IkpirClient::build_query` |
 | Decode a response | `client.rs::IkpirClient::decode` |
 | Apply an incremental delta | `client.rs::IkpirClient::apply_delta` |

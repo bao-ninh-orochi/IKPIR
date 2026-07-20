@@ -24,7 +24,7 @@ use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -88,7 +88,12 @@ fn run_one<S, B>(
     backend_config: B::Config,
 ) where
     S: MakeStore,
-    B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend
+        + ParallelSetupBackend
+        + IncrementalPirBackend
+        + PrecomputingPirBackend
+        + BackendWireSize
+        + Clone,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -132,12 +137,12 @@ fn run_one<S, B>(
 
     // ── 2. Server setup; `answer` never reads the server's `A`, so free it
     //       right after the bundle. The client materialises its own copy. ───────
-    let mut server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
+    let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store, backend_config);
     let bundle = server.setup();
     server.drop_hint_material();
 
     let (query_bytes, response_bytes) = {
-        let mut probe: IkpirClient<B> = IkpirClient::from_setup(bundle.clone());
+        let mut probe: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle.clone());
         let q = probe.build_query(&0u32.to_le_bytes());
         let rb = server.answer(&q).expect("answer ok").wire_byte_size();
         (q.wire_byte_size(), rb)
@@ -227,7 +232,7 @@ fn run_one<S, B>(
     let keys: Vec<Vec<u8>> = (0..cli.batch)
         .map(|i| (i % n).to_le_bytes().to_vec())
         .collect();
-    let mut client: IkpirClient<B> = IkpirClient::from_setup(bundle);
+    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle);
 
     // Once-per-config decode sanity check — catches silent decode regressions
     // (wrong cells_per_slot, packing bug, hint mismatch, bad plaintext_bits

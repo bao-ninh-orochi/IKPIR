@@ -147,6 +147,42 @@ hint-patch realization via `--patch-mode entry|row` (bench CLI default `entry`;
 pair with a `patch_mode` column — the empirical counterpart of the paper's
 row-level vs entry-level mutation columns.
 
+### Setup in the benches: reference vs optimized
+
+Setup is `Θ(arity · n_rows · lwe_dim · row_width)` — minutes to hours at
+paper scale, dwarfing every online operation. But **only `server_setup`
+reports it**; for the other eight PIR benches it is preamble that
+contributes nothing to the measured number, and their results depend on
+setup's *output*, never on how it was computed.
+
+So the setup phase ships in two implementations with identical output:
+
+| | Entry points | Used by |
+|---|---|---|
+| **Reference** — single-threaded, non-SIMD; the paper's regime | `B::server_setup`, `IkpirServer::{new, full_rebuild}`, `IkpirClient::{from_setup, reset_from}` | `benches/server_setup.rs` — the measurement |
+| **Optimized** — same output, all cores | `B::server_setup_parallel`, `IkpirServer::{new_parallel, full_rebuild_parallel}`, `IkpirClient::{from_setup_parallel, reset_from_parallel}` | every other bench's preamble |
+
+The optimized path is **bit-identical**, not merely decode-equivalent: it
+partitions only the output — disjoint bands of the hint matrix `H`,
+disjoint runs of the ChaCha20 keystream that expands `A` (via
+`set_word_pos`) — so each cell accumulates the same terms in the same
+order. A server built on one path interoperates with a client built on
+the other; `ikpir-server/tests/parallel_setup_equivalence.rs` pins every
+combination. Threading is `std::thread::scope` (`ikpir-common`'s
+`backend/parallel.rs`); no new dependency, no cargo feature, nothing to
+enable. Contract: `ikpir_common::ParallelSetupBackend`.
+
+Worker count comes from `IKPIR_SETUP_THREADS`, else
+`available_parallelism()`; setting it to `1` forces the reference
+schedule everywhere, which is the first thing to try when bisecting a
+result mismatch. Measured on 8 cores: **4.8× (FrodoPIR), 6.3×
+(SimplePIR)**.
+
+`server_setup --setup-impl parallel` times the optimized path instead, to
+quantify what the other benches save. Such a row is not a paper number,
+and says so: the CSV's `setup_mode` column gains a `_parallel` suffix
+(`full_parallel` / `per_segment_parallel`).
+
 ## The paper's PIR config matrix
 
 Five KV-SCF shapes, each at one size (`paper_num_buckets` in `scripts/lib.sh`),
@@ -206,3 +242,4 @@ cargo bench -p ikpir-server --bench server_answer -- \
 - The PIR backend (FrodoPIR vs SimplePIR) is selected at the `B: IndexPirBackend` type parameter on `IkpirServer<S, B>` / `IkpirClient<B>` (monomorphised, no Cargo features involved); the benches expose it as a runtime `--backend frodo|simple` flag.
 - Avoid dynamic dispatch on the hot path; prefer generics.
 - All cryptographic and PIR primitives must be constant-time where relevant to avoid side-channel leakage.
+- **Measured code stays single-threaded and non-SIMD.** The paper reports that regime, so every operation a bench times runs it. Parallelism is confined to the setup phase, offered as a separate, explicitly named entry point (`*_parallel`) with a bit-identical-output contract — never as a flag that could silently change what a timed path does. Adding an optimized twin of any other operation must follow the same shape.

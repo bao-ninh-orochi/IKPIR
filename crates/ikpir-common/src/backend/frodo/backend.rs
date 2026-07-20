@@ -39,10 +39,14 @@ use std::collections::VecDeque;
 
 use rand::RngCore;
 
-use super::{round_p_to_q, round_q_to_p, sample_a, sample_ternary_into, FrodoConfig, FrodoParams};
+use super::{
+    round_p_to_q, round_q_to_p, sample_a, sample_a_parallel, sample_ternary_into, FrodoConfig,
+    FrodoParams,
+};
 use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
-    BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
+    parallel, BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, PrecomputingPirBackend,
 };
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
@@ -478,6 +482,134 @@ fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32
     h
 }
 
+/// Below this much setup work, computing `H` on one thread beats
+/// paying for thread spawn. ~1M multiply-adds — a millisecond or so
+/// sequential, against tens of microseconds to spawn. Every realistic
+/// segment shape clears it by orders of magnitude, so the guard only
+/// matters for the tiny shapes used in unit tests.
+///
+/// Gating on the **work** (`n_rows · lwe_dim · row_width`) rather than
+/// on the output size matters: a tall segment with a narrow row can
+/// have a small hint and still be minutes of arithmetic.
+const PAR_MIN_HINT_MACS: u64 = 1 << 20;
+
+/// Multi-threaded twin of [`compute_hint`] — **bit-identical output**.
+///
+/// # Purpose
+///
+/// The optimized setup path's hint precompute (see
+/// [`ParallelSetupBackend`]). This is where essentially all of setup's
+/// `Θ(n_rows · lwe_dim · row_width)` arithmetic lives.
+///
+/// # Rationale
+///
+/// `H` splits by **bands of rows**: worker `t` owns hint rows
+/// `[k₀, k₀ + band)` and runs the reference's `i, k, j` nest restricted
+/// to that band. The bands are disjoint output regions, so there is no
+/// reduction and no cross-thread synchronisation — and each cell
+/// `H[k, j]` still accumulates over `i` in the same increasing order
+/// the reference uses, which is what makes the result bit-identical
+/// rather than merely equivalent.
+///
+/// Banding by `k` (not by `i`) is also the cache-friendly choice: each
+/// worker keeps a `band × row_width` slice of `H` hot while all workers
+/// stream the same `D` rows in lockstep, sharing them in the outer
+/// cache levels.
+///
+/// Falls back to [`compute_hint`] on a single core or below
+/// [`PAR_MIN_HINT_MACS`].
+fn compute_hint_parallel(
+    a: &[u32],
+    db: &[u32],
+    n_rows: u32,
+    lwe_dim: u32,
+    row_width: u32,
+) -> Vec<u32> {
+    let lwe_dim_us = lwe_dim as usize;
+    let row_width_us = row_width as usize;
+    let macs = u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width);
+    let threads = parallel::setup_threads();
+    if threads <= 1 || macs < PAR_MIN_HINT_MACS {
+        return compute_hint(a, db, n_rows, lwe_dim, row_width);
+    }
+
+    let mut h = vec![0u32; lwe_dim_us * row_width_us];
+    // Chunk length is a whole multiple of `row_width`, so every band
+    // starts on a hint-row boundary and `offset / row_width` is the
+    // band's first `k`.
+    let chunk = parallel::balanced_chunk_len(h.len(), row_width_us, threads);
+    parallel::par_chunks_mut(&mut h, chunk, |offset, band| {
+        let k0 = offset / row_width_us;
+        let band_rows = band.len() / row_width_us;
+        for i in 0..n_rows as usize {
+            let a_row = &a[i * lwe_dim_us + k0..i * lwe_dim_us + k0 + band_rows];
+            let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
+            for (k, &aik) in a_row.iter().enumerate() {
+                if aik == 0 {
+                    continue;
+                }
+                let h_row = &mut band[k * row_width_us..(k + 1) * row_width_us];
+                for j in 0..row_width_us {
+                    h_row[j] = h_row[j].wrapping_add(aik.wrapping_mul(d_row[j]));
+                }
+            }
+        }
+    });
+    h
+}
+
+/// Optimized setup for FrodoPIR: same `(ServerParams, HintMaterial,
+/// Hint)`, computed across cores.
+///
+/// Both heavy kernels fan out — [`sample_a_parallel`] for `A` and
+/// [`compute_hint_parallel`] for `H = Aᵀ·D` — and both are bit-identical
+/// to their reference twins, so a server set up on this path is
+/// indistinguishable from one set up on [`IndexPirBackend::server_setup`].
+impl ParallelSetupBackend for FrodoPirBackend {
+    fn server_setup_parallel(
+        config: &FrodoConfig,
+        db: &[u32],
+        n_rows: u32,
+        row_width: u32,
+        plaintext_bits: u32,
+    ) -> (FrodoServerParams, FrodoHintMaterial, FrodoHint) {
+        debug_assert_eq!(db.len(), (n_rows as usize) * (row_width as usize));
+        let lwe_dim = config.lwe_dim;
+
+        let mut seed = [0u8; 16];
+        rand::rng().fill_bytes(&mut seed);
+        let params = FrodoParams::new(lwe_dim, plaintext_bits, seed);
+
+        let a = sample_a_parallel(&seed, n_rows, lwe_dim);
+        let hint_data = compute_hint_parallel(&a, db, n_rows, lwe_dim, row_width);
+
+        (
+            FrodoServerParams {
+                params,
+                n_rows,
+                row_width,
+            },
+            FrodoHintMaterial { a },
+            FrodoHint { data: hint_data },
+        )
+    }
+
+    fn expand_hint_material_parallel(params: &FrodoServerParams) -> FrodoHintMaterial {
+        let a = sample_a_parallel(&params.params.seed, params.n_rows, params.params.lwe_dim);
+        FrodoHintMaterial { a }
+    }
+
+    fn client_setup_parallel(params: &FrodoServerParams, hint: &FrodoHint) -> FrodoClientState {
+        FrodoClientState {
+            params: params.clone(),
+            hint_material: Self::expand_hint_material_parallel(params),
+            hint: hint.clone(),
+            prepared: VecDeque::new(),
+            in_flight: None,
+        }
+    }
+}
+
 /// Wire-size accounting for FrodoPIR.
 ///
 /// Reports the minimum fixed-width little-endian encoding of each wire
@@ -809,6 +941,56 @@ mod tests {
                 .to_vec();
             assert_eq!(decoded, expected, "row {row} mismatch");
         }
+    }
+
+    /// The optimized hint kernel is bit-identical to the reference.
+    /// Every shape exceeds `PAR_MIN_HINT_MACS` (asserted, so the test
+    /// cannot silently go vacuous if the threshold moves) and the
+    /// `lwe_dim` values are both multiples and non-multiples of any
+    /// plausible worker count, exercising the ragged last band.
+    #[test]
+    fn compute_hint_parallel_matches_reference() {
+        for (n_rows, row_width, lwe_dim) in
+            [(37u32, 257u32, 256u32), (32, 64, 1031), (24, 4096, 17)]
+        {
+            assert!(
+                u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width) >= PAR_MIN_HINT_MACS,
+                "shape ({n_rows}, {row_width}, {lwe_dim}) must exceed the parallel threshold"
+            );
+            let db = make_db(n_rows, row_width, 8);
+            let a = sample_a(&[0x9Eu8; 16], n_rows, lwe_dim);
+            assert_eq!(
+                compute_hint_parallel(&a, &db, n_rows, lwe_dim, row_width),
+                compute_hint(&a, &db, n_rows, lwe_dim, row_width),
+                "mismatch at n_rows={n_rows} row_width={row_width} lwe_dim={lwe_dim}"
+            );
+        }
+    }
+
+    /// End-to-end equivalence contract of [`ParallelSetupBackend`]: a
+    /// server set up on the optimized path holds exactly the `(A, H)`
+    /// the reference path would have derived from the same seed.
+    #[test]
+    fn parallel_setup_matches_reference_for_its_own_seed() {
+        let (n_rows, row_width, pb) = (64u32, 300u32, 8u32);
+        let db = make_db(n_rows, row_width, pb);
+        let cfg = FrodoConfig::with_lwe_dim(256);
+
+        let (sp, mat, hint) =
+            FrodoPirBackend::server_setup_parallel(&cfg, &db, n_rows, row_width, pb);
+
+        // Same `A` as the reference expansion of this segment's seed …
+        let reference_mat = FrodoPirBackend::expand_hint_material(&sp);
+        assert_eq!(mat.a, reference_mat.a);
+        // … and the same hint the reference would have computed from it.
+        assert_eq!(
+            hint.data,
+            compute_hint(&reference_mat.a, &db, n_rows, sp.params.lwe_dim, row_width)
+        );
+        // The client's optimized re-expansion agrees too.
+        let state = FrodoPirBackend::client_setup_parallel(&sp, &hint);
+        assert_eq!(state.hint_material.a, reference_mat.a);
+        assert_eq!(state.hint, hint);
     }
 
     #[test]

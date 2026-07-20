@@ -69,8 +69,8 @@ mod server;
 // call sites continue to resolve unchanged.
 pub use ikpir_common::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError,
-    IncrementalPirBackend, IndexPirBackend, PirQueryBundle, PirResponseBundle,
-    PrecomputingPirBackend, ServerSetupBundle, SimpleConfig, SimplePirBackend,
+    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, PirQueryBundle,
+    PirResponseBundle, PrecomputingPirBackend, ServerSetupBundle, SimpleConfig, SimplePirBackend,
 };
 
 pub use server::{
