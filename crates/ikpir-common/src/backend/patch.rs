@@ -233,6 +233,74 @@ pub(crate) const fn row_level_batch_rows(hint_row_width: usize, lwe_dim: usize) 
     }
 }
 
+/// Touched rows a row-level chunk needs before the register-tiled GEMM
+/// beats the reference rank-one updates.
+///
+/// # Rationale
+///
+/// The GEMM's whole advantage is streaming `H` once per chunk instead of
+/// once per row, and it buys that by holding an `MR × NR` accumulator
+/// tile in registers across the chunk's contraction. With one row in the
+/// chunk there is no contraction to amortise over: the tile's 64 loads
+/// and 64 stores of `H` buy exactly 64 multiply-adds, which is what the
+/// reference pass already achieves with a plain streaming update — and
+/// the GEMM additionally pays a pack buffer per `(KC-block, k-tile)`.
+/// Measured on the mutation benches, where every call patches exactly
+/// one row, routing that through the GEMM ran **0.69–0.80×** `main`.
+/// At the 64-row burst `benches/kernels.rs` fires it is **2.4–3.0×**
+/// faster. The crossover is somewhere between; `2 · MR` is the first
+/// chunk depth at which every micro-tile has more contraction than
+/// height, and is where this cuts over. The exact knee is not pinned —
+/// only the two endpoints are measured.
+pub(crate) const ROW_LEVEL_MIN_GEMM_ROWS: usize = 8;
+
+/// Apply one row-level chunk: `H += A_selᵀ · Δ` for `rows` densified
+/// rows, through whichever kernel suits the chunk depth.
+///
+/// # Arguments
+///
+/// - `hint` — row-major `lwe_dim × hint_row_width`, updated in place.
+/// - `a_sel` — the chunk's gathered `A` rows, `rows × lwe_dim`.
+/// - `delta` — the chunk's densified deltas, `rows × hint_row_width`.
+///
+/// # Constraints
+///
+/// The two kernels are bit-identical: each `H[k, j]` gains
+/// `Σ_r A_sel[r, k] · Δ[r, j]` either way, and wrapping `u32` addition is
+/// associative and commutative. Which one runs depends only on `rows`.
+pub(crate) fn apply_dense_rows(
+    hint: &mut [u32],
+    a_sel: &[u32],
+    delta: &[u32],
+    lwe_dim: usize,
+    hint_row_width: usize,
+) {
+    if lwe_dim == 0 || hint_row_width == 0 || a_sel.is_empty() {
+        return;
+    }
+    let rows = a_sel.len() / lwe_dim;
+    debug_assert_eq!(delta.len(), rows * hint_row_width);
+
+    if rows >= ROW_LEVEL_MIN_GEMM_ROWS {
+        super::gemm::gemm_at_d_accumulate(hint, a_sel, delta, lwe_dim, hint_row_width);
+        return;
+    }
+
+    // Shallow chunk: the reference dense rank-one update per row, which
+    // is already one streamed pass over `H` per row and has no tile to
+    // amortise. See `ROW_LEVEL_MIN_GEMM_ROWS`.
+    for r in 0..rows {
+        let a_row = &a_sel[r * lwe_dim..(r + 1) * lwe_dim];
+        let d_row = &delta[r * hint_row_width..(r + 1) * hint_row_width];
+        for (k, &aik) in a_row.iter().enumerate() {
+            let h_row = &mut hint[k * hint_row_width..(k + 1) * hint_row_width];
+            for (h, &dj) in h_row.iter_mut().zip(d_row) {
+                *h = h.wrapping_add(aik.wrapping_mul(dj));
+            }
+        }
+    }
+}
+
 /// Minimum multiply-add count before an entry-level patch fans out over
 /// rayon.
 ///

@@ -57,7 +57,7 @@ use crate::backend::gemm::gemm_at_d_accumulate;
 use crate::backend::matvec::{matvec_accumulate, matvec_rows_accumulate};
 #[cfg(feature = "parallel")]
 use crate::backend::patch;
-use crate::backend::patch::{row_level_batch_rows, TouchedRuns};
+use crate::backend::patch::{apply_dense_rows, row_level_batch_rows, TouchedRuns};
 use crate::backend::{
     parallel, BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend,
     ParallelSetupBackend, PrecomputingPirBackend,
@@ -995,13 +995,23 @@ fn patch_slot_c<'a, I>(
     let lwe_dim_us = lwe_dim as usize;
     let reshape_row_width_us = reshape_row_width as usize;
 
-    // Slots are independent (each owns its secret and c), so a warm
-    // queue parallelises trivially; a cold/small queue stays inline.
+    // Slots are independent (each owns its secret and c), so a warm queue
+    // parallelises trivially — but only once there is enough work to pay
+    // for the fan-out. The per-slot cost is `row_deltas · lwe_dim`
+    // multiply-adds, so a single-mutation delta against a warm queue of
+    // sixteen slots is ~25 k MACs total: two orders of magnitude under
+    // the gate, and measurably *slower* threaded. A τ-sized batch clears
+    // it comfortably.
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
         let slot_refs: Vec<&mut PreparedSlot> = slots.into_iter().collect();
-        if slot_refs.len() >= 4 {
+        let work = slot_refs
+            .len()
+            .saturating_mul(row_deltas.len())
+            .saturating_mul(lwe_dim_us);
+        if slot_refs.len() >= 2 && work >= patch::PATCH_PAR_MIN_MACS && parallel::kernels_parallel()
+        {
             slot_refs.into_par_iter().for_each(|slot| {
                 patch_one_slot_c(
                     a,
@@ -1262,7 +1272,10 @@ fn apply_patch_entry_level(
 /// [`row_level_batch_rows`] slots, and each full chunk fires a single
 /// `H += A_selᵀ · Δ` product through the shared register-tiled
 /// [`gemm_at_d_accumulate`]. The hint is streamed once per chunk rather
-/// than once per row, and the multiply-adds run tiled.
+/// than once per row, and the multiply-adds run tiled. A chunk too
+/// shallow to give the tiles any contraction to amortise keeps the
+/// reference rank-one pass; `patch::apply_dense_rows` owns that choice
+/// and the measurement behind it.
 ///
 /// Chunking rather than one product over the whole batch is what keeps
 /// the working set bounded — [`patch::ROW_LEVEL_BATCH_CELLS`], a few
@@ -1342,7 +1355,7 @@ fn apply_patch_row_level(
         filled += 1;
 
         if filled == cap_rows {
-            gemm_at_d_accumulate(
+            apply_dense_rows(
                 hint,
                 &a_sel[..filled * lwe_dim_us],
                 &delta[..filled * reshape_row_width_us],
@@ -1358,7 +1371,7 @@ fn apply_patch_row_level(
     }
 
     if filled > 0 {
-        gemm_at_d_accumulate(
+        apply_dense_rows(
             hint,
             &a_sel[..filled * lwe_dim_us],
             &delta[..filled * reshape_row_width_us],
