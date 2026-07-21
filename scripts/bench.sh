@@ -12,32 +12,71 @@
 #   client_query  client_decode  client_mutation  headtohead_query  headtohead_decode
 #
 #     --arity N            2 | 3 | 4                         (default 2)
-#     --num-buckets N                                        (default: per-arity)
+#     --num-buckets N                             (default: per-arity, dev scale)
 #     --bucket-size N                                        (default 4)
-#     --value-bits N       256 | 2048 | 8192 = 32B/256B/1kB  (default 256)
+#     --value-bits N       2048 | 8192 = 256B / 1kB          (default 2048)
+#                          The paper reports these two widths. 256 (= 32B) still
+#                          runs if you pass it; it is just not a paper config.
 #     --backend B          frodo | simple                    (default frodo)
 #     --plaintext-bits N                    (default: max the backend admits)
 #     --lwe-dim N                           (default: 1566 frodo / 1275 simple)
-#   Mutation benches also take:
-#     --n-mutations N      (default: 1% of capacity, capped at 2000)
+#   server_setup and the mutation benches also take:
 #     --load-factor F      (default 0.90)
+#   server_setup also takes:
+#     --setup-impl I       reference | parallel              (default reference)
+#                          `reference` is the single-threaded, non-SIMD path the
+#                          paper reports, and the ONLY thing server_setup should
+#                          normally time. `parallel` times the byte-identical
+#                          multi-threaded twin that every OTHER bench already
+#                          uses in its untimed preamble — diagnostic, never a
+#                          paper number. The CSV's setup_mode column records it
+#                          (full vs full_parallel).
+#                          IKPIR_SETUP_THREADS sets the worker count everywhere
+#                          (default: the machine's available parallelism, and
+#                          clamped to MAX_SETUP_THREADS = 1024); set it to 1 to
+#                          force the reference schedule.
+#   Mutation benches also take:
+#     --n-mutations N      (default: 1% of the table's slots — the paper's τ)
 #     --patch-mode M       entry | row | entry,row           (default entry,row)
 #   Head-to-head benches also take:
 #     --num-keys N         (default: ~90% of capacity)
-#   Any other flag (--batch, --fingerprint-bits, --estimate, --max-mem-gb,
-#   --trials, --warmup, …) is forwarded to the bench unchanged.
+#   Any other flag (--batch, --fingerprint-bits, --trials, --warmup, …) is
+#   forwarded to the bench unchanged.
 #
-# segmented-cuckoo benches (fixed internal config matrix — take no --arity/etc.):
-#   load_factor  insert_throughput  lookup_throughput  delete_throughput  fpr
-#   degree_distribution  kv_store_insert_throughput  kv_store_lookup_throughput
-#   kv_store_delete_throughput
+# Geometry defaults here are DEV SCALE (~2^16 slots), not the paper's. This is
+# the everyday one-config runner; the paper's matrix lives in scripts/lib.sh and
+# is driven by table{2,3,4,5}.sh.
+#
+# segmented-cuckoo benches (all flags optional; with none, each runs the paper's
+# Table 2 matrix of five (arity, bucket_size) configs — see
+# crates/segmented-cuckoo/benches/configs.rs). Flags are forwarded unchanged:
+#   cuckoo_filter_load_factor         cuckoo_filter_insert_throughput
+#   cuckoo_filter_lookup_throughput   cuckoo_filter_delete_throughput
+#   cuckoo_filter_false_positive_rate
+#   kv_store_insert_throughput  kv_store_lookup_throughput  kv_store_delete_throughput
+#
+#     --arity N            2 | 3 | 4          (default: every arity in the matrix)
+#     --bucket-size N      1..4               (default: every size in the matrix)
+#     --num-buckets N                         (default: per-arity, per Table 2)
+#     --fingerprint-bits N                    (default 32)
+#     --max-kicks N                           (default 2500)
+#     --warmup N / --trials N   (default 3 / 10; load_factor defaults to 20 trials)
+#   Filter-bench extras:  --hit-rate (lookup), --num-queries (false_positive_rate)
+#   KV-store extras:      --value-bits, --plaintext-bits, --target-items
+#
+# To reproduce a paper table end to end, use the sweep that owns it:
+#   ./scripts/table2.sh   filter: SCF vs standard cuckoo filter
+#   ./scripts/table3.sh   online: query / response / answer
+#   ./scripts/table4.sh   mutation throughput
+#   ./scripts/table5.sh   setup (static rebuild cost)
 #
 # Examples:
-#   ./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --bucket-size 4 --value-bits 256
+#   ./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --bucket-size 4 --value-bits 8192
 #   ./scripts/bench.sh client_decode --backend simple
 #   ./scripts/bench.sh server_mutation --patch-mode entry
 #   ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
-#   ./scripts/bench.sh insert_throughput
+#   ./scripts/bench.sh cuckoo_filter_insert_throughput                    # full Table 2 matrix
+#   ./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2   # one cell
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,9 +100,14 @@ export IKPIR_RESULTS_DIR="$RESULTS_BASE/$CRATE"
 mkdir -p "$IKPIR_RESULTS_DIR"
 REL_DIR="${IKPIR_RESULTS_DIR#"$IKPIR_ROOT"/}"
 
-# segmented-cuckoo benches run their own fixed matrix — just dispatch + route.
+# segmented-cuckoo benches parse their own flags and default to the paper's
+# Table 2 matrix — just dispatch + route the CSV.
 if [[ "$CRATE" == segmented-cuckoo ]]; then
-    log "$BENCH  (segmented-cuckoo — fixed internal config matrix)"
+    if [[ $# -eq 0 ]]; then
+        log "$BENCH  (segmented-cuckoo — paper Table 2 matrix)"
+    else
+        log "$BENCH  (segmented-cuckoo — $*)"
+    fi
     cargo bench -p segmented-cuckoo --bench "$BENCH" -- "$@"
     ok "CSV(s) under $REL_DIR/"
     exit 0
@@ -92,7 +136,7 @@ done
 
 ARITY=${ARITY:-2}
 BUCKET_SIZE=${BUCKET_SIZE:-4}
-VALUE_BITS=${VALUE_BITS:-256}
+VALUE_BITS=${VALUE_BITS:-2048}
 BACKEND=${BACKEND:-frodo}
 validate_backend "$BACKEND"
 NUM_BUCKETS=${NUM_BUCKETS:-$(default_num_buckets "$ARITY")}
@@ -104,17 +148,32 @@ fi
 ARGS=(--arity "$ARITY" --num-buckets "$NUM_BUCKETS" --bucket-size "$BUCKET_SIZE"
       --value-bits "$VALUE_BITS" --backend "$BACKEND" --plaintext-bits "$PB" --lwe-dim "$LWE")
 
+# A flag that does not apply to this bench is parsed above but never forwarded.
+# Say so: silently dropping it would run a config the caller did not ask for.
+if [[ -n "$LOAD_FACTOR" ]] && ! takes_load_factor "$BENCH"; then
+    warn "$BENCH takes no --load-factor (it populates to TableFull, or to --num-keys); ignoring it"
+fi
+if [[ -n "$N_MUT$PATCH_MODE" ]] && ! is_mutation_bench "$BENCH"; then
+    warn "$BENCH is not a mutation bench; ignoring --n-mutations / --patch-mode"
+fi
+if [[ -n "$NUM_KEYS" ]] && ! is_headtohead_bench "$BENCH"; then
+    warn "$BENCH takes no --num-keys (only the headtohead_* benches fix a key count); ignoring it"
+fi
+
 if is_mutation_bench "$BENCH"; then
-    if [[ -z "$N_MUT" ]]; then
-        N_MUT=$(( NUM_BUCKETS * BUCKET_SIZE / 100 ))
-        (( N_MUT > 2000 )) && N_MUT=2000
-        (( N_MUT < 1 ))    && N_MUT=1
-    fi
-    ARGS+=(--n-mutations "$N_MUT" --load-factor "${LOAD_FACTOR:-0.90}" --patch-mode "${PATCH_MODE:-entry,row}")
+    # τ = PAPER_TAU_PERCENT of the table's slots, the paper's batch rule. There
+    # is no upper clamp: the rule is what the paper's method sentence states, and
+    # a clamp would only ever bind at paper scale — exactly where it must not.
+    ARGS+=(--n-mutations "${N_MUT:-$(tau_for_geometry "$NUM_BUCKETS" "$BUCKET_SIZE")}"
+           --patch-mode "${PATCH_MODE:-entry,row}")
+fi
+
+if takes_load_factor "$BENCH"; then
+    ARGS+=(--load-factor "${LOAD_FACTOR:-$PAPER_LOAD_FACTOR}")
 fi
 
 if is_headtohead_bench "$BENCH"; then
-    ARGS+=(--num-keys "${NUM_KEYS:-$(( NUM_BUCKETS * BUCKET_SIZE * 90 / 100 ))}")
+    ARGS+=(--num-keys "${NUM_KEYS:-$(keys_at_paper_fill "$NUM_BUCKETS" "$BUCKET_SIZE")}")
 fi
 
 ARGS+=("${EXTRA[@]+"${EXTRA[@]}"}")

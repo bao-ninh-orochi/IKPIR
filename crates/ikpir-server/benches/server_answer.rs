@@ -25,7 +25,7 @@ use helpers::{Backend, MakeStore};
 use ikpir_client::IkpirClient;
 use ikpir_server::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirServer, IncrementalPirBackend,
-    IndexPirBackend, PirQueryBundle, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PirQueryBundle, SimpleConfig, SimplePirBackend,
 };
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
 use std::io::Write;
@@ -46,7 +46,8 @@ struct Cli {
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
     bucket_size: u32,
-    #[arg(long, default_value_t = 256)]
+    /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
+    #[arg(long, default_value_t = 2048)]
     value_bits: u32,
     #[arg(long, default_value_t = 32)]
     fingerprint_bits: u32,
@@ -72,7 +73,7 @@ fn run_one<S, B>(
     backend_config: B::Config,
 ) where
     S: MakeStore,
-    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + BackendWireSize,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -86,8 +87,8 @@ fn run_one<S, B>(
         cli.value_bits,
         cli.plaintext_bits,
     );
-    let server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
-    let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
+    let server: IkpirServer<S, B> = IkpirServer::new_parallel(store, backend_config);
+    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(server.setup());
 
     let queries: Vec<PirQueryBundle<B>> = (0..cli.batch)
         .map(|i| client.build_query(&((i % n_inserted as u32).to_le_bytes())))
@@ -103,8 +104,7 @@ fn run_one<S, B>(
     let cps = params.cells_per_slot();
     let row_width = cli.bucket_size * cps;
     let segment_rows = params.segment_size();
-    let (db_rows, db_cols) =
-        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
+    let (db_rows, db_cols) = B::db_matrix_shape(&server.backend_params()[0]);
     let load_factor = n_inserted as f64 / (num_buckets as f64 * cli.bucket_size as f64);
     let bundle = server.setup();
     let lwe_dim_eff = effective_lwe_dim(cli);

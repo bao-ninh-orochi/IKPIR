@@ -22,6 +22,10 @@
 //!   ([`client_precompute_queries`] / [`client_precompute_decodes`])
 //!   that let the client amortise per-query LWE work across a batch of
 //!   upcoming queries (FrodoPIR Fig. 1 amortisation).
+//! - [`ParallelSetupBackend`] adds a second, multi-threaded
+//!   *realization* of the three setup entry points, producing
+//!   bit-identical output. It exists purely so that a benchmark which
+//!   does not measure setup can stop paying for it single-threaded.
 //!
 //! [`BackendWireSize`] is an orthogonal helper for backends that can
 //! report byte-level sizes; benches use it to compare wire footprints
@@ -77,6 +81,8 @@
 pub mod frodo;
 pub(crate) mod gemm;
 pub(crate) mod matvec;
+pub mod parallel;
+pub(crate) mod patch;
 pub(crate) mod prg;
 pub mod simple;
 pub use frodo::{FrodoConfig, FrodoPirBackend};
@@ -133,6 +139,19 @@ pub trait IndexPirBackend {
         row_width: u32,
         plaintext_bits: u32,
     ) -> (Self::ServerParams, Self::HintMaterial, Self::Hint);
+
+    /// Shape `(rows, cols)` of the matrix the backend actually multiplies
+    /// for one segment, read back from `params`.
+    ///
+    /// A backend may reshape the `(n_rows, row_width)` segment it was
+    /// handed into whatever layout its algorithm wants: FrodoPIR keeps the
+    /// tall-skinny original, SimplePIR folds it into a near-square matrix.
+    /// The reshape is chosen inside [`Self::server_setup`] and recorded in
+    /// `params`, so this must *report* those stored dimensions — never
+    /// recompute them. Callers that need the real geometry (the benches'
+    /// `db_rows` / `db_cols` CSV columns) then cannot drift from the
+    /// backend's own choice.
+    fn db_matrix_shape(params: &Self::ServerParams) -> (u32, u32);
 
     /// Re-derive [`Self::HintMaterial`] from [`Self::ServerParams`].
     ///
@@ -204,6 +223,13 @@ pub trait IndexPirBackend {
 /// database `ω` grows with the database size, so only the entry-level
 /// patch keeps the per-mutation cost independent of the database size.
 /// The default is [`EntryLevel`](Self::EntryLevel).
+///
+/// Realizing that asymptotic advantage as wall-clock takes care with the
+/// execution order — `H` is row-major, so patching one column at a time
+/// sweeps the whole hint once *per touched column*. Both backends
+/// therefore run the entry-level patch through the crate-internal
+/// `backend::patch::TouchedRuns`, which inverts the loops and coalesces
+/// touched columns into contiguous runs; see its module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HintPatchMode {
     /// Dense per-row rank-one update, `Θ(n·ω)` per touched row — the
@@ -269,6 +295,102 @@ pub trait IncrementalPirBackend: IndexPirBackend {
         row_deltas: &[(u32, Vec<(u16, i64)>)],
         mode: HintPatchMode,
     );
+}
+
+/// Extension of [`IndexPirBackend`] offering a **second realization of
+/// the setup phase** that trades single-threadedness for wall-clock
+/// time while producing bit-identical output.
+///
+/// # Why this exists
+///
+/// Setup is `Θ(n_rows · lwe_dim · row_width)` — orders of magnitude
+/// more arithmetic than any online operation, and the dominant cost of
+/// getting a server or client into the state a benchmark actually wants
+/// to measure. The paper reports setup in the single-threaded,
+/// non-SIMD regime, so [`IndexPirBackend::server_setup`] and friends
+/// must stay exactly that. Every *other* benchmark, however, only needs
+/// setup's **result**; how it was computed is unobservable downstream.
+///
+/// This trait is that second path. Nothing else about the protocol
+/// changes: same `ServerParams`, same `HintMaterial`, same `Hint`, same
+/// wire bytes.
+///
+/// # Equivalence contract
+///
+/// For every `(config, db, n_rows, row_width, plaintext_bits)` and
+/// every `params`:
+///
+/// - [`expand_hint_material_parallel`](Self::expand_hint_material_parallel)`(p)`
+///   must equal [`IndexPirBackend::expand_hint_material`]`(p)` **bit for
+///   bit**, and
+/// - [`server_setup_parallel`](Self::server_setup_parallel) must return
+///   the same `(HintMaterial, Hint)` that
+///   [`IndexPirBackend::server_setup`] would have returned **given the
+///   same internally sampled seed** — i.e. `hint == Aᵀ·D` for the
+///   `A` that the returned `ServerParams`' seed expands to, with `A`
+///   itself unchanged, and
+/// - [`client_setup_parallel`](Self::client_setup_parallel) must yield a
+///   `ClientState` observationally identical to
+///   [`IndexPirBackend::client_setup`]'s: same queries, same decodes,
+///   same patch behaviour.
+///
+/// Implementations get this for free by partitioning only the
+/// **output** — disjoint bands of the hint, disjoint runs of the
+/// keystream — so each output cell still accumulates the same terms in
+/// the same order. `u32` wrapping arithmetic is associative and
+/// commutative, but relying on that is not even necessary under a
+/// disjoint-output partition. See
+/// [`backend::parallel`](crate::backend::parallel) for the fan-out
+/// primitives and the worker-count knob (`IKPIR_SETUP_THREADS`).
+///
+/// # Constraints
+///
+/// The schedule depends only on public shape
+/// (`n_rows`, `row_width`, `lwe_dim`) and the machine's core count —
+/// never on database contents or on any secret — so the parallel path
+/// inherits the base trait's side-channel posture. Implementations must
+/// preserve that; do not branch on cell values to skip work.
+///
+/// # Choosing a path
+///
+/// | Caller | Use |
+/// |---|---|
+/// | `benches/server_setup.rs` (the measurement) | [`IndexPirBackend::server_setup`] |
+/// | every other bench's preamble | [`Self::server_setup_parallel`] |
+/// | library / test / production code | either; they are interchangeable |
+///
+/// `IkpirServer::new_parallel` / `IkpirServer::full_rebuild_parallel` /
+/// `IkpirClient::from_setup_parallel` are the protocol-level entry
+/// points that route here.
+pub trait ParallelSetupBackend: IndexPirBackend {
+    /// Multi-threaded realization of [`IndexPirBackend::server_setup`].
+    ///
+    /// Returns the same triple, under the equivalence contract in the
+    /// trait docs. Fresh randomness (the public seed) is still sampled
+    /// per call, exactly as the reference does.
+    fn server_setup_parallel(
+        config: &Self::Config,
+        db: &[u32],
+        n_rows: u32,
+        row_width: u32,
+        plaintext_bits: u32,
+    ) -> (Self::ServerParams, Self::HintMaterial, Self::Hint);
+
+    /// Multi-threaded realization of
+    /// [`IndexPirBackend::expand_hint_material`].
+    ///
+    /// **Bit-identical** to the reference for the same `params` — the
+    /// determinism contract on the reference method applies here
+    /// verbatim, and across the two methods: a server that expanded
+    /// with one may re-expand with the other.
+    fn expand_hint_material_parallel(params: &Self::ServerParams) -> Self::HintMaterial;
+
+    /// Multi-threaded realization of [`IndexPirBackend::client_setup`].
+    ///
+    /// The client's cost here is dominated by re-expanding `A` from the
+    /// wire-shipped seed, so this is `expand_hint_material_parallel`
+    /// plus the same cheap clones the reference performs.
+    fn client_setup_parallel(params: &Self::ServerParams, hint: &Self::Hint) -> Self::ClientState;
 }
 
 /// Extension of [`IndexPirBackend`] for backends that can report the wire

@@ -77,8 +77,27 @@ without a full rebuild.
   `B::expand_hint_material`. Callers observe nothing different other
   than a one-time first-mutation re-expansion cost.
 
-- **Sync API; no async, no `Arc`** — all calls are synchronous and
-  single-threaded. Concurrency wrapping is the caller's responsibility.
+- **Sync API; no async, no `Arc`** — all calls are synchronous.
+  Concurrency wrapping is the caller's responsibility. The one place
+  the crate spawns threads itself is `new_parallel` / `full_rebuild_parallel`
+  (below), and those join before returning, so the API stays synchronous.
+
+- **Two setup implementations, one result** — `IkpirServer::new` and
+  `full_rebuild` run `B::server_setup` per segment **single-threaded**:
+  the regime the paper reports and `benches/server_setup.rs` times.
+  `new_parallel` / `full_rebuild_parallel` (available whenever
+  `B: ParallelSetupBackend`, which both shipped backends are) do the
+  same work over all cores and produce byte-identical state — same
+  `ServerParams`, same `HintMaterial`, same `Hint`, same epoch, same
+  wire bundle. Both pairs share one body via a `SegmentSetup<B>` fn
+  pointer, so segment slicing cannot drift between them.
+
+  Setup is `Θ(arity · n_rows · lwe_dim · row_width)` — by far the
+  largest cost of *reaching* the state the other benches measure, and
+  contributing nothing to what they report. So every bench except
+  `server_setup` builds its server with `new_parallel`. Measured on 8
+  cores: 4.8× (FrodoPIR), 6.3× (SimplePIR). Worker count follows
+  `IKPIR_SETUP_THREADS`, else `available_parallelism()`.
 
 - **Two shipped backends** — both LWE-based, post-quantum, with full incremental hint patching:
   `FrodoPirBackend` (ternary errors, tall-skinny `n_rows × row_width`
@@ -130,9 +149,12 @@ without a full rebuild.
 | Task | Where to look |
 |---|---|
 | Setup + answer flow | `server.rs::IkpirServer::{new, setup, answer}` |
+| Real per-segment matrix shape (`db_rows`/`db_cols`) | `server.rs::IkpirServer::backend_params` → `ikpir-common::IndexPirBackend::db_matrix_shape` — the backend reports what it chose; benches never re-derive it |
+| Optimized (multi-threaded) setup | `server.rs::IkpirServer::{new_parallel, full_rebuild_parallel}` — byte-identical state, all cores; contract in `ikpir-common::ParallelSetupBackend` |
+| Cross-path interop test | `tests/parallel_setup_equivalence.rs` — every `{reference, parallel}` server × `{reference, parallel}` client combination, both backends |
 | Mutation + incremental hint | `server.rs::commit_mutations` → `hint_patch.rs::fold_mutations_into_row_deltas` |
 | Hint-patch realization knob | `server.rs::IkpirServer::{hint_patch_mode, set_hint_patch_mode}` + `ikpir-common::HintPatchMode` |
-| Backend trait contract | `ikpir-common/src/backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` + `PrecomputingPirBackend` + `BackendWireSize` |
+| Backend trait contract | `ikpir-common/src/backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` + `PrecomputingPirBackend` + `ParallelSetupBackend` + `BackendWireSize` |
 | FrodoPIR config knobs | `ikpir-common/src/backend/frodo/params.rs::FrodoConfig` (`lwe_dim`) |
 | FrodoPIR backend implementation | `ikpir-common/src/backend/frodo/backend.rs` |
 | SimplePIR config knobs | `ikpir-common/src/backend/simple/params.rs::SimpleConfig` (`lwe_dim`, `sigma`) |
@@ -153,18 +175,21 @@ without a full rebuild.
 3. `server_setup(config, db, n_rows, row_width, plaintext_bits)` returns
    `(ServerParams, HintMaterial, Hint)` from the DB slice and the
    supplied config.
-4. `expand_hint_material(params)` re-derives the `HintMaterial`
+4. `db_matrix_shape(params)` reports the `(rows, cols)` the backend
+   actually multiplies, read back from `params` — never recomputed. The
+   benches' `db_rows` / `db_cols` columns come from here.
+5. `expand_hint_material(params)` re-derives the `HintMaterial`
    deterministically from `ServerParams` (the server may drop and
    re-expand mid-protocol; the client materialises its own copy
    independently during `client_setup`).
-5. `client_setup` returns `ClientState` from `(ServerParams, Hint)`,
+6. `client_setup` returns `ClientState` from `(ServerParams, Hint)`,
    internally calling `expand_hint_material(params)`.
-6. `client_query(state, row)` + `server_answer(params, db, n_rows, row_width, query)` +
+7. `client_query(state, row)` + `server_answer(params, db, n_rows, row_width, query)` +
    `client_decode(state, response)` must satisfy:
    `client_decode(server_answer(client_query(state, row))) == db[row*row_width..(row+1)*row_width]`.
    `server_answer` is permitted **not** to read the `HintMaterial` — this
    is what makes read-only `drop_hint_material` deployments work.
-7. If implementing `IncrementalPirBackend`: `server_patch_hint(params,
+8. If implementing `IncrementalPirBackend`: `server_patch_hint(params,
    material, hint, row_deltas, mode)` and `client_patch_state(state,
    row_deltas, mode)` must keep `Hint` and `ClientState` consistent with
    the updated DB for all future queries — and must produce the same
@@ -177,10 +202,20 @@ Four focused benches covering classical and incremental server criteria for the 
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
-| `server_setup` | `TableFull` | setup wall-clock (default trials=1, warmup=0): full `IkpirServer::new`, or `--estimate` = time one segment's `B::server_setup` × `arity`; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
+| `server_setup` | `--load-factor` (0.90) | setup wall-clock (default trials=3, warmup=1): the full `IkpirServer::new`; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR matvec answer rate (queries/sec, criterion); query_bytes, response_bytes | `ikpir_server_answer.csv` |
 | `server_mutation` | `--load-factor` (0.90) | Per-(kind, patch-mode) throughput (insert/update/delete × entry/row), wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
 | `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `server_answer` + `num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
+
+> **`server_setup` is the only bench that runs the reference setup.** It is
+> the one that *reports* setup cost, so it must. Every other bench builds its
+> server with `IkpirServer::new_parallel` and its client with
+> `IkpirClient::from_setup_parallel` — untimed preamble, byte-identical state,
+> minutes to hours saved at paper scale. `server_setup --setup-impl parallel`
+> opts into the optimized path to quantify that saving; the CSV's `setup_mode`
+> column then reads `full_parallel` rather than `full`, so such a row can never
+> be misread as a paper number. Both modes time a whole `IkpirServer::new`:
+> nothing measures one segment and multiplies by `arity`.
 
 - Each bench is `harness = false` and parses CLI via `clap` (see helpers
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
@@ -207,8 +242,19 @@ Four focused benches covering classical and incremental server criteria for the 
 - **Runner.** `scripts/bench.sh <bench> [flags]` maps the bench to its
   crate, auto-derives `--plaintext-bits` / `--lwe-dim`, and exports
   `IKPIR_RESULTS_DIR=results/ikpir-server` before `cargo bench`. Pass
-  `--backend simple` to switch backends. There is no full-matrix sweep
-  script; `scripts/smoke.sh` runs every PIR bench tiny for correctness.
+  `--backend simple` to switch backends. Its geometry defaults are dev
+  scale, not the paper's: the paper matrix lives in `scripts/lib.sh`
+  (`PAPER_*`) and is swept by `scripts/table3.sh` (online, via
+  `headtohead_answer`), `table4.sh` (mutation, via `server_mutation`)
+  and `table5.sh` (setup, via `server_setup`). `scripts/smoke.sh` runs
+  every PIR bench tiny for correctness.
+- **Fill.** `server_setup` and `server_mutation` both seed to
+  `--load-factor` (default 0.90) so the setup table and the mutation
+  table describe one store — setup is the static rebuild that mutation
+  replaces. Setup time itself is fill-independent (`compute_hint`
+  multiplies unconditionally); the fill only makes the CSV's
+  `load_factor` column honest. `server_answer` still populates to
+  `TableFull`, and `headtohead_answer` to an exact `--num-keys`.
 - One invocation = one CSV row (append-mode writer via
   `csv_writer`, honoring `IKPIR_RESULTS_DIR`; default `results/`).
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across

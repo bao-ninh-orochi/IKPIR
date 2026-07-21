@@ -111,7 +111,9 @@ pub(crate) fn gemm_at_d_accumulate(
     // produce bit-identical output (the tile schedule carries no
     // arithmetic).
     #[cfg(feature = "parallel")]
-    if (n_rows as u64) * (lwe_dim as u64) * (width as u64) >= GEMM_PAR_MIN_MACS {
+    if (n_rows as u64) * (lwe_dim as u64) * (width as u64) >= GEMM_PAR_MIN_MACS
+        && crate::backend::parallel::kernels_parallel()
+    {
         use rayon::prelude::*;
         let mut i0 = 0;
         while i0 < n_rows {

@@ -50,13 +50,22 @@ has the paper config matrix; there is no full-matrix sweep script.
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
-| `server_setup` | `TableFull` | `IkpirServer::new` wall-clock (trials=1, warmup=0), or `--estimate` = one segment × arity; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
+| `server_setup` | `--load-factor` (0.90) | `IkpirServer::new` wall-clock (trials=3, warmup=1); setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR answer rate (queries/sec, criterion, batch=64); query_bytes, response_bytes | `ikpir_server_answer.csv` |
 | `server_mutation` | `--load-factor` (0.90) | Per-(patch mode, kind) ops/sec, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
 | `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); +`num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
 
 `num_buckets` constraints differ per arity: 2-ary `2^t`, 3-ary `3·2^t`,
 4-ary `2^t ≥ 4`.
+
+`server_setup` is the only bench that runs setup on the **reference**
+(single-threaded, non-SIMD) implementation, because it is the only one that
+reports setup cost. The others build their server with
+`IkpirServer::new_parallel` — byte-identical state across all cores, untimed
+preamble. `--setup-impl parallel` points `server_setup` at that path too, to
+quantify the saving; the CSV's `setup_mode` column then reads `full_parallel`
+rather than `full`, so the row cannot be misread as a paper number. Both modes
+time a whole `IkpirServer::new` — no bench scales a partial measurement up.
 
 ### Flags
 
@@ -70,11 +79,11 @@ has the paper config matrix; there is no full-matrix sweep script.
 | `--plaintext-bits <N>` | `8` bench / max via `bench.sh` | PIR cell width |
 | `--lwe-dim <N>` | 1566 (frodo) / 1275 (simple) | LWE dimension |
 
-Bench-specific: `server_setup` takes `--estimate` / `--trials` / `--warmup`;
-`server_answer` and `headtohead_answer` take `--batch`; `server_mutation` takes
-`--patch-mode entry\|row` (comma list, default `entry`), `--n-mutations`,
-`--load-factor`; `headtohead_answer` requires `--num-keys` and takes
-`--max-mem-gb`.
+Bench-specific: `server_setup` takes `--trials` / `--warmup` / `--load-factor`
+/ `--setup-impl reference\|parallel`; `server_answer` and `headtohead_answer`
+take `--batch`; `server_mutation` takes `--patch-mode entry\|row` (comma list,
+default `entry`), `--n-mutations`, `--load-factor`; `headtohead_answer`
+requires `--num-keys`.
 
 ### Low-level: `cargo bench`
 
@@ -87,6 +96,25 @@ cargo bench -p ikpir-server --bench server_answer -- --backend simple --plaintex
 cargo bench -p ikpir-server --bench server_mutation -- --patch-mode entry,row --n-mutations 64
 cargo bench -p ikpir-server --bench <name> -- --help
 ```
+
+## Setup: reference and optimized
+
+`IkpirServer::new` and `full_rebuild` compute the per-segment hints
+single-threaded — the regime the paper reports. For any backend implementing
+`ParallelSetupBackend` (both shipped ones do), `new_parallel` and
+`full_rebuild_parallel` produce **byte-identical** state across all cores:
+
+```rust
+// Interchangeable — same ServerParams, same Hint, same epoch, same wire bytes.
+let server = Segmented2aryIkpirServer::new(store, FrodoConfig::default());
+let server = Segmented2aryIkpirServer::new_parallel(store, FrodoConfig::default());
+```
+
+Use the reference path when the setup timing itself is the result; use the
+parallel path whenever you just need a server. Worker count comes from
+`IKPIR_SETUP_THREADS`, else the machine's available parallelism (set it to `1`
+to force the reference schedule). Measured on 8 cores: 4.8× (FrodoPIR),
+6.3× (SimplePIR).
 
 ## Per-segment architecture
 

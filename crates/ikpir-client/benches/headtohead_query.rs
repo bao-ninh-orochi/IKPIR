@@ -1,16 +1,15 @@
 //! **Intent:** Head-to-head counterpart of `client_query` — measure
-//! client-side `build_query` throughput at a **fixed keyword count**
-//! (1 M / 1.5 M / 3 M / 4 M), for the fair comparison against ChalametPIR and
-//! Hao et al. 2025. See `headtohead_answer` for the motivation behind fixing
-//! `num_keys` instead of DB size.
+//! client-side `build_query` throughput at a **fixed keyword count**, for the
+//! fair comparison against ChalametPIR and Hao et al. 2025. See
+//! `headtohead_answer` for the motivation behind fixing `num_keys` instead of
+//! DB size, and for the two key-count regimes `scripts/table3.sh` sweeps.
 //!
 //! **Method:** Identical warm-bc pipeline as `client_query` except
 //! `populate_exact_n_keys(target_n = num_keys)` replaces `populate_until_full`,
 //! and the CSV carries the extra `num_keys` / `db_size` / `fingerprint_bits`
 //! columns.
 //!
-//! **Arguments (CLI):** Same as `client_query`, plus `--num-keys` (required)
-//! and `--max-mem-gb` (OOM guard).
+//! **Arguments (CLI):** Same as `client_query`, plus `--num-keys` (required).
 //!
 //! **Output:** `results/ikpir_headtohead_client_query.csv`
 
@@ -19,11 +18,11 @@
 
 mod helpers;
 
-use criterion::{Criterion, Throughput};
+use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -54,7 +53,8 @@ struct Cli {
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
     bucket_size: u32,
-    #[arg(long, default_value_t = 256)]
+    /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
+    #[arg(long, default_value_t = 2048)]
     value_bits: u32,
     #[arg(long, default_value_t = 32)]
     fingerprint_bits: u32,
@@ -67,10 +67,6 @@ struct Cli {
     /// repeated iterations do not reuse hot CPU-cache state from the previous call.
     #[arg(long, default_value_t = 64)]
     batch: u32,
-    /// Skip configs whose estimated peak memory exceeds this limit. Default
-    /// 85.0 is tuned for a ~96 GB server; lower it on smaller machines.
-    #[arg(long, default_value_t = 85.0)]
-    max_mem_gb: f64,
 }
 
 fn effective_lwe_dim(cli: &Cli) -> u32 {
@@ -86,33 +82,17 @@ fn run_one<S, B>(
     backend_config: B::Config,
 ) where
     S: MakeStore,
-    B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend
+        + ParallelSetupBackend
+        + IncrementalPirBackend
+        + PrecomputingPirBackend
+        + BackendWireSize
+        + Clone,
     B::Query: Clone,
     B::Response: Clone,
 {
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
-
-    // ── 0. Memory guard ─────────────────────────────────────────────────────────
-    let lwe_dim_est = effective_lwe_dim(cli) as u64;
-    let cells_per_slot_est =
-        (cli.fingerprint_bits + cli.value_bits).div_ceil(cli.plaintext_bits) as u64;
-    let row_width_est = cli.bucket_size as u64 * cells_per_slot_est;
-    let n_rows_per_seg = num_buckets as u64 / arity as u64;
-    let table_bytes = num_buckets as u64 * cli.bucket_size as u64 * cells_per_slot_est * 4;
-    let (a_rows_per_seg, _c_len_per_seg) =
-        helpers::backend_shape_estimate(cli.backend, n_rows_per_seg, row_width_est);
-    let a_bytes = arity as u64 * a_rows_per_seg * lwe_dim_est * 4;
-    let estimated_gb = (table_bytes + a_bytes) as f64 / 1e9;
-    if estimated_gb > cli.max_mem_gb {
-        eprintln!(
-            "  Skip (OOM guard): estimated peak {:.1} GB > --max-mem-gb {:.1} \
-             (nb={num_buckets} bs={} vb={} lwe_dim={lwe_dim_est} backend={}). \
-             Raise --max-mem-gb on machines with more RAM.",
-            estimated_gb, cli.max_mem_gb, cli.bucket_size, cli.value_bits, cli.backend,
-        );
-        return;
-    }
 
     // ── 1. Populate exactly num_keys ────────────────────────────────────────────
     let (store, n_inserted) = helpers::populate_exact_n_keys::<S>(
@@ -131,12 +111,12 @@ fn run_one<S, B>(
     // ── 2. Server setup; the query path never touches the server's `A`, so
     //       free it right after taking the bundle to keep peak RAM to the
     //       single client-side copy. ────────────────────────────────────────────
-    let mut server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
+    let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store, backend_config);
     let bundle = server.setup();
     server.drop_hint_material();
 
     let query_bytes = {
-        let mut probe: IkpirClient<B> = IkpirClient::from_setup(bundle.clone());
+        let mut probe: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle.clone());
         probe.build_query(&0u32.to_le_bytes()).wire_byte_size()
     };
 
@@ -145,8 +125,7 @@ fn run_one<S, B>(
     let cps = params_store.cells_per_slot();
     let row_width = cli.bucket_size * cps;
     let segment_rows = params_store.segment_size();
-    let (db_rows, db_cols) =
-        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
+    let (db_rows, db_cols) = B::db_matrix_shape(&server.backend_params()[0]);
     let db_size = (num_buckets as u64) * (cli.bucket_size as u64);
     let load_factor = n_inserted as f64 / db_size as f64;
     let lwe_dim_eff = effective_lwe_dim(cli);
@@ -222,12 +201,12 @@ fn run_one<S, B>(
     // ── 4. Measure build_query (warm-bc) ─────────────────────────────────────────
     let n = n_inserted as u32;
     let keys: Vec<[u8; 4]> = (0..cli.batch).map(|i| (i % n).to_le_bytes()).collect();
-    let mut client: IkpirClient<B> = IkpirClient::from_setup(bundle);
+    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle);
 
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut idx = 0usize;
     {
-        let mut c = Criterion::default();
+        let mut c = helpers::configured_criterion();
         let mut group = c.benchmark_group("headtohead_query");
         group.throughput(Throughput::Elements(1));
         group.bench_function("headtohead_query", |b| {

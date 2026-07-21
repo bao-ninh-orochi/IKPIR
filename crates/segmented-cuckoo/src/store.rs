@@ -2781,4 +2781,228 @@ mod tests {
             assert_eq!(occ.value_cells.len(), store.cells_per_slot() as usize);
         }
     }
+
+    // ─── pack_slot_cells / unpack_slot_cells over a parameter grid ───────────
+    //
+    // `pack_slot_cells` and `unpack_slot_cells` are the two halves of the slot
+    // wire layout that cross a crate boundary: `ikpir-server`'s hint patch packs
+    // a slot to compute cell deltas, and `ikpir-client`'s decode unpacks a
+    // PIR-recovered row. Neither sees a live store, so if either drifts from the
+    // layout `CuckooKVStore` actually writes, the failure surfaces as a *wrong
+    // decoded value* in the PIR layer rather than a panic here. These tests pin
+    // both halves against the live store across the whole grid, with emphasis on
+    // ragged tails (`value_bits % plaintext_bits != 0`), where the accumulator
+    // paths in the two directions are easiest to get subtly wrong.
+
+    /// `(plaintext_bits, fingerprint_bits, value_bits)` triples covering
+    /// byte-aligned and ragged-tail cell layouts, single-bit and full-width
+    /// cells, and values from 1 bit to 1 KiB.
+    const CELL_LAYOUT_GRID: &[(u32, u32, u32)] = &{
+        // Kept as an explicit cross-product so a failure names its own triple.
+        const PB: [u32; 6] = [1, 7, 8, 9, 12, 32];
+        const FP: [u32; 4] = [5, 12, 17, 32];
+        const VB: [u32; 6] = [1, 8, 13, 64, 100, 1024];
+        let mut out = [(0u32, 0u32, 0u32); PB.len() * FP.len() * VB.len()];
+        let mut i = 0;
+        let mut a = 0;
+        while a < PB.len() {
+            let mut b = 0;
+            while b < FP.len() {
+                let mut c = 0;
+                while c < VB.len() {
+                    out[i] = (PB[a], FP[b], VB[c]);
+                    i += 1;
+                    c += 1;
+                }
+                b += 1;
+            }
+            a += 1;
+        }
+        out
+    };
+
+    /// Build a `value_bits`-wide value, masking the tail byte so the bytes
+    /// carry no bits beyond `value_bits` (what the store contract requires).
+    fn make_masked_value(value_bits: u32, seed: u8) -> Vec<u8> {
+        let mut v = make_value(value_bits.div_ceil(8) as usize, seed);
+        if value_bits % 8 != 0 {
+            if let Some(last) = v.last_mut() {
+                *last &= (1u8 << (value_bits % 8)) - 1;
+            }
+        }
+        v
+    }
+
+    /// Convert value bytes to value cells using the store's own packer, so the
+    /// tests exercise the real path instead of a re-implementation of it.
+    fn value_cells_for(params: &CuckooParams, bytes: &[u8]) -> Vec<u32> {
+        let mut cells = vec![0u32; params.value_size_in_cells() as usize];
+        pack_value_bytes_to_cells(bytes, &mut cells, params.value_bits, params.plaintext_bits);
+        cells
+    }
+
+    /// `pack_slot_cells` → `unpack_slot_cells` is the identity on
+    /// `(fingerprint, value_bytes)`, and every cell it emits satisfies the
+    /// ChalametPIR high-bits-zero invariant.
+    #[test]
+    fn pack_unpack_roundtrip_over_param_grid() {
+        for &(pb, fp_bits, value_bits) in CELL_LAYOUT_GRID {
+            let store =
+                CuckooKVStore::<Segmented2aryScheme>::new(8, 4, fp_bits, value_bits, pb).unwrap();
+            let params = store.params();
+
+            let value_bytes = make_masked_value(value_bits, 0x5A);
+            let value_cells = value_cells_for(&params, &value_bytes);
+
+            let fp_mask = if fp_bits < 32 {
+                (1u32 << fp_bits) - 1
+            } else {
+                u32::MAX
+            };
+            let fp = (0xDEAD_BEEFu32 & fp_mask).max(1);
+
+            let mut packed = vec![0u32; params.cells_per_slot() as usize];
+            pack_slot_cells(&params, fp, &value_cells, &mut packed);
+
+            if pb < 32 {
+                let hi = !((1u32 << pb) - 1);
+                for (i, &c) in packed.iter().enumerate() {
+                    assert_eq!(
+                        c & hi,
+                        0,
+                        "high bits set in packed cell {i} at pb={pb} fp_bits={fp_bits} vb={value_bits}",
+                    );
+                }
+            }
+
+            let (got_fp, got_bytes) = unpack_slot_cells(&params, &packed);
+            assert_eq!(
+                got_fp, fp,
+                "fingerprint round-trip failed at pb={pb} fp_bits={fp_bits} vb={value_bits}",
+            );
+            assert_eq!(
+                got_bytes, value_bytes,
+                "value round-trip failed at pb={pb} fp_bits={fp_bits} vb={value_bits}",
+            );
+        }
+    }
+
+    /// `pack_slot_cells` reproduces, cell for cell, the layout `insert` writes
+    /// into the live store for the same `(fingerprint, value)` pair. This is the
+    /// invariant `ikpir-server`'s hint patch depends on: it packs slots off-store
+    /// and sums the cell deltas into the hint, so a layout mismatch corrupts the
+    /// hint rather than failing loudly.
+    #[test]
+    fn pack_matches_store_cell_layout_over_param_grid() {
+        for &(pb, fp_bits, value_bits) in CELL_LAYOUT_GRID {
+            let mut store =
+                CuckooKVStore::<Segmented2aryScheme>::new(8, 4, fp_bits, value_bits, pb).unwrap();
+            let params = store.params();
+
+            let value_bytes = make_masked_value(value_bits, 0x13);
+            store
+                .insert(b"grid_key" as &[u8], &value_bytes)
+                .expect("insert into empty store must succeed");
+
+            let occ = store
+                .iter_occupied_slots()
+                .next()
+                .expect("one key inserted ⇒ one occupied slot");
+            let (bucket, slot, fp) = (occ.bucket, occ.slot, occ.fingerprint);
+
+            let value_cells = value_cells_for(&params, &value_bytes);
+            let mut packed = vec![0u32; params.cells_per_slot() as usize];
+            pack_slot_cells(&params, fp, &value_cells, &mut packed);
+
+            let ground_truth = &store.as_cells()[params.slot_cell_range(bucket, slot)];
+            assert_eq!(
+                packed.as_slice(),
+                ground_truth,
+                "pack_slot_cells layout differs from store cells at pb={pb} fp_bits={fp_bits} vb={value_bits}",
+            );
+        }
+    }
+
+    /// `unpack_slot_cells` on a live slot's cell range returns the same
+    /// `(fingerprint, value)` the store holds. This is the invariant
+    /// `ikpir-client`'s decode depends on.
+    #[test]
+    fn unpack_matches_store_cell_layout_over_param_grid() {
+        for &(pb, fp_bits, value_bits) in CELL_LAYOUT_GRID {
+            let mut store =
+                CuckooKVStore::<Segmented2aryScheme>::new(8, 4, fp_bits, value_bits, pb).unwrap();
+            let params = store.params();
+
+            let value_bytes = make_masked_value(value_bits, 0x27);
+            store
+                .insert(b"grid_key" as &[u8], &value_bytes)
+                .expect("insert into empty store must succeed");
+
+            let occ = store
+                .iter_occupied_slots()
+                .next()
+                .expect("one key inserted ⇒ one occupied slot");
+            let (bucket, slot, store_fp) = (occ.bucket, occ.slot, occ.fingerprint);
+
+            let slot_cells = &store.as_cells()[params.slot_cell_range(bucket, slot)];
+            let (got_fp, got_bytes) = unpack_slot_cells(&params, slot_cells);
+
+            assert_eq!(
+                got_fp, store_fp,
+                "unpack_slot_cells fingerprint mismatch at pb={pb} fp_bits={fp_bits} vb={value_bits}",
+            );
+            assert_eq!(
+                got_bytes, value_bytes,
+                "unpack_slot_cells value mismatch at pb={pb} fp_bits={fp_bits} vb={value_bits}",
+            );
+        }
+    }
+
+    /// Across the grid, a written store keeps every cell within `plaintext_bits`
+    /// and every candidate index inside its own segment — the two structural
+    /// invariants the PIR layer reads the table under.
+    #[test]
+    fn store_invariants_hold_over_param_grid() {
+        for &(pb, fp_bits, value_bits) in CELL_LAYOUT_GRID {
+            let mut store =
+                CuckooKVStore::<Segmented2aryScheme>::new(8, 4, fp_bits, value_bits, pb).unwrap();
+            let params = store.params();
+            let value_bytes = make_masked_value(value_bits, 0x71);
+
+            for i in 0u32..12 {
+                let _ = store.insert(i.to_le_bytes(), &value_bytes);
+            }
+
+            if pb < 32 {
+                let hi = !((1u32 << pb) - 1);
+                for &c in store.as_cells() {
+                    assert_eq!(
+                        c & hi,
+                        0,
+                        "high bits set in store cell at pb={pb} fp_bits={fp_bits} vb={value_bits}",
+                    );
+                }
+            }
+
+            // 2-ary: candidate 0 lives in [0, segment_size), candidate 1 in
+            // [segment_size, num_buckets) — the confinement IKPIR relies on to
+            // reduce a keyword lookup to one Index-PIR query per segment.
+            let seg = params.segment_size();
+            for i in 0u32..12 {
+                let (fp, indices) = params.candidate_buckets(&i.to_le_bytes());
+                assert_ne!(fp, 0, "fingerprint must never be zero");
+                assert!(
+                    indices[0] < seg,
+                    "i0={} must be < segment_size={seg}",
+                    indices[0]
+                );
+                assert!(
+                    indices[1] >= seg && indices[1] < params.num_buckets,
+                    "i1={} must be in [{seg}, {})",
+                    indices[1],
+                    params.num_buckets,
+                );
+            }
+        }
+    }
 }

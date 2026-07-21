@@ -19,9 +19,12 @@ autobenches = false
 workspace = true
 
 [features]
-# Forward the perf branch's parallel-kernels feature (default-on).
+# Forward the perf branch's parallel-kernels feature (default-on). The
+# `ikpir-server` arm is what keeps the client benches' server-side setup
+# preamble multi-threaded — it is a dev-dependency, so nothing here
+# reaches a downstream consumer's build.
 default  = ["parallel"]
-parallel = ["ikpir-common/parallel"]
+parallel = ["ikpir-common/parallel", "ikpir-server/parallel"]
 
 [dependencies]
 segmented-cuckoo = { workspace = true }

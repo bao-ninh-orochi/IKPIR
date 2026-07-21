@@ -39,11 +39,18 @@ use std::collections::VecDeque;
 
 use rand::RngCore;
 
-use super::{round_p_to_q, round_q_to_p, sample_a, sample_ternary_into, FrodoConfig, FrodoParams};
+use super::{
+    round_p_to_q, round_q_to_p, sample_a, sample_a_parallel, sample_ternary_into, FrodoConfig,
+    FrodoParams,
+};
 use crate::backend::gemm::gemm_at_d_accumulate;
 use crate::backend::matvec::{matvec_accumulate, matvec_rows_accumulate};
+#[cfg(feature = "parallel")]
+use crate::backend::patch;
+use crate::backend::patch::{row_level_batch_rows, TouchedRuns};
 use crate::backend::{
-    BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend,
+    parallel, BackendWireSize, HintPatchMode, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, PrecomputingPirBackend,
 };
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
@@ -246,6 +253,11 @@ impl IndexPirBackend for FrodoPirBackend {
             FrodoHintMaterial { a },
             FrodoHint { data: hint_data },
         )
+    }
+
+    fn db_matrix_shape(params: &FrodoServerParams) -> (u32, u32) {
+        // FrodoPIR multiplies the segment as handed to it — no reshape.
+        (params.n_rows, params.row_width)
     }
 
     fn expand_hint_material(params: &FrodoServerParams) -> FrodoHintMaterial {
@@ -478,11 +490,17 @@ impl PrecomputingPirBackend for FrodoPirBackend {
 ///
 /// # Rationale
 ///
-/// Delegates to the shared panel-blocked [`gemm_at_d_accumulate`]
+/// Delegates to the shared register-tiled [`gemm_at_d_accumulate`]
 /// kernel (see `backend/gemm.rs` for the blocking scheme and the
 /// bit-exactness argument) — the reference `i, k, j` rank-one-update
 /// loop streamed the whole hint once per DB row and was bound on `H`
 /// cache traffic, not multiply throughput.
+///
+/// There is deliberately **no `aik == 0` shortcut**. `A` is uniform over
+/// `Z_{2³²}` (`sample_a` draws raw `next_u32` words), so a zero cell
+/// occurs with probability `2⁻³²` and skipping it can never pay for the
+/// test. The ternary distribution in this backend belongs to the LWE
+/// *secret and error* (`sample_ternary_into`), not to `A`.
 ///
 /// # Complexity
 ///
@@ -495,6 +513,156 @@ fn compute_hint(a: &[u32], db: &[u32], n_rows: u32, lwe_dim: u32, row_width: u32
     let mut h = vec![0u32; lwe_dim_us * row_width_us];
     gemm_at_d_accumulate(&mut h, a, db, lwe_dim_us, row_width_us);
     h
+}
+
+/// Multi-threaded twin of [`compute_hint`] — **bit-identical output**.
+///
+/// # Purpose
+///
+/// The optimized setup path's hint precompute (see
+/// [`ParallelSetupBackend`]). This is where essentially all of setup's
+/// `Θ(n_rows · lwe_dim · row_width)` arithmetic lives.
+///
+/// # Rationale
+///
+/// On this branch [`compute_hint`] *is* the optimized kernel: the
+/// register-tiled GEMM in `backend/gemm.rs` already fans its disjoint
+/// `H` tiles out over rayon. So the twin is the same function, and
+/// `ParallelSetupBackend`'s equivalence contract holds trivially.
+/// Wrapping a second fan-out around it would only oversubscribe the
+/// machine. `--no-default-features` selects the scoped-thread banding
+/// instead — see the sibling definition below.
+#[cfg(feature = "parallel")]
+fn compute_hint_parallel(
+    a: &[u32],
+    db: &[u32],
+    n_rows: u32,
+    lwe_dim: u32,
+    row_width: u32,
+) -> Vec<u32> {
+    compute_hint(a, db, n_rows, lwe_dim, row_width)
+}
+
+/// Multi-threaded twin of [`compute_hint`] — **bit-identical output**.
+///
+/// # Purpose
+///
+/// The `--no-default-features` build's optimized setup path: with the
+/// `parallel` feature off, [`compute_hint`] runs the register-tiled
+/// GEMM single-threaded, so [`ParallelSetupBackend`] still needs a
+/// fan-out of its own.
+///
+/// # Rationale
+///
+/// `H` splits by **bands of rows**: worker `t` owns hint rows
+/// `[k₀, k₀ + band)` and runs the reference's `i, k, j` nest restricted
+/// to that band. The bands are disjoint output regions, so there is no
+/// reduction and no cross-thread synchronisation — and each cell
+/// `H[k, j]` still accumulates over `i` in the same increasing order
+/// the reference uses, which is what makes the result bit-identical
+/// rather than merely equivalent.
+///
+/// Banding by `k` (not by `i`) is also the cache-friendly choice: each
+/// worker keeps a `band × row_width` slice of `H` hot while all workers
+/// stream the same `D` rows in lockstep, sharing them in the outer
+/// cache levels.
+///
+/// Falls back to [`compute_hint`] on a single core or below
+/// [`parallel::PAR_MIN_HINT_MACS`].
+#[cfg(not(feature = "parallel"))]
+fn compute_hint_parallel(
+    a: &[u32],
+    db: &[u32],
+    n_rows: u32,
+    lwe_dim: u32,
+    row_width: u32,
+) -> Vec<u32> {
+    let lwe_dim_us = lwe_dim as usize;
+    let row_width_us = row_width as usize;
+    let macs = u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width);
+    let threads = parallel::setup_threads();
+    if threads <= 1 || macs < parallel::PAR_MIN_HINT_MACS {
+        return compute_hint(a, db, n_rows, lwe_dim, row_width);
+    }
+
+    let mut h = vec![0u32; lwe_dim_us * row_width_us];
+    // Chunk length is a whole multiple of `row_width`, so every band
+    // starts on a hint-row boundary and `offset / row_width` is the
+    // band's first `k`.
+    let chunk = parallel::balanced_chunk_len(h.len(), row_width_us, threads);
+    parallel::par_chunks_mut(&mut h, chunk, |offset, band| {
+        let k0 = offset / row_width_us;
+        // Whole hint rows per band: `balanced_chunk_len` was given
+        // `row_width` as its unit and `h.len()` is `lwe_dim · row_width`,
+        // so every chunk — including the ragged last one — divides
+        // exactly. The floor below would silently drop the tail rows if
+        // that ever stopped holding.
+        debug_assert_eq!(band.len() % row_width_us, 0, "band must be whole hint rows");
+        let band_rows = band.len() / row_width_us;
+        for i in 0..n_rows as usize {
+            let a_row = &a[i * lwe_dim_us + k0..i * lwe_dim_us + k0 + band_rows];
+            let d_row = &db[i * row_width_us..(i + 1) * row_width_us];
+            for (k, &aik) in a_row.iter().enumerate() {
+                let h_row = &mut band[k * row_width_us..(k + 1) * row_width_us];
+                for j in 0..row_width_us {
+                    h_row[j] = h_row[j].wrapping_add(aik.wrapping_mul(d_row[j]));
+                }
+            }
+        }
+    });
+    h
+}
+
+/// Optimized setup for FrodoPIR: same `(ServerParams, HintMaterial,
+/// Hint)`, computed across cores.
+///
+/// Both heavy kernels fan out — `sample_a_parallel` (in `sampler.rs`) for
+/// `A` and `compute_hint_parallel` (above) for `H = Aᵀ·D` — and both are bit-identical
+/// to their reference twins, so a server set up on this path is
+/// indistinguishable from one set up on [`IndexPirBackend::server_setup`].
+impl ParallelSetupBackend for FrodoPirBackend {
+    fn server_setup_parallel(
+        config: &FrodoConfig,
+        db: &[u32],
+        n_rows: u32,
+        row_width: u32,
+        plaintext_bits: u32,
+    ) -> (FrodoServerParams, FrodoHintMaterial, FrodoHint) {
+        debug_assert_eq!(db.len(), (n_rows as usize) * (row_width as usize));
+        let lwe_dim = config.lwe_dim;
+
+        let mut seed = [0u8; 16];
+        rand::rng().fill_bytes(&mut seed);
+        let params = FrodoParams::new(lwe_dim, plaintext_bits, seed);
+
+        let a = sample_a_parallel(&seed, n_rows, lwe_dim);
+        let hint_data = compute_hint_parallel(&a, db, n_rows, lwe_dim, row_width);
+
+        (
+            FrodoServerParams {
+                params,
+                n_rows,
+                row_width,
+            },
+            FrodoHintMaterial { a },
+            FrodoHint { data: hint_data },
+        )
+    }
+
+    fn expand_hint_material_parallel(params: &FrodoServerParams) -> FrodoHintMaterial {
+        let a = sample_a_parallel(&params.params.seed, params.n_rows, params.params.lwe_dim);
+        FrodoHintMaterial { a }
+    }
+
+    fn client_setup_parallel(params: &FrodoServerParams, hint: &FrodoHint) -> FrodoClientState {
+        FrodoClientState {
+            params: params.clone(),
+            hint_material: Self::expand_hint_material_parallel(params),
+            hint: hint.clone(),
+            prepared: VecDeque::new(),
+            in_flight: None,
+        }
+    }
 }
 
 /// Wire-size accounting for FrodoPIR.
@@ -718,16 +886,30 @@ fn apply_patch(
 /// Math: `H[k, cell] += A[row_idx, k] · Δ mod 2³²`. Iterates touched
 /// `(row, cell, Δ)` triples and slides `A`'s `row_idx`-th column
 /// against the hint column at `cell`; untouched columns are never read
-/// or written. Large bursts split the `k` dimension across rayon tasks
-/// — each task owns a contiguous band of hint rows, so writes are
-/// disjoint and every `(row, cell, k)` term is added exactly once
-/// (bit-exact for any banding).
+/// or written. No `aik == 0` shortcut — see [`compute_hint`] for why `A`
+/// carries no exploitable sparsity.
+///
+/// The execution order is [`TouchedRuns`]': `k` (the hint row) outside,
+/// the row's touched columns — coalesced into contiguous runs — inside,
+/// so the patch sweeps the hint once. FrodoPIR patches column
+/// `cell_offset` directly; there is no reshape to translate through.
+///
+/// Large bursts then split that single sweep by `k`: each rayon task
+/// owns a contiguous **band** of hint rows and replays every row's runs
+/// into it. Bands are disjoint output regions, so each `(row, cell, k)`
+/// term is still added exactly once and the result is bit-identical to
+/// the one-band pass for any banding. The two optimisations are
+/// orthogonal — coalescing fixes *what order* the hint is walked in,
+/// banding fixes *how many cores* walk it — and compose without either
+/// giving anything up.
 ///
 /// # Complexity
 ///
 /// `O(touched_cells · lwe_dim)` wrapping multiply-add — `Θ(n)` per
 /// touched cell, the paper's entry-level cost. Vastly cheaper than a
-/// full `compute_hint` when the mutation count is small.
+/// full `compute_hint` when the mutation count is small, and
+/// `bucket_size×` cheaper than [`apply_patch_row_level`] on the same
+/// batch.
 fn apply_patch_entry_level(
     a: &[u32],
     lwe_dim: u32,
@@ -746,61 +928,45 @@ fn apply_patch_entry_level(
 
     #[cfg(feature = "parallel")]
     {
-        let touched: usize = row_deltas.iter().map(|(_, cells)| cells.len()).sum();
-        if touched * lwe_dim_us >= PATCH_PAR_MIN_MACS {
-            use rayon::prelude::*;
-            let band_k = lwe_dim_us
-                .div_ceil(rayon::current_num_threads() * 4)
-                .max(16);
-            hint.par_chunks_mut(band_k * row_width_us)
-                .enumerate()
-                .for_each(|(bi, band)| {
-                    entry_level_band(a, lwe_dim_us, row_width_us, band, bi * band_k, row_deltas);
-                });
+        let touched_cells: usize = row_deltas.iter().map(|(_, cells)| cells.len()).sum();
+        if touched_cells * lwe_dim_us >= patch::PATCH_PAR_MIN_MACS && parallel::kernels_parallel() {
+            patch::apply_banded(
+                a,
+                lwe_dim_us,
+                hint,
+                row_width_us,
+                row_deltas,
+                |row_idx, cells| {
+                    let mut runs = TouchedRuns::new();
+                    runs.rebuild(cells, |off| off as usize);
+                    (row_idx as usize, runs)
+                },
+            );
             return;
         }
     }
-    entry_level_band(a, lwe_dim_us, row_width_us, hint, 0, row_deltas);
-}
 
-/// Minimum multiply-add count before a hint patch fans out to rayon —
-/// single-mutation bursts stay inline, `server_mutation`-sized batches
-/// parallelise.
-#[cfg(feature = "parallel")]
-const PATCH_PAR_MIN_MACS: usize = 1 << 19;
+    // Hoisted out of the row loop: a batch of mutations allocates at most
+    // once, however many rows it touches.
+    let mut touched = TouchedRuns::new();
 
-/// Apply every `(row, cell, Δ)` edit to one contiguous band of hint
-/// rows (`k_base ..` for `band.len() / row_width` rows).
-fn entry_level_band(
-    a: &[u32],
-    lwe_dim_us: usize,
-    row_width_us: usize,
-    band: &mut [u32],
-    k_base: usize,
-    row_deltas: &[(u32, Vec<(u16, i64)>)],
-) {
-    let k_count = band.len() / row_width_us;
     for (row_idx, cells) in row_deltas {
-        debug_assert!((*row_idx as usize) * lwe_dim_us < a.len());
-        let a_off = (*row_idx as usize) * lwe_dim_us + k_base;
-        let a_band = &a[a_off..a_off + k_count];
-
-        for (cell_offset, delta) in cells {
+        debug_assert!(
+            (*row_idx as usize) < n_rows as usize,
+            "row_idx {row_idx} out of range (n_rows={n_rows})",
+        );
+        touched.rebuild(cells, |off| {
             debug_assert!(
-                (*cell_offset as usize) < row_width_us,
-                "cell_offset {cell_offset} out of range (row_width={row_width_us})",
+                (off as usize) < row_width_us,
+                "cell_offset {off} out of range (row_width={row_width})",
             );
-            if *delta == 0 {
-                continue;
-            }
-            let delta_u32 = *delta as u32;
-            let cell_us = *cell_offset as usize;
-
-            for (k, &aik) in a_band.iter().enumerate() {
-                let idx = k * row_width_us + cell_us;
-                band[idx] = band[idx].wrapping_add(aik.wrapping_mul(delta_u32));
-            }
+            off as usize
+        });
+        if touched.is_empty() {
+            continue;
         }
+        let a_row = &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us];
+        touched.apply(a_row, hint, row_width_us);
     }
 }
 
@@ -809,17 +975,30 @@ fn entry_level_band(
 ///
 /// # Rationale
 ///
-/// Densify the sparse edits into a `touched_rows × row_width` delta
-/// matrix `Δ` (zero at untouched columns), gather the touched `A` rows,
-/// and apply the whole burst as one `H += A_selᵀ · Δ` product through
-/// the shared register-tiled [`gemm_at_d_accumulate`] — the dense
-/// rank-one updates of the paper's row-level patch, batched into the
-/// same tiled (and, for large bursts, parallel) kernel that computes
-/// hints. Columns with `δ = 0` are still multiplied — that is the
-/// point: this is the row-granular patch of SimplePIR, kept as the
-/// baseline the entry-level sharpening is measured against. Bit-exact
-/// vs the per-row loop: each `H[k, j]` gains `Σ_r A[r, k] · δ_r[j]`
-/// and wrapping addition is associative + commutative.
+/// The literal reading is one dense rank-one update per touched row:
+/// densify that row's sparse edits into a `row_width`-wide delta vector
+/// `δ` (zero at untouched columns) and fold
+/// `H[k, ·] += A[row_idx, k] · δ[·]` across the whole hint. Columns with
+/// `δ = 0` are still multiplied — that is the point: this is the
+/// row-granular patch of SimplePIR, kept as the baseline the entry-level
+/// sharpening is measured against.
+///
+/// Executed one row at a time it also streams the entire hint once
+/// **per touched row**, and a τ = 1 % mutation batch touches thousands.
+/// So rows are densified in *chunks*, and each chunk applied as a single
+/// `H += A_selᵀ · Δ` product through the shared register-tiled
+/// [`gemm_at_d_accumulate`] — the same kernel that computes hints. The
+/// hint is then streamed once per chunk rather than once per row, and
+/// the multiply-adds run tiled instead of one accumulator load and store
+/// apiece.
+///
+/// Chunking rather than one product over the whole batch is what keeps
+/// the working set bounded: `Δ` plus the gathered `A` rows is capped at
+/// [`patch::ROW_LEVEL_BATCH_CELLS`], a few megabytes, where the whole batch at
+/// paper scale would be tens to hundreds. Bit-exact either way — each
+/// `H[k, j]` gains `Σ_r A[r, k] · δ_r[j]` and wrapping addition is
+/// associative and commutative, so any chunking sums the same terms. No
+/// `aik == 0` shortcut — see [`compute_hint`].
 ///
 /// # Complexity
 ///
@@ -838,28 +1017,40 @@ fn apply_patch_row_level(
     debug_assert_eq!(a.len(), (n_rows as usize) * lwe_dim_us);
     debug_assert_eq!(hint.len(), lwe_dim_us * row_width_us);
 
-    let t = row_deltas.len();
-    let mut delta = vec![0u32; t * row_width_us];
-    let mut a_sel = vec![0u32; t * lwe_dim_us];
-    for (r, (row_idx, cells)) in row_deltas.iter().enumerate() {
-        debug_assert!(
-            (*row_idx as usize) < n_rows as usize,
-            "row_idx {row_idx} out of range (n_rows={n_rows})",
-        );
-        let delta_row = &mut delta[r * row_width_us..(r + 1) * row_width_us];
-        for (cell_offset, d) in cells {
+    let batch_rows = row_level_batch_rows(row_width_us, lwe_dim_us);
+    // Reused across chunks: `clear` + `resize` refills with zeros without
+    // giving the capacity back, so only the first chunk allocates.
+    let mut delta: Vec<u32> = Vec::new();
+    let mut a_sel: Vec<u32> = Vec::new();
+
+    for chunk in row_deltas.chunks(batch_rows) {
+        let t = chunk.len();
+        delta.clear();
+        delta.resize(t * row_width_us, 0);
+        a_sel.clear();
+        a_sel.resize(t * lwe_dim_us, 0);
+
+        for (r, (row_idx, cells)) in chunk.iter().enumerate() {
             debug_assert!(
-                (*cell_offset as usize) < row_width_us,
-                "cell_offset {cell_offset} out of range (row_width={row_width})",
+                (*row_idx as usize) < n_rows as usize,
+                "row_idx {row_idx} out of range (n_rows={n_rows})",
             );
-            let cell_us = *cell_offset as usize;
-            delta_row[cell_us] = delta_row[cell_us].wrapping_add(*d as u32);
+            let delta_row = &mut delta[r * row_width_us..(r + 1) * row_width_us];
+            for (cell_offset, d) in cells {
+                debug_assert!(
+                    (*cell_offset as usize) < row_width_us,
+                    "cell_offset {cell_offset} out of range (row_width={row_width})",
+                );
+                let cell_us = *cell_offset as usize;
+                delta_row[cell_us] = delta_row[cell_us].wrapping_add(*d as u32);
+            }
+            a_sel[r * lwe_dim_us..(r + 1) * lwe_dim_us].copy_from_slice(
+                &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us],
+            );
         }
-        a_sel[r * lwe_dim_us..(r + 1) * lwe_dim_us].copy_from_slice(
-            &a[(*row_idx as usize) * lwe_dim_us..(*row_idx as usize + 1) * lwe_dim_us],
-        );
+
+        gemm_at_d_accumulate(hint, &a_sel, &delta, lwe_dim_us, row_width_us);
     }
-    gemm_at_d_accumulate(hint, &a_sel, &delta, lwe_dim_us, row_width_us);
 }
 
 #[cfg(test)]
@@ -888,6 +1079,57 @@ mod tests {
                 .to_vec();
             assert_eq!(decoded, expected, "row {row} mismatch");
         }
+    }
+
+    /// The optimized hint kernel is bit-identical to the reference.
+    /// Every shape exceeds `parallel::PAR_MIN_HINT_MACS` (asserted, so the test
+    /// cannot silently go vacuous if the threshold moves) and the
+    /// `lwe_dim` values are both multiples and non-multiples of any
+    /// plausible worker count, exercising the ragged last band.
+    #[test]
+    fn compute_hint_parallel_matches_reference() {
+        for (n_rows, row_width, lwe_dim) in
+            [(37u32, 257u32, 256u32), (32, 64, 1031), (24, 4096, 17)]
+        {
+            assert!(
+                u64::from(n_rows) * u64::from(lwe_dim) * u64::from(row_width)
+                    >= parallel::PAR_MIN_HINT_MACS,
+                "shape ({n_rows}, {row_width}, {lwe_dim}) must exceed the parallel threshold"
+            );
+            let db = make_db(n_rows, row_width, 8);
+            let a = sample_a(&[0x9Eu8; 16], n_rows, lwe_dim);
+            assert_eq!(
+                compute_hint_parallel(&a, &db, n_rows, lwe_dim, row_width),
+                compute_hint(&a, &db, n_rows, lwe_dim, row_width),
+                "mismatch at n_rows={n_rows} row_width={row_width} lwe_dim={lwe_dim}"
+            );
+        }
+    }
+
+    /// End-to-end equivalence contract of [`ParallelSetupBackend`]: a
+    /// server set up on the optimized path holds exactly the `(A, H)`
+    /// the reference path would have derived from the same seed.
+    #[test]
+    fn parallel_setup_matches_reference_for_its_own_seed() {
+        let (n_rows, row_width, pb) = (64u32, 300u32, 8u32);
+        let db = make_db(n_rows, row_width, pb);
+        let cfg = FrodoConfig::with_lwe_dim(256);
+
+        let (sp, mat, hint) =
+            FrodoPirBackend::server_setup_parallel(&cfg, &db, n_rows, row_width, pb);
+
+        // Same `A` as the reference expansion of this segment's seed …
+        let reference_mat = FrodoPirBackend::expand_hint_material(&sp);
+        assert_eq!(mat.a, reference_mat.a);
+        // … and the same hint the reference would have computed from it.
+        assert_eq!(
+            hint.data,
+            compute_hint(&reference_mat.a, &db, n_rows, sp.params.lwe_dim, row_width)
+        );
+        // The client's optimized re-expansion agrees too.
+        let state = FrodoPirBackend::client_setup_parallel(&sp, &hint);
+        assert_eq!(state.hint_material.a, reference_mat.a);
+        assert_eq!(state.hint, hint);
     }
 
     #[test]
@@ -1111,6 +1353,117 @@ mod tests {
         let a = sample_a(&sp.params.seed, n_rows, lwe_dim);
         let expected = compute_hint(&a, &db, n_rows, lwe_dim, row_width);
         assert_eq!(hint.data, expected);
+    }
+
+    /// A mutation batch big enough to cross `PATCH_PAR_MIN_MACS` — the
+    /// threshold is asserted, so the test cannot go vacuous if it moves —
+    /// patches identically under both realizations and matches a
+    /// recomputed hint. This is the only coverage of the banded
+    /// entry-level sweep at a shape a caller actually produces.
+    #[test]
+    fn patch_batch_above_parallel_gate_matches_oracle() {
+        let pb = 8u32;
+        let (n_rows, row_width) = (128u32, 16u32);
+        let cfg = FrodoConfig { lwe_dim: 512 };
+        let mut db = make_db(n_rows, row_width, pb);
+        let (sp, mat, hint0) = FrodoPirBackend::server_setup(&cfg, &db, n_rows, row_width, pb);
+
+        // Every cell of every row: 2048 touched cells × 512 = 2²⁰ MACs.
+        let row_deltas: Vec<(u32, Vec<(u16, i64)>)> = (0..n_rows)
+            .map(|row| {
+                let cells = (0..row_width as u16)
+                    .map(|off| {
+                        let dlt = i64::from(off).wrapping_sub(7).wrapping_mul(3);
+                        (off, apply_cell_delta(&mut db, row, off, dlt, row_width, pb))
+                    })
+                    .collect();
+                (row, cells)
+            })
+            .collect();
+        #[cfg(feature = "parallel")]
+        {
+            let touched: usize = row_deltas.iter().map(|(_, c)| c.len()).sum();
+            assert!(
+                touched * cfg.lwe_dim as usize >= crate::backend::patch::PATCH_PAR_MIN_MACS,
+                "fixture must exceed the entry-level fan-out threshold"
+            );
+        }
+
+        let mut hint_entry = hint0.clone();
+        let mut hint_row = hint0;
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint_entry,
+            &row_deltas,
+            HintPatchMode::EntryLevel,
+        );
+        FrodoPirBackend::server_patch_hint(
+            &sp,
+            &mat,
+            &mut hint_row,
+            &row_deltas,
+            HintPatchMode::RowLevel,
+        );
+
+        let expected = compute_hint(&mat.a, &db, n_rows, cfg.lwe_dim, row_width);
+        assert_eq!(
+            hint_entry.data, expected,
+            "entry-level diverged from oracle"
+        );
+        assert_eq!(hint_row.data, expected, "row-level diverged from oracle");
+    }
+
+    /// The row-level pass fires one GEMM per chunk of touched rows, so a
+    /// batch spanning several chunks must reach the same hint as one
+    /// spanning one — in particular the chunk buffer has to be zeroed
+    /// between products. The shape is synthetic (a hint far wider than
+    /// any real segment) purely to make `row_level_batch_rows` small
+    /// enough that a cheap test crosses the boundary; the loop it
+    /// exercises depends on nothing else.
+    #[test]
+    fn row_level_patch_spans_several_chunks() {
+        let (lwe_dim, row_width) = (4u32, 262_140u32);
+        let cap = crate::backend::patch::row_level_batch_rows(row_width as usize, lwe_dim as usize);
+        let n_rows = (cap as u32) * 2 + 3;
+        assert!(
+            cap >= 2 && n_rows as usize > 2 * cap,
+            "fixture must span 3 chunks"
+        );
+
+        let a: Vec<u32> = (0..n_rows * lwe_dim)
+            .map(|i| i.wrapping_mul(2_654_435_761).wrapping_add(17))
+            .collect();
+        let hint0: Vec<u32> = (0..lwe_dim * row_width)
+            .map(|i| i.wrapping_mul(40_503))
+            .collect();
+        let row_deltas: Vec<(u32, Vec<(u16, i64)>)> = (0..n_rows)
+            .map(|row| {
+                (
+                    row,
+                    vec![
+                        (u16::try_from(row % 1000).unwrap(), i64::from(row) + 1),
+                        (u16::try_from(row % 1000).unwrap() + 1, -3),
+                    ],
+                )
+            })
+            .collect();
+
+        // Oracle: the sparse formula, one touched cell at a time.
+        let mut expected = hint0.clone();
+        for (row, cells) in &row_deltas {
+            for &(off, dlt) in cells {
+                for k in 0..lwe_dim as usize {
+                    let idx = k * row_width as usize + off as usize;
+                    let aik = a[*row as usize * lwe_dim as usize + k];
+                    expected[idx] = expected[idx].wrapping_add(aik.wrapping_mul(dlt as u32));
+                }
+            }
+        }
+
+        let mut got = hint0;
+        apply_patch_row_level(&a, lwe_dim, n_rows, row_width, &mut got, &row_deltas);
+        assert_eq!(got, expected, "chunked row-level patch diverged");
     }
 
     #[test]

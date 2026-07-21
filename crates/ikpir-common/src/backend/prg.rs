@@ -1,14 +1,13 @@
 //! Chunk-parallel ChaCha20 word-stream expansion — the shared engine
-//! behind both backends' `sample_a`.
+//! behind both backends' `sample_a` / `sample_a_parallel`.
 //!
 //! # Purpose
 //!
 //! Expanding the LWE public matrix `A` from its 16-byte seed is a pure
 //! ChaCha20 stream read (`n_rows · lwe_dim` successive `next_u32`
-//! words) and, after the matrix kernels were blocked and parallelised,
-//! it dominates FrodoPIR's `server_setup` (~220 ms of a ~250 ms setup
-//! at the paper's mid shape on M1) and every `expand_hint_material` /
-//! `client_setup` call.
+//! words) and, once the matrix kernels are blocked and parallelised, it
+//! dominates FrodoPIR's `server_setup` and *is* the entire cost of
+//! every `expand_hint_material` / `client_setup` call.
 //!
 //! # Design / architecture
 //!
@@ -20,14 +19,28 @@
 //! sequential stream **byte-for-byte** — the determinism contract on
 //! `expand_hint_material` (server and client independently re-expand
 //! the same `A` from the wire seed) is preserved exactly. Chunk starts
-//! are rounded to the 16-word ChaCha block size so no task recomputes a
-//! partial block.
+//! are rounded to ChaCha20's 64-word refill buffer
+//! ([`parallel::CHACHA_BUFFER_WORDS`]) so no task regenerates a partial
+//! buffer.
+//!
+//! Two realizations, same bytes:
+//!
+//! - [`chacha20_fill_words`] — the default path. With the `parallel`
+//!   feature on (the default here) it fans out over rayon's persistent
+//!   pool, so `sample_a` — and therefore every setup and every client
+//!   bootstrap — is already multi-threaded.
+//! - `chacha20_fill_words_scoped` — the `--no-default-features` build's
+//!   fan-out for `sample_a_parallel`, on `std::thread::scope`. With the
+//!   `parallel` feature on it is not compiled: `sample_a` is already
+//!   parallel, so the twin simply calls it.
 //!
 //! # Related files
 //!
 //! - `frodo/sampler.rs` / `simple/sampler.rs` — `sample_a` callers
 //!   (both pad the same 16-byte seed the same way; the padding stays in
 //!   the per-backend samplers, mirroring the `arith.rs` convention).
+//! - `backend/parallel.rs` — the worker count, the chunk rule, and the
+//!   scoped fan-out.
 //! - `matvec.rs` / `gemm.rs` — the same shared-kernel rationale: this
 //!   is backend-agnostic machinery whose tuning must never diverge
 //!   between backends.
@@ -35,16 +48,7 @@
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-/// ChaCha20 outputs 16 `u32` words per block; chunk boundaries snap to
-/// this so no parallel task regenerates a partial block.
-#[cfg(feature = "parallel")]
-const CHACHA_BLOCK_WORDS: usize = 16;
-
-/// Minimum output words before fanning out to rayon. A ~1 MiB fill
-/// takes ~500 µs single-threaded — well past fork/join overhead — while
-/// SimplePIR's smallest reshaped `A` stays comfortably above this too.
-#[cfg(feature = "parallel")]
-const PAR_MIN_WORDS: usize = 1 << 18;
+use crate::backend::parallel;
 
 /// Fill `out` with the first `out.len()` words of `ChaCha20(seed)` —
 /// `seed` is the already-padded 32-byte RNG seed.
@@ -54,16 +58,42 @@ const PAR_MIN_WORDS: usize = 1 << 18;
 /// Byte-identical to `for cell in out { *cell = rng.next_u32() }` on a
 /// fresh `ChaCha20Rng::from_seed(seed)`, regardless of thread count —
 /// pinned by the unit tests. The chunk schedule depends only on
-/// `out.len()`.
+/// `out.len()` and the public worker count.
 pub(crate) fn chacha20_fill_words(seed: [u8; 32], out: &mut [u32]) {
     #[cfg(feature = "parallel")]
-    if out.len() >= PAR_MIN_WORDS {
-        let tasks = rayon::current_num_threads() * 4;
-        let chunk = out.len().div_ceil(tasks).div_ceil(CHACHA_BLOCK_WORDS) * CHACHA_BLOCK_WORDS;
-        fill_words_chunked(seed, out, chunk);
+    if out.len() >= parallel::PAR_MIN_WORDS && parallel::kernels_parallel() {
+        use rayon::prelude::*;
+        let chunk = parallel::balanced_chunk_len(
+            out.len(),
+            parallel::CHACHA_BUFFER_WORDS,
+            parallel::kernel_tasks(),
+        );
+        out.par_chunks_mut(chunk)
+            .enumerate()
+            .for_each(|(ci, part)| {
+                fill_words_seq(seed, part, (ci * chunk) as u128);
+            });
         return;
     }
     fill_words_seq(seed, out, 0);
+}
+
+/// Scoped-thread twin of [`chacha20_fill_words`] — **byte-identical
+/// output**, and the `--no-default-features` build's only fan-out.
+///
+/// Falls back to the sequential fill on a single worker or below
+/// [`parallel::PAR_MIN_WORDS`].
+#[cfg(not(feature = "parallel"))]
+pub(crate) fn chacha20_fill_words_scoped(seed: [u8; 32], out: &mut [u32]) {
+    let threads = parallel::setup_threads();
+    if threads <= 1 || out.len() < parallel::PAR_MIN_WORDS {
+        fill_words_seq(seed, out, 0);
+        return;
+    }
+    let chunk = parallel::balanced_chunk_len(out.len(), parallel::CHACHA_BUFFER_WORDS, threads);
+    parallel::par_chunks_mut(out, chunk, |offset, part| {
+        fill_words_seq(seed, part, offset as u128);
+    });
 }
 
 /// Sequential fill starting at stream word `word_pos`.
@@ -75,15 +105,6 @@ fn fill_words_seq(seed: [u8; 32], out: &mut [u32], word_pos: u128) {
     for cell in out {
         *cell = rng.next_u32();
     }
-}
-
-/// Parallel fill: `chunk`-word tasks, each seeked to its own offset.
-#[cfg(feature = "parallel")]
-fn fill_words_chunked(seed: [u8; 32], out: &mut [u32], chunk: usize) {
-    use rayon::prelude::*;
-    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, oc)| {
-        fill_words_seq(seed, oc, (ci * chunk) as u128);
-    });
 }
 
 #[cfg(test)]
@@ -99,17 +120,20 @@ mod tests {
         out
     }
 
-    /// Forced chunk sizes — block-aligned, unaligned, larger than the
-    /// buffer — all reproduce the sequential stream exactly.
-    #[cfg(feature = "parallel")]
+    /// Forced chunk sizes — buffer-aligned, unaligned, larger than the
+    /// buffer — all reproduce the sequential stream exactly. This is the
+    /// primitive both fan-outs rest on, so it is pinned independently of
+    /// whichever one the current feature set compiles.
     #[test]
     fn chunked_matches_sequential() {
         let seed = [0x5Au8; 32];
         for len in [1usize, 15, 16, 17, 1000, 4096, 100_003] {
             let expected = sequential(seed, len);
-            for chunk in [16usize, 48, 1024, 1 << 20] {
+            for chunk in [16usize, 48, 64, 1024, 1 << 20] {
                 let mut got = vec![0u32; len];
-                fill_words_chunked(seed, &mut got, chunk);
+                for (ci, part) in got.chunks_mut(chunk).enumerate() {
+                    fill_words_seq(seed, part, (ci * chunk) as u128);
+                }
                 assert_eq!(got, expected, "len={len} chunk={chunk}");
             }
         }
@@ -120,14 +144,23 @@ mod tests {
     #[test]
     fn entry_matches_sequential_across_gate() {
         let seed = [0xC3u8; 32];
-        #[cfg(feature = "parallel")]
-        let lens = [1000usize, PAR_MIN_WORDS + 37];
-        #[cfg(not(feature = "parallel"))]
-        let lens = [1000usize, (1 << 18) + 37];
-        for len in lens {
+        for len in [1000usize, parallel::PAR_MIN_WORDS + 37] {
             let expected = sequential(seed, len);
             let mut got = vec![0u32; len];
             chacha20_fill_words(seed, &mut got);
+            assert_eq!(got, expected, "len={len}");
+        }
+    }
+
+    /// The scoped twin agrees too, on both sides of its own gate.
+    #[cfg(not(feature = "parallel"))]
+    #[test]
+    fn scoped_matches_sequential_across_gate() {
+        let seed = [0x2Bu8; 32];
+        for len in [1000usize, parallel::PAR_MIN_WORDS + 37] {
+            let expected = sequential(seed, len);
+            let mut got = vec![0u32; len];
+            chacha20_fill_words_scoped(seed, &mut got);
             assert_eq!(got, expected, "len={len}");
         }
     }

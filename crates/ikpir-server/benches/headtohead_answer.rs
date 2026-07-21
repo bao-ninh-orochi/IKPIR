@@ -1,7 +1,12 @@
 //! **Intent:** Head-to-head counterpart of `server_answer` — measure
-//! server-side `answer` throughput and wire sizes at a **fixed keyword count**
-//! (1 M / 1.5 M / 3 M / 4 M), for the fair comparison against ChalametPIR and
-//! Hao et al. 2025.
+//! server-side `answer` throughput and wire sizes at a **fixed keyword count**,
+//! for the fair comparison against ChalametPIR and Hao et al. 2025.
+//!
+//! The paper reports it at `--num-keys` = 10^6, the count both baselines
+//! publish at (`scripts/table3.sh`). The arity-3 KV-SCF shapes cannot hold 10^6
+//! keys at a comparable fill and have no baseline to match, so that sweep runs
+//! them at 90% fill instead — a different `--num-keys`, same bench. The CSV's
+//! `num_keys` / `db_size` columns record which regime a row came from.
 //!
 //! **Motivation:** `server_answer` fixes `num_buckets` (and thus DB size) and
 //! populates `until_full`, so different schemes store different keyword counts
@@ -15,7 +20,7 @@
 //! the extra `num_keys` / `db_size` / `fingerprint_bits` columns.
 //!
 //! **Arguments (CLI):** Same as `server_answer`, plus `--num-keys` (required,
-//! the keyword count to populate) and `--max-mem-gb` (OOM guard).
+//! the keyword count to populate).
 //!
 //! **Output:** `results/ikpir_headtohead_server_answer.csv`
 
@@ -28,7 +33,7 @@ use helpers::{Backend, MakeStore};
 use ikpir_client::IkpirClient;
 use ikpir_server::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirServer, IncrementalPirBackend,
-    IndexPirBackend, PirQueryBundle, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PirQueryBundle, SimpleConfig, SimplePirBackend,
 };
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
 use std::io::Write;
@@ -49,15 +54,17 @@ struct Cli {
     backend: Backend,
     /// Required: number of keys to populate. The DB size (= `num_buckets ×
     /// bucket_size`) is fixed by `--num-buckets` / `--bucket-size`; the caller
-    /// picks those so capacity ≥ `num_keys` at a reasonable load factor
-    /// (~95% for the head-to-head matrix).
+    /// picks those so capacity ≥ `num_keys` at a reasonable load factor — 0.954
+    /// for the paper's arity-2/4 shapes at 10^6 keys, 0.90 for its arity-3
+    /// ones. Both stay under every achieved load factor of Table 2.
     #[arg(long)]
     num_keys: u64,
     #[arg(long, default_value_t = 16_384)]
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
     bucket_size: u32,
-    #[arg(long, default_value_t = 256)]
+    /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
+    #[arg(long, default_value_t = 2048)]
     value_bits: u32,
     #[arg(long, default_value_t = 32)]
     fingerprint_bits: u32,
@@ -68,10 +75,6 @@ struct Cli {
     lwe_dim: Option<u32>,
     #[arg(long, default_value_t = 64)]
     batch: u32,
-    /// Skip configs whose estimated peak memory exceeds this limit. Default
-    /// 85.0 is tuned for a ~96 GB server; lower it on smaller machines.
-    #[arg(long, default_value_t = 85.0)]
-    max_mem_gb: f64,
 }
 
 fn effective_lwe_dim(cli: &Cli) -> u32 {
@@ -87,37 +90,12 @@ fn run_one<S, B>(
     backend_config: B::Config,
 ) where
     S: MakeStore,
-    B: IndexPirBackend + IncrementalPirBackend + BackendWireSize,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + BackendWireSize,
     B::Query: Clone,
     B::Response: Clone,
 {
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
-
-    // ── 0. Memory guard ─────────────────────────────────────────────────────────
-    // The dominant term (per-segment LWE matrix `A`, held in B::HintMaterial)
-    // is independent of how many keys we insert, so the formula is unchanged
-    // from the fixed-DB benches.
-    let lwe_dim_est = effective_lwe_dim(cli) as u64;
-    let cells_per_slot_est =
-        (cli.fingerprint_bits + cli.value_bits).div_ceil(cli.plaintext_bits) as u64;
-    let row_width_est = cli.bucket_size as u64 * cells_per_slot_est;
-    let n_rows_per_seg = num_buckets as u64 / arity as u64;
-    let table_bytes = num_buckets as u64 * cli.bucket_size as u64 * cells_per_slot_est * 4;
-    let (a_rows_per_seg, _c_len_per_seg) =
-        helpers::backend_shape_estimate(cli.backend, n_rows_per_seg, row_width_est);
-    let a_bytes = arity as u64 * a_rows_per_seg * lwe_dim_est * 4;
-    let queries_bytes = cli.batch as u64 * arity as u64 * a_rows_per_seg * 4;
-    let estimated_gb = (table_bytes + a_bytes + queries_bytes) as f64 / 1e9;
-    if estimated_gb > cli.max_mem_gb {
-        eprintln!(
-            "  Skip (OOM guard): estimated peak {:.1} GB > --max-mem-gb {:.1} \
-             (nb={num_buckets} bs={} vb={} lwe_dim={lwe_dim_est} backend={}). \
-             Raise --max-mem-gb on machines with more RAM.",
-            estimated_gb, cli.max_mem_gb, cli.bucket_size, cli.value_bits, cli.backend,
-        );
-        return;
-    }
 
     // ── 1. Populate exactly num_keys ────────────────────────────────────────────
     let (store, n_inserted) = helpers::populate_exact_n_keys::<S>(
@@ -136,10 +114,10 @@ fn run_one<S, B>(
     // ── 2. Build server, queries, and drop the seed-derived `A` ────────────────
     // `answer` does not read the LWE matrix `A`, so a read-only bench frees it
     // right after building the queries to keep peak RAM to a single copy.
-    let mut server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
+    let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store, backend_config);
     let n = n_inserted as u32;
     let queries: Vec<PirQueryBundle<B>> = {
-        let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
+        let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(server.setup());
         (0..cli.batch)
             .map(|i| client.build_query(&((i % n).to_le_bytes())))
             .collect()
@@ -157,8 +135,7 @@ fn run_one<S, B>(
     let cps = params.cells_per_slot();
     let row_width = cli.bucket_size * cps;
     let segment_rows = params.segment_size();
-    let (db_rows, db_cols) =
-        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
+    let (db_rows, db_cols) = B::db_matrix_shape(&server.backend_params()[0]);
     let db_size = (num_buckets as u64) * (cli.bucket_size as u64);
     let load_factor = n_inserted as f64 / db_size as f64;
     let lwe_dim_eff = effective_lwe_dim(cli);

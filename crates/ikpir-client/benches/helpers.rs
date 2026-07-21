@@ -176,49 +176,17 @@ pub fn patch_modes_label(modes: &[PatchMode]) -> String {
         .join(",")
 }
 
-/// Per-segment database matrix `D` shape `(rows, row_width)` for the
-/// given backend, given the original `(n_rows_per_seg, row_width)`.
-///
-/// # Rationale
-///
-/// The head-to-head benches' OOM guard (and the `db_rows`/`db_cols` shape
-/// columns every bench reports) need the per-segment `D` shape because every
-/// other LWE-PIR buffer derives its dimensions from it:
-/// - `A` is `rows × lwe_dim` — shares `D`'s row count, so `rows` drives
-///   the `A` allocation and the per-slot `b`-vector length
-///   (`b = A·s + e + Δ·u`, length `rows`).
-/// - `H = Aᵀ · D` is `lwe_dim × row_width` — shares `D`'s row width,
-///   so `row_width` drives the hint allocation and the prepared-slot
-///   `c`-vector length (`c = sᵀ · H`, length `row_width`).
-///
-/// FrodoPIR keeps the original layout; SimplePIR reshapes into a
-/// near-square `(reshape_rows × reshape_row_width)` matrix with
-/// `k = max(1, round(√(n_rows_per_seg / row_width)))`. The formula
-/// mirrors `reshape_dims` in `ikpir-common/src/backend/simple/backend.rs`.
-///
-/// # Returns
-///
-/// `(d_rows_per_seg, d_row_width_per_seg)`:
-/// - FrodoPIR:  `(n_rows_per_seg, row_width)`
-/// - SimplePIR: `(⌈n_rows_per_seg / k⌉, k · row_width)`
-#[allow(dead_code)]
-pub fn backend_shape_estimate(backend: Backend, n_rows_per_seg: u64, row_width: u64) -> (u64, u64) {
-    match backend {
-        Backend::Frodo => (n_rows_per_seg, row_width),
-        Backend::Simple => {
-            let k = ((n_rows_per_seg as f64 / row_width as f64)
-                .sqrt()
-                .round()
-                .max(1.0)) as u64;
-            let reshape_rows = n_rows_per_seg.div_ceil(k);
-            let reshape_row_width = k * row_width;
-            (reshape_rows, reshape_row_width)
-        }
-    }
-}
-
 // ── Default num_buckets per arity ────────────────────────────────────────────
 
+/// Default `num_buckets` for a one-off run: **dev scale** (≈2^16 slots),
+/// sub-second per bench.
+/// 2-ary: 2^14 buckets × bucket_size=4 → 65536 slots.
+/// 3-ary: 3·2^13 buckets × bucket_size=4 → 98304 slots.
+/// 4-ary: 2^14 buckets × bucket_size=4 → 65536 slots.
+///
+/// This is **not** the paper's geometry, which is ~2^20 slots and lives in
+/// `scripts/lib.sh::paper_num_buckets` — the `table{3,4,5}.sh` sweeps pass it
+/// explicitly. Mirrors `default_num_buckets` in that file.
 #[allow(dead_code)]
 pub fn default_num_buckets_for_arity(arity: u32) -> u32 {
     match arity {
@@ -530,6 +498,31 @@ pub fn verify_decode<B, S>(
 
 // ── Criterion throughput helper ──────────────────────────────────────────────
 
+// Shared Table 3 measurement contract. RisePIR, ChalametPIR (`../chalamet`),
+// and KPIR^index (`../KPIR-index`) all measure the online query/answer/decode
+// benches on one criterion contract so the table's three rows are directly
+// comparable: 100 samples, 3 s warm-up, 5 s measurement. These are criterion's
+// own defaults, pinned explicitly here so a criterion version bump can't
+// silently drift them and so the contract is visible in-tree rather than
+// implied by a bare `Criterion::default()`.
+#[allow(dead_code)]
+pub const CRIT_SAMPLE_SIZE: usize = 100;
+#[allow(dead_code)]
+pub const CRIT_WARMUP_SECS: u64 = 3;
+#[allow(dead_code)]
+pub const CRIT_MEASUREMENT_SECS: u64 = 5;
+
+/// A `Criterion` pinned to the shared Table 3 measurement contract
+/// (`CRIT_SAMPLE_SIZE` samples, `CRIT_WARMUP_SECS` warm-up, `CRIT_MEASUREMENT_SECS`
+/// measurement). Use in place of `Criterion::default()` in every online bench.
+#[allow(dead_code)]
+pub fn configured_criterion() -> Criterion {
+    Criterion::default()
+        .sample_size(CRIT_SAMPLE_SIZE)
+        .warm_up_time(std::time::Duration::from_secs(CRIT_WARMUP_SECS))
+        .measurement_time(std::time::Duration::from_secs(CRIT_MEASUREMENT_SECS))
+}
+
 #[allow(dead_code)]
 pub struct CriterionThroughputStats {
     pub mean_ops_per_s: f64,
@@ -559,7 +552,7 @@ where
 {
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     {
-        let mut c = Criterion::default();
+        let mut c = configured_criterion();
         let mut group = c.benchmark_group(bench_label);
         group.throughput(Throughput::Elements(elements_per_iter));
         group.bench_function(bench_label, |b| {
@@ -618,7 +611,7 @@ where
 {
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     {
-        let mut c = Criterion::default();
+        let mut c = configured_criterion();
         let mut group = c.benchmark_group(bench_label);
         group.throughput(Throughput::Elements(elements_per_iter));
         group.bench_function(bench_label, |b| {

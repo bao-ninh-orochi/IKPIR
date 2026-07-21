@@ -18,10 +18,17 @@
 //!   2-bit chunks and rejecting `0b11` to keep the distribution uniform
 //!   on `{0, 1, 2}` (mapped to `{0, +1, -1}`).
 //!
+//! [`sample_a_parallel`] is the optimized-setup twin of [`sample_a`]:
+//! same keystream, same bytes, split across cores by seeking each
+//! worker to its own offset in the ChaCha20 stream. On this branch
+//! [`sample_a`] itself already fans out (see `backend/prg.rs`), so the
+//! twin is the same function unless the `parallel` feature is off.
+//!
 //! # Related files
 //!
 //! - `params.rs` — `FrodoParams::seed` is the input to `sample_a`.
 //! - `backend.rs` — sole caller for both samplers.
+//! - `backend/prg.rs` — the shared ChaCha20 expansion engine.
 
 use rand::RngCore;
 #[cfg(test)]
@@ -29,19 +36,33 @@ use rand::SeedableRng;
 #[cfg(test)]
 use rand_chacha::ChaCha20Rng;
 
-/// Build a ChaCha20Rng from a 16-byte seed (zero-padded to 32 bytes).
+use crate::backend::prg;
+
+/// Zero-pad FrodoPIR's 16-byte public seed to ChaCha20's 32.
 ///
 /// # Rationale
 ///
 /// FrodoPIR specifies a `λ = 128`-bit public seed (16 bytes); ChaCha20
 /// takes a 32-byte seed. We zero-pad to bridge — equivalent to using
 /// the first 128 bits of a 256-bit seed and is documented in
-/// `frodo/mod.rs`'s math summary.
-#[cfg(test)] // production expansion goes through backend/prg.rs
-fn rng_from_seed(seed: &[u8; 16]) -> ChaCha20Rng {
+/// `frodo/mod.rs`'s math summary. The padding lives here rather than in
+/// `prg.rs` so each backend owns its own seed convention, mirroring the
+/// `arith.rs` duplication rule.
+const fn padded_seed(seed: &[u8; 16]) -> [u8; 32] {
     let mut padded = [0u8; 32];
-    padded[..16].copy_from_slice(seed);
-    ChaCha20Rng::from_seed(padded)
+    let mut i = 0;
+    while i < 16 {
+        padded[i] = seed[i];
+        i += 1;
+    }
+    padded
+}
+
+/// Build a ChaCha20Rng from a 16-byte seed — test-only, since the
+/// production expansion goes through `backend/prg.rs`.
+#[cfg(test)]
+fn rng_from_seed(seed: &[u8; 16]) -> ChaCha20Rng {
+    ChaCha20Rng::from_seed(padded_seed(seed))
 }
 
 /// Sample the public matrix `A` in row-major shape
@@ -70,13 +91,59 @@ pub fn sample_a(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32> {
     let len = (n_rows as usize)
         .checked_mul(lwe_dim as usize)
         .expect("A dimensions overflow usize");
-    let mut padded = [0u8; 32];
-    padded[..16].copy_from_slice(seed);
     let mut out = vec![0u32; len];
     // Chunk-parallel, byte-identical to the sequential stream — see
     // backend/prg.rs for the seekability argument and pinning tests.
-    crate::backend::prg::chacha20_fill_words(padded, &mut out);
+    prg::chacha20_fill_words(padded_seed(seed), &mut out);
     out
+}
+
+/// Multi-threaded twin of [`sample_a`] — **byte-identical output**.
+///
+/// # Purpose
+///
+/// The optimized setup path's `A` expansion (see
+/// [`ParallelSetupBackend`](crate::ParallelSetupBackend)). At paper
+/// scale `A` is `n_rows × lwe_dim` words — gigabytes of keystream — and
+/// a client's `client_setup` does nothing else.
+///
+/// # Rationale
+///
+/// `ChaCha20Rng` is seekable: `set_word_pos(i)` positions the stream at
+/// its `i`-th 32-bit output. So worker `t`, owning output words
+/// `[o, o + len)`, seeds an RNG from the *same* seed, seeks to `o`, and
+/// fills its slice — reproducing exactly the words [`sample_a`] would
+/// have written there. This is what keeps the server's and client's
+/// independently expanded copies of `A` identical regardless of which
+/// path either side used.
+///
+/// With the default `parallel` feature this **is** [`sample_a`] — that
+/// path already fans out over rayon, and wrapping a second partition
+/// around it would only oversubscribe. `--no-default-features` selects
+/// the scoped-thread expansion instead, falling back to the sequential
+/// stream on a single worker or below
+/// [`parallel::PAR_MIN_WORDS`](crate::backend::parallel::PAR_MIN_WORDS).
+///
+/// # Complexity
+///
+/// Same `O(n_rows · lwe_dim)` ChaCha20 words as [`sample_a`], spread
+/// over
+/// [`parallel::setup_threads`](crate::backend::parallel::setup_threads)
+/// workers.
+pub fn sample_a_parallel(seed: &[u8; 16], n_rows: u32, lwe_dim: u32) -> Vec<u32> {
+    #[cfg(feature = "parallel")]
+    {
+        sample_a(seed, n_rows, lwe_dim)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let len = (n_rows as usize)
+            .checked_mul(lwe_dim as usize)
+            .expect("A dimensions overflow usize");
+        let mut out = vec![0u32; len];
+        prg::chacha20_fill_words_scoped(padded_seed(seed), &mut out);
+        out
+    }
 }
 
 /// Fill `dst` with uniform ternary `{-1, 0, +1}` samples.
@@ -138,6 +205,8 @@ pub fn sample_ternary_into<R: RngCore>(rng: &mut R, dst: &mut [u32]) {
 mod tests {
     use super::*;
 
+    use crate::backend::parallel;
+
     const LWE_DIM: u32 = crate::backend::frodo::FrodoParams::DEFAULT_LWE_DIM;
 
     #[test]
@@ -168,6 +237,43 @@ mod tests {
         let n_rows = 4u32;
         let a = sample_a(&seed, n_rows, LWE_DIM);
         assert_eq!(a.len(), (n_rows * LWE_DIM) as usize);
+    }
+
+    /// The optimized path is byte-identical to the reference. Shaped
+    /// above `parallel::PAR_MIN_WORDS` so the fan-out actually runs.
+    #[test]
+    fn sample_a_parallel_matches_sequential() {
+        let seed = [0x5Au8; 16];
+        let n_rows = 256u32;
+        assert!(
+            (n_rows as usize) * (LWE_DIM as usize) >= parallel::PAR_MIN_WORDS,
+            "test shape must exceed the parallel threshold"
+        );
+        assert_eq!(
+            sample_a_parallel(&seed, n_rows, LWE_DIM),
+            sample_a(&seed, n_rows, LWE_DIM)
+        );
+    }
+
+    /// Pins the primitive `sample_a_parallel` rests on: a fresh RNG
+    /// seeked to word `o` emits exactly the words the sequential stream
+    /// has at `o` — for chunk lengths on and off the 64-word buffer
+    /// edge, and for a chunk longer than the whole output.
+    #[test]
+    fn chacha_seek_reproduces_stream_at_every_chunking() {
+        let seed = [0xC3u8; 16];
+        let expected = sample_a(&seed, 8, 512);
+        for chunk in [1usize, 15, 16, 63, 64, 100, 4096, 9000] {
+            let mut got = vec![0u32; expected.len()];
+            for (i, part) in got.chunks_mut(chunk).enumerate() {
+                let mut rng = rng_from_seed(&seed);
+                rng.set_word_pos((i * chunk) as u128);
+                for cell in part {
+                    *cell = rng.next_u32();
+                }
+            }
+            assert_eq!(got, expected, "chunk={chunk}");
+        }
     }
 
     #[test]

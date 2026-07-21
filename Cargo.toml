@@ -15,12 +15,13 @@ publish      = false
 
 [workspace.dependencies]
 segmented-cuckoo = { path = "crates/segmented-cuckoo", version = "0.1" }
-# perf/optimized branch: default features stay ON for the intra-workspace
-# ikpir-* deps so the (default) `parallel` feature flows into every bench,
-# test, and example. main pins default-features = false here.
-ikpir-common     = { path = "crates/ikpir-common",     version = "0.1" }
-ikpir-server     = { path = "crates/ikpir-server",     version = "0.1" }
-ikpir-client     = { path = "crates/ikpir-client",     version = "0.1" }
+# `default-features = false` here, with each crate re-enabling `parallel`
+# through its own default feature. That way `--no-default-features` at the
+# workspace level actually reaches `ikpir-common`, instead of the feature
+# sneaking back in over a sibling's dependency edge.
+ikpir-common     = { path = "crates/ikpir-common",     version = "0.1", default-features = false }
+ikpir-server     = { path = "crates/ikpir-server",     version = "0.1", default-features = false }
+ikpir-client     = { path = "crates/ikpir-client",     version = "0.1", default-features = false }
 clap         = { version = "4", features = ["derive"] }
 criterion    = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 rand         = "0.9"

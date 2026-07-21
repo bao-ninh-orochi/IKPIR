@@ -36,6 +36,15 @@
 //!   2× *slower* than unblocked — while narrow rows need large `R` to
 //!   amortise the per-row overhead (`R = 16` at `width = 29` is 2.7×
 //!   faster than unblocked).
+//! - **Per-µarch tables.** The dispatch is selected by target
+//!   architecture at compile time, because the profitable schedule is
+//!   a property of the cache hierarchy and prefetchers, not of the
+//!   arithmetic: the same blocked pass that wins on Apple M1 collapses
+//!   3× on AMD Zen 4 at narrow widths, and vice versa the unblocked
+//!   wide pass Zen 4 prefers leaves 1.7× on the table against `R = 8`.
+//!   The `# Tuning` section below records both shipped tables, the
+//!   cost model behind every boundary, the measured evidence, and the
+//!   recipe for porting to a new microarchitecture.
 //! - **Bit-exact.** `u32` wrapping addition is associative and
 //!   commutative, so regrouping the `i`-summation by blocks leaves every
 //!   `acc[j]` bit-identical to the naive loop for any `R`. The unit
@@ -44,6 +53,80 @@
 //!   schedule depends only on the public shape `(n, width)`, never on
 //!   the values of `q` or `d` — safe for secret-dependent inputs
 //!   (`client_decode`, `compute_c`).
+//!
+//! # Tuning — the dispatch table is a measured, per-µarch object
+//!
+//! Nothing in the table is derived from first principles alone; every
+//! boundary was chosen by running this kernel on the machines we
+//! publish numbers from. Two tables ship:
+//!
+//! - **`aarch64`** (measured on Apple M1, 128 KiB L1d): the footprint
+//!   ladder — `R` = largest power of two `≤ 16` with
+//!   `R · width ≤ 2048` cells.
+//! - **`x86_64`** (measured on AMD Zen 4, EPYC 9R14, AWS
+//!   `r7a.xlarge`, 32 KiB L1d; spot-validated on Zen 2, EPYC 7R32,
+//!   AWS `c5a`): `width ≤ 128 → R = 16`, `129..=4096 → R = 1`,
+//!   `> 4096 → R = 8`.
+//!
+//! ## The cost model behind the boundaries
+//!
+//! Per cell the pass pays one streamed DB read plus `1/R` of an
+//! accumulator load and store. Three regimes follow:
+//!
+//! 1. **`width ≤ 128`** — rows are so short that per-row loop
+//!    overhead dominates; a large `R` amortises it (M1: `R = 16` at
+//!    `width = 29` measured 2.7× over unblocked).
+//! 2. **Middle band, accumulator fits L1** — we cap it at half the
+//!    cache, `width ≤ L1d_bytes / 8` cells (= 4096 at 32 KiB): the
+//!    accumulator read-modify-write hits L1 and is nearly free, so
+//!    blocking has nothing to amortise, and `R = 1`, one perfectly
+//!    sequential DB stream, is optimal (Zen 4: 22–27 GB/s). Blocking
+//!    here is actively harmful when the row stride `4 · width` is
+//!    under a page or two: the `R` streams then interleave inside the
+//!    same pages, the per-page sequential prefetchers cannot classify
+//!    them, and throughput collapses (Zen 4: 6–9 GB/s at
+//!    `width ∈ [208, 832]`, `R ∈ {2, 4, 8}` — the regression the
+//!    2026-07 paper run caught).
+//! 3. **`width > L1d_bytes / 8`** — the accumulator spills L1, its
+//!    per-row read-modify-write runs through L2 and roughly halves
+//!    the rate (Zen 4: 13.3 GB/s at `width = 11138`), so blocking
+//!    pays again — and is safe, because the same threshold guarantees
+//!    the `R` streams sit `≥ 16` KiB apart, on distinct pages the
+//!    prefetchers track as independent sequential streams. `R = 8`
+//!    balances amortisation (accumulator traffic ÷ 8) against stream
+//!    count and per-column register pressure.
+//!
+//! ## Measured reference curves (wide arm, GB/s by `R` = 1/2/4/8/16)
+//!
+//! At the SimplePIR paper shape (`width = 11138`, ~0.5 GiB/segment,
+//! far past every cache):
+//!
+//! - Zen 4 (EPYC 9R14): 13.3 / 18.3 / 22.2 / **23.0** / 21.2 — peak
+//!   at `R = 8`.
+//! - Zen 2 (EPYC 7R32): 12.7 / 16.5 / **18.4** / 17.5 / 17.1 — peak
+//!   at `R = 4`, `R = 8` within 5%, so one shared `R = 8` serves both.
+//!
+//! A single interior peak is the expected shape: rising while the
+//! remaining accumulator traffic halves per step, falling once stream
+//! count and the `R` live sums per column outrun the prefetchers and
+//! the register file.
+//!
+//! ## Porting to a new microarchitecture
+//!
+//! - Move the middle-band boundary with the data cache:
+//!   `L1d_bytes / 8` cells (48 KiB L1d → 6144; 128 KiB → 16384).
+//! - Re-measure the wide arm before trusting `R = 8`: point the `_`
+//!   dispatch arm at each `block_pass::<R>` for
+//!   `R ∈ {1, 2, 4, 8, 16}` in turn and run the server-answer bench
+//!   at a wide shape (`scripts/bench.sh server_answer --backend simple`
+//!   at paper geometry), expecting a curve like the references above.
+//! - Never ship a blocked arm at sub-page stride (`4 · width` under
+//!   ~1–2 pages) without measuring it on the target: that is exactly
+//!   the configuration behind the Zen 4 collapse.
+//! - Re-tuning can never change an answer, only its speed: wrapping
+//!   `u32` addition is associative and commutative, and the unit
+//!   tests pin every arm against the naive loop bit for bit. Tune
+//!   freely.
 //!
 //! # Related files
 //!
@@ -80,7 +163,7 @@
 pub(crate) fn matvec_accumulate(acc: &mut [u32], d: &[u32], q: &[u32]) {
     debug_assert_eq!(d.len(), q.len() * acc.len(), "matvec shape mismatch");
     #[cfg(feature = "parallel")]
-    if d.len() >= PAR_MIN_CELLS && !acc.is_empty() {
+    if d.len() >= PAR_MIN_CELLS && !acc.is_empty() && crate::backend::parallel::kernels_parallel() {
         matvec_accumulate_par(acc, d, q, par_chunk_rows(q.len()));
         return;
     }
@@ -90,14 +173,26 @@ pub(crate) fn matvec_accumulate(acc: &mut [u32], d: &[u32], q: &[u32]) {
 /// Sequential realization: width-adaptive register blocking.
 fn matvec_accumulate_seq(acc: &mut [u32], d: &[u32], q: &[u32]) {
     // R = largest power of two ≤ 16 with R · width ≤ 2048 cells (8 KiB
-    // block footprint) — see the module docs for the measured cliffs
-    // that pin both ends of this rule.
+    // block footprint) — except on x86-64, where the measured Zen 4
+    // cliffs pin a different table: width ≤ 128 blocks at R = 16,
+    // 129..=4096 streams unblocked (the accumulator is L1-resident),
+    // and wider takes R = 8 (the accumulator would spill L1, and the
+    // R streams sit a page or more apart). See the module docs for the
+    // measurements behind every boundary.
     match acc.len() {
         0 => (),
         1..=128 => block_pass::<16>(acc, d, q),
+        #[cfg(not(target_arch = "x86_64"))]
         129..=256 => block_pass::<8>(acc, d, q),
+        #[cfg(not(target_arch = "x86_64"))]
         257..=512 => block_pass::<4>(acc, d, q),
+        #[cfg(not(target_arch = "x86_64"))]
         513..=1024 => block_pass::<2>(acc, d, q),
+        #[cfg(target_arch = "x86_64")]
+        129..=4096 => block_pass::<1>(acc, d, q),
+        #[cfg(target_arch = "x86_64")]
+        _ => block_pass::<8>(acc, d, q),
+        #[cfg(not(target_arch = "x86_64"))]
         _ => block_pass::<1>(acc, d, q),
     }
 }
@@ -115,7 +210,8 @@ const PAR_MIN_CELLS: usize = 1 << 20;
 /// window.
 #[cfg(feature = "parallel")]
 fn par_chunk_rows(rows: usize) -> usize {
-    rows.div_ceil(rayon::current_num_threads() * 4).max(64)
+    rows.div_ceil(crate::backend::parallel::kernel_tasks())
+        .max(64)
 }
 
 /// Parallel realization: partition the rows into `chunk_rows`-row
@@ -238,7 +334,7 @@ pub(crate) fn matvec_rows_accumulate(b: &mut [u32], a: &[u32], s: &[u32]) {
     // Worthwhile even in the DRAM-bound regime: threads add aggregate
     // memory bandwidth that a single core cannot reach.
     #[cfg(feature = "parallel")]
-    if a.len() >= PAR_MIN_CELLS && !s.is_empty() {
+    if a.len() >= PAR_MIN_CELLS && !s.is_empty() && crate::backend::parallel::kernels_parallel() {
         use rayon::prelude::*;
         let n = s.len();
         let chunk = par_chunk_rows(b.len());
@@ -339,6 +435,10 @@ mod tests {
             (65, 1024),
             (5, 2049),
             (3, 208),
+            (5, 4096),
+            (5, 4097),
+            (3, 12000),
+            (17, 11138),
         ];
         for (n, width) in shapes {
             let mut d = vec![0u32; n * width];

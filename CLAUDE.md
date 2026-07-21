@@ -13,7 +13,7 @@ Target Index-PIR backends: **FrodoPIR** and **SimplePIR** (LWE-based, post-quant
 ## Workspace structure
 
 ```
-Incremental-Keyword-PIR/          ← workspace root
+RisePIR/                          ← workspace root
 ├── Cargo.toml                    ← workspace manifest (members = ["crates/*"])
 ├── CLAUDE.md
 ├── README.md
@@ -89,24 +89,43 @@ state machine, failure-mode table, and entry-point map.
 
 ## Benches
 
-Nine focused `clap`-parsed benches — four server (`server_setup`,
+Nine focused `clap`-parsed PIR benches — four server (`server_setup`,
 `server_answer`, `server_mutation`, `headtohead_answer`) and five client
 (`client_query`, `client_decode`, `client_mutation`, `headtohead_query`,
 `headtohead_decode`) — emit CSV under `results/<crate>/`. Each invocation =
 one config = one CSV row (the mutation benches emit one row per
 `(patch mode, kind)` pair; the `headtohead_*` benches fix `--num-keys` and add
 `num_keys`/`db_size` columns for the fixed-N comparison vs ChalametPIR /
-Hao 2025). `segmented-cuckoo` adds nine filter/KV-store micro-benches that run
-a fixed internal config matrix (no CLI flags).
+Hao 2025).
+
+`segmented-cuckoo` adds eight filter/KV-store benches: five `cuckoo_filter_*`
+(`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,
+`false_positive_rate`) and three `kv_store_*`. They are `clap`-parsed too, but
+every flag is optional: with none, each runs the paper's **Table 2** matrix — the
+five `(arity, bucket_size)` pairs at `fingerprint_bits = 32`, `max_kicks = 2500`,
+~10^6 buckets. That matrix and every default live in
+`crates/segmented-cuckoo/benches/configs.rs`, the single source of truth;
+`--arity` / `--bucket-size` narrow it, other flags override one axis.
 
 Run one bench at one config with **`scripts/bench.sh <name> [flags]`**, which
-maps the bench to its crate, auto-derives `--plaintext-bits` and `--lwe-dim`,
-and exports `IKPIR_RESULTS_DIR=results/<crate>` before `cargo bench`. There is
-**no full-matrix sweep script** (the paper is complete); reproducing the whole
-matrix means looping `bench.sh`. **`scripts/smoke.sh`** runs every PIR bench at
-a tiny config on both backends in a couple of minutes (into a throwaway
-`results/.smoke/`) — the fast correctness/property check. Shared derivation
-(pb/lwe, the bench→crate map) lives in **`scripts/lib.sh`**.
+maps the bench to its crate, auto-derives `--plaintext-bits` and `--lwe-dim` for
+the PIR benches, and exports `IKPIR_RESULTS_DIR=results/<crate>` before
+`cargo bench`. Its geometry defaults are **dev scale** (~2^16 slots), not the
+paper's — it is the everyday one-config runner.
+
+**One sweep script per paper table**, each looping `bench.sh` over the matrix
+that table reports: **`table2.sh`** (filter), **`table3.sh`** (online),
+**`table4.sh`** (mutation), **`table5.sh`** (setup). `table2.sh` forwards all
+flags to each bench; `table{3,4,5}.sh` additionally take
+`--arity` / `--bucket-size` / `--value-bits` / `--backend` to narrow, and
+forward the rest.
+
+**`scripts/smoke.sh`** runs every PIR bench at a tiny config on both backends in
+a couple of minutes (into a throwaway `results/.smoke/`) — the fast
+correctness/property check. Shared derivation (pb/lwe, the bench→crate map) and
+**the paper's PIR config matrix** (`PAPER_*`, `paper_num_buckets`,
+`paper_num_keys`) live in **`scripts/lib.sh`** — the PIR-side counterpart of
+`configs.rs`, and the single source of truth for what `table{3,4,5}.sh` sweep.
 
 `plaintext_bits` is **not fixed across configs**. For each
 `(backend, SCF geometry, value_bits)` triple, `bench.sh` picks the maximum `pb`
@@ -128,11 +147,91 @@ hint-patch realization via `--patch-mode entry|row` (bench CLI default `entry`;
 pair with a `patch_mode` column — the empirical counterpart of the paper's
 row-level vs entry-level mutation columns.
 
+### Setup in the benches: reference vs optimized
+
+Setup is `Θ(arity · n_rows · lwe_dim · row_width)` — minutes to hours at
+paper scale, dwarfing every online operation. But **only `server_setup`
+reports it**; for the other eight PIR benches it is preamble that
+contributes nothing to the measured number, and their results depend on
+setup's *output*, never on how it was computed.
+
+So the setup phase ships in two implementations with identical output:
+
+| | Entry points | Used by |
+|---|---|---|
+| **Reference** — single-threaded, non-SIMD; the paper's regime | `B::server_setup`, `IkpirServer::{new, full_rebuild}`, `IkpirClient::{from_setup, reset_from}` | `benches/server_setup.rs` — the measurement |
+| **Optimized** — same output, all cores | `B::server_setup_parallel`, `IkpirServer::{new_parallel, full_rebuild_parallel}`, `IkpirClient::{from_setup_parallel, reset_from_parallel}` | every other bench's preamble |
+
+The optimized path is **bit-identical**, not merely decode-equivalent: it
+partitions only the output — disjoint bands of the hint matrix `H`,
+disjoint runs of the ChaCha20 keystream that expands `A` (via
+`set_word_pos`) — so each cell accumulates the same terms in the same
+order. A server built on one path interoperates with a client built on
+the other; `ikpir-server/tests/parallel_setup_equivalence.rs` pins every
+combination. Threading is `std::thread::scope` (`ikpir-common`'s
+`backend/parallel.rs`); no new dependency, no cargo feature, nothing to
+enable. Contract: `ikpir_common::ParallelSetupBackend`.
+
+Worker count comes from `IKPIR_SETUP_THREADS`, else
+`available_parallelism()`; setting it to `1` forces the reference
+schedule everywhere, which is the first thing to try when bisecting a
+result mismatch. Measured on 8 cores: **4.8× (FrodoPIR), 6.3×
+(SimplePIR)**.
+
+`server_setup --setup-impl parallel` times the optimized path instead, to
+quantify what the other benches save. Such a row is not a paper number,
+and says so: the CSV's `setup_mode` column reads `full_parallel` rather
+than `full`.
+
+Either way the number is a whole `IkpirServer::new`, timed end to end.
+No bench times a fraction of an operation and scales the result up —
+that shortcut existed while the geometry was `N = 2²²` and was dropped
+once `N = 2²⁰` made single-threaded setup affordable to measure
+outright.
+
+## The paper's PIR config matrix
+
+Five KV-SCF shapes, each at one size (`paper_num_buckets` in `scripts/lib.sh`),
+× value widths `2048 / 8192` (256 B / 1 kB) × backends `frodo / simple`:
+
+| `(d, b)` | `n_b` | slots `N` | online keys `m` | in tables |
+|---|---|---|---|---|
+| (2, 4) | 2¹⁸ | 2²⁰ | 10⁶ | 3, 4, 5 |
+| (4, 1) | 2²⁰ | 2²⁰ | 10⁶ | 3, 4, 5 |
+| (4, 2) | 2¹⁹ | 2²⁰ | 10⁶ | 3, 4, 5 |
+| (3, 2) | 3·2¹⁸ | 3·2¹⁹ = 1 572 864 | 1 415 577 (fill 0.90) | 3, 4 |
+| (3, 3) | 3·2¹⁷ | 9·2¹⁷ = 1 179 648 | 1 061 683 (fill 0.90) | 3, 4 |
+
+Why these, and not others:
+
+- **Arity 2/4 share `N = 2²⁰`**, differing only in shape, and fix `m = 10⁶` —
+  the count ChalametPIR and KPIR^index publish at, which fills them to 0.954,
+  under every achieved load factor of Table 2.
+- **Arity 3 is a full-paper addition**, absent from the submitted version. It
+  cannot reach `2²⁰` (a segmented 3-ary table needs `n_b = 3·2^t`), so it takes
+  the smallest rung of its ladder still holding 10⁶ keys at fill 0.90, and
+  reports at that fill rather than a fixed `m` — it has no baseline to match.
+  No Table 5 row: it carries no static-rebuild comparison.
+- **32 B values and `(4, 3)` are deliberately gone** from every default and
+  matrix. Both still run if passed explicitly; neither is a paper config.
+- Mutation and setup seed to fill 0.90; mutation applies one batch of
+  τ = 1 % of the slots (10 485 at `N = 2²⁰`), the paper's batch rule, with no
+  clamp — a clamp would only ever bind at paper scale.
+
 ```bash
-# One bench at one config (auto pb + lwe; results → results/<crate>/).
-./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --value-bits 256
+# One bench at one config, DEV scale (auto pb + lwe; results → results/<crate>/).
+./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --value-bits 8192
 ./scripts/bench.sh client_mutation --backend simple --patch-mode entry,row
 ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
+
+# Reproduce a paper table end to end (paper geometry, from the matrix above).
+./scripts/table2.sh                    # filter: SCF vs standard, five configs
+./scripts/table3.sh                    # online: query / response / answer
+./scripts/table4.sh --arity 3          # mutation: the full-paper arity-3 cells
+./scripts/table5.sh --backend frodo    # setup: RisePIR-F rows only
+
+# One segmented-cuckoo bench: no flags = the full Table 2 matrix.
+./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2
 
 # Fast correctness/property smoke across all PIR benches, both backends.
 ./scripts/smoke.sh
@@ -140,7 +239,7 @@ row-level vs entry-level mutation columns.
 # Low-level: cargo bench directly (--plaintext-bits defaults to 8; results land
 # in the crate-local results/ unless IKPIR_RESULTS_DIR is set).
 cargo bench -p ikpir-server --bench server_answer -- \
-    --num-buckets 65536 --bucket-size 4 --value-bits 256 --plaintext-bits 10
+    --num-buckets 65536 --bucket-size 4 --value-bits 8192 --plaintext-bits 10
 ```
 
 ## Design principles
@@ -149,3 +248,4 @@ cargo bench -p ikpir-server --bench server_answer -- \
 - The PIR backend (FrodoPIR vs SimplePIR) is selected at the `B: IndexPirBackend` type parameter on `IkpirServer<S, B>` / `IkpirClient<B>` (monomorphised, no Cargo features involved); the benches expose it as a runtime `--backend frodo|simple` flag.
 - Avoid dynamic dispatch on the hot path; prefer generics.
 - All cryptographic and PIR primitives must be constant-time where relevant to avoid side-channel leakage.
+- **Measured code stays single-threaded and non-SIMD.** The paper reports that regime, so every operation a bench times runs it. Parallelism is confined to the setup phase, offered as a separate, explicitly named entry point (`*_parallel`) with a bit-identical-output contract — never as a flag that could silently change what a timed path does. Adding an optimized twin of any other operation must follow the same shape.

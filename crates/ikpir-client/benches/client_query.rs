@@ -29,11 +29,11 @@
 
 mod helpers;
 
-use criterion::{Criterion, Throughput};
+use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
     BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -57,7 +57,8 @@ struct Cli {
     num_buckets: u32,
     #[arg(long, default_value_t = 4)]
     bucket_size: u32,
-    #[arg(long, default_value_t = 256)]
+    /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
+    #[arg(long, default_value_t = 2048)]
     value_bits: u32,
     #[arg(long, default_value_t = 32)]
     fingerprint_bits: u32,
@@ -85,7 +86,12 @@ fn run_one<S, B>(
     backend_config: B::Config,
 ) where
     S: MakeStore,
-    B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBackend + BackendWireSize + Clone,
+    B: IndexPirBackend
+        + ParallelSetupBackend
+        + IncrementalPirBackend
+        + PrecomputingPirBackend
+        + BackendWireSize
+        + Clone,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -104,7 +110,7 @@ fn run_one<S, B>(
         return;
     }
 
-    let server: IkpirServer<S, B> = IkpirServer::new(store, backend_config);
+    let server: IkpirServer<S, B> = IkpirServer::new_parallel(store, backend_config);
     let bundle = server.setup();
 
     // Probe scope: build one query just to measure `query_bytes`, then drop
@@ -112,7 +118,7 @@ fn run_one<S, B>(
     // Without this scope, `probe_client` would live to end-of-function and
     // coexist with `client` — doubling peak `A` RAM at paper-scale configs.
     let query_bytes = {
-        let mut probe_client: IkpirClient<B> = IkpirClient::from_setup(bundle.clone());
+        let mut probe_client: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle.clone());
         probe_client
             .build_query(&0u32.to_le_bytes())
             .wire_byte_size()
@@ -122,8 +128,7 @@ fn run_one<S, B>(
     let cps = params_store.cells_per_slot();
     let row_width = cli.bucket_size * cps;
     let segment_rows = params_store.segment_size();
-    let (db_rows, db_cols) =
-        helpers::backend_shape_estimate(cli.backend, segment_rows as u64, row_width as u64);
+    let (db_rows, db_cols) = B::db_matrix_shape(&server.backend_params()[0]);
     let load_factor = n_inserted as f64 / (num_buckets as f64 * cli.bucket_size as f64);
     let lwe_dim_eff = effective_lwe_dim(cli);
     let store_state = helpers::StoreState {
@@ -188,14 +193,14 @@ fn run_one<S, B>(
     let n = n_inserted as u32;
     let keys: Vec<[u8; 4]> = (0..cli.batch).map(|i| (i % n).to_le_bytes()).collect();
 
-    let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
+    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(server.setup());
     // No upfront precompute_queries — refill per criterion sample (see iter_custom below)
     // so we never stall with millions of A·s+e computations before timing starts.
 
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut idx = 0usize;
     {
-        let mut c = Criterion::default();
+        let mut c = helpers::configured_criterion();
         let mut group = c.benchmark_group("client_query");
         group.throughput(Throughput::Elements(1));
         group.bench_function("client_query", |b| {

@@ -19,7 +19,7 @@ setup bundle.
 
 > Production code in this crate depends only on `ikpir-common` and
 > `segmented-cuckoo`. `ikpir-server` is carried as a `[dev-dependency]`
-> for `tests/client_e2e.rs`, the six benches, and the quick-start doctest.
+> for `tests/client_e2e.rs`, the five benches, and the quick-start doctest.
 
 ## 3. Key design decisions (the WHY)
 
@@ -51,6 +51,20 @@ setup bundle.
 - **Dual-path recovery** — `apply_delta` for the steady state (strict
   monotone epoch+1 patch), `reset_from` after `full_rebuild` or after a
   `FutureDelta` gap that cannot be bridged incrementally.
+
+- **Two bootstrap implementations, one result** — `from_setup` /
+  `reset_from` re-expand each segment's `A` **single-threaded**, which is
+  the entire cost of bootstrapping a client (`Θ(arity · n_rows · lwe_dim)`
+  ChaCha20 words — gigabytes at paper scale). `from_setup_parallel` /
+  `reset_from_parallel` (available whenever `B: ParallelSetupBackend`,
+  which both shipped backends are) do the same across all cores and yield
+  an observationally identical client: same queries, same decodes, same
+  patch behaviour, same epoch. Both pairs share one body via a
+  `PerSegmentClientSetup<B>` fn pointer.
+
+  No bench reports client-bootstrap cost, so all five build their client
+  with `from_setup_parallel`. The reference path stays the default so a
+  future bootstrap-cost measurement has something honest to call.
 
 - **Selectable hint-patch realization** — `apply_delta` realizes the
   patch at the client's `hint_patch_mode` (`set_hint_patch_mode`;
@@ -93,6 +107,7 @@ setup bundle.
 | Task | Where to look |
 |---|---|
 | Build a fresh client | `client.rs::IkpirClient::from_setup` |
+| Bootstrap a client fast (untimed preamble) | `client.rs::IkpirClient::{from_setup_parallel, reset_from_parallel}` — identical client, all cores; contract in `ikpir-common::ParallelSetupBackend` |
 | Issue a query | `client.rs::IkpirClient::build_query` |
 | Decode a response | `client.rs::IkpirClient::decode` |
 | Apply an incremental delta | `client.rs::IkpirClient::apply_delta` |
@@ -152,8 +167,11 @@ in isolation, without warm-bc queue-maintenance overhead mixed in.
   crate, auto-derives `--plaintext-bits` / `--lwe-dim`, and exports
   `IKPIR_RESULTS_DIR=results/ikpir-client` before `cargo bench`. One
   invocation = one CSV row (append-mode `csv_writer`, honoring
-  `IKPIR_RESULTS_DIR`; default `results/`). There is no full-matrix
-  sweep script; `scripts/smoke.sh` runs every PIR bench tiny.
+  `IKPIR_RESULTS_DIR`; default `results/`). Its geometry defaults are dev
+  scale, not the paper's: the paper matrix lives in `scripts/lib.sh`
+  (`PAPER_*`) and is swept by `scripts/table3.sh` (online, via
+  `headtohead_{query,decode}`) and `table4.sh` (mutation, via
+  `client_mutation`). `scripts/smoke.sh` runs every PIR bench tiny.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — a common core is mirrored in `ikpir-server/benches/helpers.rs`,
   but this copy additionally carries `verify_decode`, which round-trips

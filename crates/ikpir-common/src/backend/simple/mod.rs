@@ -88,4 +88,6 @@ pub use backend::{
 pub use params::{SimpleConfig, SimpleParams};
 
 pub(crate) use arith::{round_p_to_q, round_q_to_p};
-pub(crate) use sampler::{sample_a, sample_discrete_gaussian_into, sample_uniform_zq_into};
+pub(crate) use sampler::{
+    sample_a, sample_a_parallel, sample_discrete_gaussian_into, sample_uniform_zq_into,
+};

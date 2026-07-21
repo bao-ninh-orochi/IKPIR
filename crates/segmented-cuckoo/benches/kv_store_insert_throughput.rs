@@ -1,110 +1,111 @@
-//! **Intent:** Measure raw KV insert speed for each segmented variant
-//! across `arity`, `bucket_size`, and `value_bits`.
+//! **Intent:** Measure KV-store insert throughput across the paper's
+//! `(arity, bucket_size)` configs and a sweep of `value_bits`.
 //!
-//! **Method:** Insert sequential keys carrying a deterministic value
-//! until `TableFull`, timing the full loop. 3 warmup + 10 timed trials.
+//! **Method:** Insert sequential keys carrying a fixed value until `TableFull`,
+//! timing the whole loop. `--warmup` untimed fills, then `--trials` timed ones.
 //!
-//! **Arguments (CLI):** none — this bench sweeps a built-in
-//! cross-product (see constants below). One row per `(arity, bucket_size,
-//! value_bits)` is appended per run.
+//! **Design rationale:** "Insert until full" is the fair comparison for the same
+//! reason as `cuckoo_filter_insert_throughput`: it puts every config through its
+//! natural load-factor trajectory, so the number reflects the steady-state cost
+//! the IKPIR server actually pays rather than a cherry-picked sparse-table
+//! regime. The `value_bits` sweep is what distinguishes this bench from the
+//! filter one — it exposes cell-packing cost, which at `value_bits = 1024`
+//! dominates the insert path.
 //!
-//! **Design rationale:** "Insert until full" is the fair comparison
-//! method here for the same reason as `insert_throughput`: it puts every
-//! `(arity, bucket_size, value_bits)` configuration through its natural
-//! load-factor distribution, so the throughput number reflects the
-//! steady-state cost the IKPIR server will actually pay rather than a
-//! cherry-picked sparse-table regime. `value_bits` sweep also exposes
-//! cell-packing cost: at `value_bits = 1024` the `pack_value_bytes_to_cells`
-//! path dominates `insert`.
+//! **Relation to the paper.** This measures the KV-SCF, the primitive layer
+//! under RisePIR, and is *not* one of the paper's tables. It borrows Table 2's
+//! five `(arity, bucket_size)` pairs so the geometry lines up with the filter
+//! benches, but sizes the table from `--target-items` rather than Table 2's ~10^6
+//! buckets: a KV slot carries `fp ‖ value`, so at 10^6 buckets and
+//! `value_bits = 1024` the table alone would run to gigabytes. Pass
+//! `--num-buckets` to size it explicitly instead.
 //!
-//! **Parameters:** arity ∈ {2, 3, 4}, bucket_size ∈ {2, 4}, value_bits ∈
-//! {8, 64, 256, 1024}. `fingerprint_bits = 12`, `plaintext_bits = 8`.
-//! `num_buckets` sized via `from_num_items` at `2^16` target items.
+//! **Arguments (CLI):** all optional; with none, runs the paper's five configs.
+//! `--arity`, `--bucket-size`, `--fingerprint-bits`, `--max-kicks`, `--warmup`,
+//! `--trials` (see `benches/configs.rs`), plus `--value-bits` (comma-separated,
+//! default `8,64,256,1024`), `--plaintext-bits` (default 8), `--target-items`
+//! (default 65536), and `--num-buckets` (overrides `--target-items` sizing).
 //!
-//! **Output:** `results/kv_store_insert_throughput.csv`
-//! Columns: scheme, arity, num_buckets, bucket_size, value_bits,
-//! mean_inserted, mean_lf, mean_mops
+//! **Output:** `results/segmented-cuckoo/kv_store_insert_throughput.csv`
+//! Columns: scheme, arity, num_buckets, bucket_size, fingerprint_bits,
+//! value_bits, plaintext_bits, mean_inserted, mean_lf, mean_mops, min_mops,
+//! max_mops, stddev_mops
 
+mod configs;
 mod helpers;
 
+use configs::{ConfigCli, FilterConfig};
 use segmented_cuckoo::{
     CuckooError, Segmented2aryCuckooKVStore, Segmented3aryCuckooKVStore, Segmented4aryCuckooKVStore,
 };
 use std::io::Write;
 use std::time::Instant;
 
-const MAX_KICKS: u32 = 2500;
-const FINGERPRINT_BITS: u32 = 12;
-const PLAINTEXT_BITS: u32 = 8;
-const WARMUP_TRIALS: usize = 3;
-const MEASURE_TRIALS: usize = 10;
+const HEADER: &str = "scheme,arity,num_buckets,bucket_size,fingerprint_bits,value_bits,\
+                      plaintext_bits,mean_inserted,mean_lf,mean_mops,min_mops,max_mops,\
+                      stddev_mops";
 
-const TARGET_ITEMS: u64 = 1 << 16;
-const BUCKET_SIZE_VALUES: &[u32] = &[2, 4];
-const VALUE_BITS_VALUES: &[u32] = &[8, 64, 256, 1024];
+#[derive(clap::Parser)]
+#[command(about = "Insert throughput of the segmented cuckoo KV store (IKPIR primitive layer).")]
+struct Cli {
+    #[command(flatten)]
+    config: ConfigCli,
 
+    /// Value widths to sweep, comma-separated.
+    #[arg(long, value_delimiter = ',', default_value = "8,64,256,1024")]
+    value_bits: Vec<u32>,
+
+    /// PIR plaintext cell width (1–32). 8 keeps byte↔cell a no-op.
+    #[arg(long, default_value_t = 8)]
+    plaintext_bits: u32,
+
+    /// Target item count used to size the table when `--num-buckets` is absent.
+    #[arg(long, default_value_t = 1 << 16)]
+    target_items: u64,
+}
+
+/// Time repeated fill-to-`TableFull` runs of one KV store type; one CSV row.
 macro_rules! bench_kv_insert {
-    ($csv:expr, $label:expr, $store_ty:ty, $scheme:expr, $arity:expr, $bucket_size:expr, $value_bits:expr) => {{
-        let bucket_size: u32 = $bucket_size;
+    ($csv:expr, $cli:expr, $label:expr, $store_ty:ty, $scheme:expr, $cfg:expr, $value_bits:expr) => {{
+        let cfg: FilterConfig = $cfg;
         let value_bits: u32 = $value_bits;
-        let vsize = (value_bits as usize).div_ceil(8);
-        let value: Vec<u8> = (0..vsize)
+        let c = &$cli.config;
+        let fp_bits = c
+            .fingerprint_bits
+            .unwrap_or(configs::DEFAULT_FINGERPRINT_BITS);
+        let trials = c.trials.unwrap_or(configs::DEFAULT_MEASURE_TRIALS);
+        let pb = $cli.plaintext_bits;
+
+        let value: Vec<u8> = (0..value_bits.div_ceil(8) as usize)
             .map(|i| (i as u8).wrapping_mul(37).wrapping_add(7))
             .collect();
 
-        match <$store_ty>::from_num_items(
-            TARGET_ITEMS,
-            bucket_size,
-            FINGERPRINT_BITS,
-            value_bits,
-            PLAINTEXT_BITS,
-        ) {
-            Err(e) => {
-                eprintln!(
-                    "  Skip {} bucket_size={} value_bits={}: {}",
-                    $label, bucket_size, value_bits, e
-                );
-            }
+        // `--num-buckets`, when given, sizes the table directly; otherwise size
+        // from the target item count (see the module docs on why this bench does
+        // not default to Table 2's ~10^6 buckets).
+        let build = || match c.num_buckets {
+            Some(nb) => <$store_ty>::new(nb, cfg.bucket_size, fp_bits, value_bits, pb),
+            None => <$store_ty>::from_num_items(
+                $cli.target_items,
+                cfg.bucket_size,
+                fp_bits,
+                value_bits,
+                pb,
+            ),
+        };
+
+        match build() {
+            Err(e) => eprintln!(
+                "  Skip {} bucket_size={} value_bits={}: {}",
+                $label, cfg.bucket_size, value_bits, e
+            ),
             Ok(template) => {
-                let num_buckets = (template.size_in_bytes() as f64
-                    / ((FINGERPRINT_BITS + value_bits) as f64 / 8.0 * bucket_size as f64))
-                    .ceil() as u32;
+                let num_buckets = template.params().num_buckets;
 
-                // Warmup
-                for _ in 0..WARMUP_TRIALS {
-                    let mut store = <$store_ty>::from_num_items(
-                        TARGET_ITEMS,
-                        bucket_size,
-                        FINGERPRINT_BITS,
-                        value_bits,
-                        PLAINTEXT_BITS,
-                    )
-                    .unwrap();
-                    store.set_max_kicks(MAX_KICKS);
-                    let mut i = 0u64;
-                    loop {
-                        match store.insert(i.to_le_bytes(), &value) {
-                            Ok(()) => i += 1,
-                            Err(CuckooError::TableFull) => break,
-                            Err(e) => panic!("{}", e),
-                        }
-                    }
-                }
-
-                // Measure
-                let mut throughputs = Vec::with_capacity(MEASURE_TRIALS);
-                let mut inserted_vals = Vec::with_capacity(MEASURE_TRIALS);
-                let mut lf_vals = Vec::with_capacity(MEASURE_TRIALS);
-                for _trial in 0..MEASURE_TRIALS {
-                    let mut store = <$store_ty>::from_num_items(
-                        TARGET_ITEMS,
-                        bucket_size,
-                        FINGERPRINT_BITS,
-                        value_bits,
-                        PLAINTEXT_BITS,
-                    )
-                    .unwrap();
-                    store.set_max_kicks(MAX_KICKS);
+                // One fill to TableFull → (inserted, elapsed_ns, load_factor).
+                let fill = || {
+                    let mut store = build().unwrap();
+                    store.set_max_kicks(c.max_kicks);
                     let start = Instant::now();
                     let mut i = 0u64;
                     loop {
@@ -114,89 +115,132 @@ macro_rules! bench_kv_insert {
                             Err(e) => panic!("{}", e),
                         }
                     }
-                    let elapsed_ns = start.elapsed().as_nanos() as f64;
-                    let inserted = i;
-                    let lf = store.load_factor();
-                    let mops = inserted as f64 / elapsed_ns * 1000.0;
-                    throughputs.push(mops);
+                    let ns = start.elapsed().as_nanos() as f64;
+                    (i, ns, store.load_factor())
+                };
+
+                for _ in 0..c.warmup {
+                    std::hint::black_box(fill());
+                }
+
+                let mut mops = Vec::with_capacity(trials);
+                let mut inserted_vals = Vec::with_capacity(trials);
+                let mut lf_vals = Vec::with_capacity(trials);
+                for _ in 0..trials {
+                    let (inserted, ns, lf) = fill();
+                    mops.push(inserted as f64 / ns * 1000.0);
                     inserted_vals.push(inserted as f64);
                     lf_vals.push(lf);
                 }
-                let mops_stats = helpers::compute_stats(&throughputs);
-                let mean_inserted = inserted_vals.iter().sum::<f64>() / MEASURE_TRIALS as f64;
-                let mean_lf = lf_vals.iter().sum::<f64>() / MEASURE_TRIALS as f64;
+
+                let s = helpers::compute_stats(&mops);
+                let mean_inserted = inserted_vals.iter().sum::<f64>() / trials as f64;
+                let mean_lf = lf_vals.iter().sum::<f64>() / trials as f64;
                 writeln!(
                     $csv,
-                    "{},{},{},{},{},{:.0},{:.6},{:.4}",
+                    "{},{},{},{},{},{},{},{:.0},{:.6},{:.4},{:.4},{:.4},{:.4}",
                     $scheme,
-                    $arity,
+                    cfg.arity,
                     num_buckets,
-                    bucket_size,
+                    cfg.bucket_size,
+                    fp_bits,
                     value_bits,
+                    pb,
                     mean_inserted,
                     mean_lf,
-                    mops_stats.mean,
+                    s.mean,
+                    s.min,
+                    s.max,
+                    s.stddev
                 )
                 .unwrap();
                 println!(
-                    "  {:<22} bs={:<2} vb={:<5} | mean={:<8.3} lf={:.4} Mops",
-                    $label, bucket_size, value_bits, mops_stats.mean, mean_lf
+                    "  {:<16} nb={:<8} b={} vb={:<5} | mean={:>7.3}  std={:>6.3} Mops  (lf={:.4}%)",
+                    $label,
+                    num_buckets,
+                    cfg.bucket_size,
+                    value_bits,
+                    s.mean,
+                    s.stddev,
+                    mean_lf * 100.0
                 );
             }
         }
     }};
 }
 
+/// Run one `(arity, bucket_size)` config across every requested `value_bits`.
+fn run_config(csv: &mut std::io::BufWriter<std::fs::File>, cli: &Cli, cfg: FilterConfig) {
+    for &value_bits in &cli.value_bits {
+        println!(
+            "\n--- arity={} bucket_size={} value_bits={} ---",
+            cfg.arity, cfg.bucket_size, value_bits
+        );
+        match cfg.arity {
+            2 => bench_kv_insert!(
+                csv,
+                cli,
+                "Segmented 2-ary",
+                Segmented2aryCuckooKVStore,
+                "segmented",
+                cfg,
+                value_bits
+            ),
+            3 => bench_kv_insert!(
+                csv,
+                cli,
+                "Segmented 3-ary",
+                Segmented3aryCuckooKVStore,
+                "segmented",
+                cfg,
+                value_bits
+            ),
+            4 => bench_kv_insert!(
+                csv,
+                cli,
+                "Segmented 4-ary",
+                Segmented4aryCuckooKVStore,
+                "segmented",
+                cfg,
+                value_bits
+            ),
+            a => panic!("arity must be 2, 3, or 4 (got {a})"),
+        }
+    }
+}
+
 fn main() {
     if helpers::skip_when_cargo_test() {
         return;
     }
-    let mut csv = helpers::csv_writer(
-        "kv_store_insert_throughput.csv",
-        "scheme,arity,num_buckets,bucket_size,value_bits,mean_inserted,mean_lf,mean_mops",
-    );
+    let cli: Cli = configs::parse();
+    let cfgs = cli.config.configs();
 
-    println!("=== KV Store Insert Throughput (insert until full) ===");
+    println!("=== KV store — insert throughput (insert until full) ===");
     println!(
-        "Config: fingerprint_bits={}, max_kicks={}, target_items={}, warmup={}, trials={}",
-        FINGERPRINT_BITS, MAX_KICKS, TARGET_ITEMS, WARMUP_TRIALS, MEASURE_TRIALS
+        "{}",
+        cli.config.describe(
+            &cfgs,
+            Some(
+                cli.config
+                    .fingerprint_bits
+                    .unwrap_or(configs::DEFAULT_FINGERPRINT_BITS)
+            )
+        )
+    );
+    println!(
+        "warmup={}, trials={}",
+        cli.config.warmup,
+        cli.config.trials.unwrap_or(configs::DEFAULT_MEASURE_TRIALS)
+    );
+    println!(
+        "value_bits={:?}, plaintext_bits={}, target_items={}",
+        cli.value_bits, cli.plaintext_bits, cli.target_items
     );
 
-    for &bucket_size in BUCKET_SIZE_VALUES {
-        for &value_bits in VALUE_BITS_VALUES {
-            println!(
-                "\n--- bucket_size={}, value_bits={} ---",
-                bucket_size, value_bits
-            );
-            bench_kv_insert!(
-                csv,
-                "Segmented 2-ary",
-                Segmented2aryCuckooKVStore,
-                "segmented",
-                2,
-                bucket_size,
-                value_bits
-            );
-            bench_kv_insert!(
-                csv,
-                "Segmented 3-ary",
-                Segmented3aryCuckooKVStore,
-                "segmented",
-                3,
-                bucket_size,
-                value_bits
-            );
-            bench_kv_insert!(
-                csv,
-                "Segmented 4-ary",
-                Segmented4aryCuckooKVStore,
-                "segmented",
-                4,
-                bucket_size,
-                value_bits
-            );
-        }
+    let mut csv = helpers::csv_writer("kv_store_insert_throughput.csv", HEADER);
+    for cfg in cfgs {
+        run_config(&mut csv, &cli, cfg);
     }
-
-    println!("\nResults written to results/kv_store_insert_throughput.csv");
+    println!("\nResults written to kv_store_insert_throughput.csv");
 }

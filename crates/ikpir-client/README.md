@@ -76,7 +76,7 @@ The root [README](../../README.md#benches) has the paper config matrix.
 Bench-specific: `client_query` / `client_decode` / `headtohead_*` take `--batch`
 (key-pool size); `client_mutation` takes `--patch-mode entry\|row` (comma list,
 default `entry`), `--n-mutations`, `--load-factor`; `headtohead_query` /
-`headtohead_decode` require `--num-keys` and take `--max-mem-gb`.
+`headtohead_decode` require `--num-keys`.
 
 ### Low-level: `cargo bench`
 
@@ -105,6 +105,22 @@ from_setup(bundle)                  — initialise from server's setup bundle
   └── on FutureDelta / after server full_rebuild:
         reset_from(new_bundle)      — replace all internal state
 ```
+
+`from_setup` re-expands each segment's LWE matrix `A` from the wire-shipped
+seed, which is the whole cost of bootstrapping — gigabytes of keystream at
+paper scale, single-threaded. For any backend implementing
+`ParallelSetupBackend` (both shipped ones do), `from_setup_parallel` and
+`reset_from_parallel` build the identical client across all cores:
+
+```rust
+// Interchangeable — same queries, same decodes, same epoch.
+let client = IkpirClient::<FrodoPirBackend>::from_setup(bundle);
+let client = IkpirClient::<FrodoPirBackend>::from_setup_parallel(bundle);
+```
+
+Worker count comes from `IKPIR_SETUP_THREADS`, else the machine's available
+parallelism. All five benches use the parallel path — none of them reports
+client-bootstrap cost.
 
 ## Status and wire-format stability
 

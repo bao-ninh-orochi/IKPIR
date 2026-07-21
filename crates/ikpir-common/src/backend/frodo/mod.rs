@@ -24,4 +24,4 @@ pub use backend::{
 pub use params::{FrodoConfig, FrodoParams};
 
 pub(crate) use arith::{round_p_to_q, round_q_to_p};
-pub(crate) use sampler::{sample_a, sample_ternary_into};
+pub(crate) use sampler::{sample_a, sample_a_parallel, sample_ternary_into};
