@@ -24,6 +24,19 @@ cargo bench --workspace --no-run --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
+On `perf/optimized` the default-on `parallel` feature means those five only
+cover one half of the build matrix. Add:
+
+```bash
+cargo clippy --all-targets --no-default-features -- -D warnings
+cargo test --workspace --no-default-features
+```
+
+`--no-default-features` is not a curiosity here: it is how the branch degrades
+to upstream's behaviour, and several items (`backend::parallel::par_chunks_mut`,
+both backends' scoped-thread `compute_hint_parallel`) exist *only* in that
+configuration. Nothing else compiles them.
+
 ## Benches
 
 - One bench at one config: `./scripts/bench.sh <name> [flags]` (auto-derives

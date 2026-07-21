@@ -18,6 +18,17 @@ The crates keep the generic names (`ikpir-*`): the code implements the generic
 IKPIR-from-UIPIR construction, and the RisePIR variants are what you get by
 choosing a backend at the `B: IndexPirBackend` type parameter.
 
+> **You are on `perf/optimized`.** This branch is `main` plus a layer of CPU
+> optimization: `-C target-cpu=native`, register-tiled kernels, and a
+> default-on `parallel` cargo feature that threads *every* path, the timed
+> ones included. The protocol, wire format and API are unchanged and results
+> are bit-identical — but no number a default build produces is a paper
+> number. [`OPTIMIZATIONS.md`](OPTIMIZATIONS.md) has the design, the measured
+> speedups, and how to get `main`'s regime back
+> (`IKPIR_SETUP_THREADS=1`, or `--no-default-features`). The reference
+> implementation lives on `orochi-network/IKPIR`; this branch never merges
+> upstream.
+
 > **Status.** Research prototype. Interfaces, parameters, and internals are
 > subject to change.
 

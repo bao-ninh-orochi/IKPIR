@@ -52,9 +52,11 @@ IndexPirBackend (mandatory)
 │
 ├── ParallelSetupBackend            (same setup results, across cores)
 │   server_setup_parallel / expand_hint_material_parallel / client_setup_parallel
-│   (bit-identical to the single-threaded twins for the same seed; the
-│    base trait stays single-threaded because the paper reports that
-│    regime and `benches/server_setup.rs` times it)
+│   (bit-identical to the single-threaded twins for the same seed. On
+│    `main` the base trait stays single-threaded because the paper
+│    reports that regime; on `perf/optimized` the default-on `parallel`
+│    feature makes the base trait the optimized path, and these three
+│    delegate to it)
 │
 └── BackendWireSize                 (byte-size accounting)
     query_byte_size / response_byte_size / hint_byte_size / server_params_byte_size

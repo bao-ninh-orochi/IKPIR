@@ -122,6 +122,11 @@ Worker count comes from `IKPIR_SETUP_THREADS`, else the machine's available
 parallelism. All five benches use the parallel path — none of them reports
 client-bootstrap cost.
 
+On `perf/optimized` the two constructors are the same code: `from_setup`
+already expands `A` across cores, because `sample_a` is the rayon ChaCha20
+kernel. `IKPIR_SETUP_THREADS=1` or `--no-default-features` restores the
+single-threaded bootstrap.
+
 ## Status and wire-format stability
 
 Two backends ship: `FrodoPirBackend` (default `lwe_dim = 1566`, ternary

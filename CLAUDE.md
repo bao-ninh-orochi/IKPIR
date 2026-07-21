@@ -10,6 +10,36 @@ The key novelty is the **Segmented Cuckoo Filter (SCF)**: a dynamic fingerprint-
 
 Target Index-PIR backends: **FrodoPIR** and **SimplePIR** (LWE-based, post-quantum).
 
+## You are on `perf/optimized` — read this before believing the rest
+
+This branch is `main` plus a layer of CPU optimization. Everything below
+describes the protocol, the crates, the benches and the paper's config
+matrix, and all of it still holds. **One design principle does not**: on
+`main`, measured code stays single-threaded and non-SIMD, because that is
+the regime the paper reports. Here it does not. The `parallel` cargo
+feature is default-on, `.cargo/config.toml` builds with
+`-C target-cpu=native`, and the matvec / GEMM / ChaCha20 / hint-patch
+kernels fan out across every core on every path — the online ones
+included.
+
+Consequences worth having in front of you:
+
+- **No number produced by a default build of this branch is a paper
+  number.** `benches/server_setup.rs` says so in its `setup_mode` column
+  (`full_parallel`, for both `--setup-impl` values). The other benches
+  have no such column; they are simply not the paper's regime here.
+- To recover `main`'s regime without switching branches, set
+  `IKPIR_SETUP_THREADS=1` — the crate's single worker-count knob, which
+  the rayon kernels honour too — or build `--no-default-features`, which
+  also drops the rayon dependency and restores upstream's scoped-thread
+  `ParallelSetupBackend` implementation verbatim.
+- Results stay **bit-identical** either way; see
+  [`OPTIMIZATIONS.md`](OPTIMIZATIONS.md) for the invariant, the measured
+  speedups, the hardware they were taken on, and what is deliberately
+  unmeasured.
+- PRs from this branch go to the fork, never to `orochi-network/IKPIR`.
+  Upstream is the reference implementation and stays plain.
+
 ## Workspace structure
 
 ```
@@ -183,6 +213,17 @@ quantify what the other benches save. Such a row is not a paper number,
 and says so: the CSV's `setup_mode` column reads `full_parallel` rather
 than `full`.
 
+**On `perf/optimized` the two rows of that table are the same code.**
+`B::server_setup` here *is* the optimized path — `compute_hint` is the
+rayon GEMM and `sample_a` the rayon ChaCha20 expansion — so the three
+`*_parallel` methods delegate to their reference twins rather than
+wrapping a second fan-out around them, and `server_setup` reports
+`full_parallel` whichever `--setup-impl` it was given. The trait, its
+tests, and the protocol-level `*_parallel` entry points all still exist
+and behave identically, so nothing downstream has to change.
+`IKPIR_SETUP_THREADS=1` or `--no-default-features` restores the table as
+written, upstream's scoped threads included.
+
 Either way the number is a whole `IkpirServer::new`, timed end to end.
 No bench times a fraction of an operation and scales the result up —
 that shortcut existed while the geometry was `N = 2²²` and was dropped
@@ -248,4 +289,6 @@ cargo bench -p ikpir-server --bench server_answer -- \
 - The PIR backend (FrodoPIR vs SimplePIR) is selected at the `B: IndexPirBackend` type parameter on `IkpirServer<S, B>` / `IkpirClient<B>` (monomorphised, no Cargo features involved); the benches expose it as a runtime `--backend frodo|simple` flag.
 - Avoid dynamic dispatch on the hot path; prefer generics.
 - All cryptographic and PIR primitives must be constant-time where relevant to avoid side-channel leakage.
-- **Measured code stays single-threaded and non-SIMD.** The paper reports that regime, so every operation a bench times runs it. Parallelism is confined to the setup phase, offered as a separate, explicitly named entry point (`*_parallel`) with a bit-identical-output contract — never as a flag that could silently change what a timed path does. Adding an optimized twin of any other operation must follow the same shape.
+- ~~**Measured code stays single-threaded and non-SIMD.**~~ **Inverted on this branch.** On `main` the paper reports that regime, so every operation a bench times runs it, and parallelism is confined to the setup phase behind explicitly named `*_parallel` entry points. `perf/optimized` exists to answer the other question — how fast RisePIR goes when it is allowed to use the machine — so here every path is optimized, including the timed ones. What survives unchanged is the *contract*, which is the part that made the original principle safe: an optimization may only change the schedule, never the bits. See [`OPTIMIZATIONS.md`](OPTIMIZATIONS.md).
+- **Every optimization is bit-exact, and by construction where possible.** Partition the *output* (disjoint hint bands, disjoint keystream runs) so accumulation order is untouched; where that is impossible (`matvec.rs`'s row partition reduces), lean on `u32` wrapping addition being associative and commutative, and pin it with a test against the naive loop. Never a reduction whose result depends on scheduling.
+- **Every parallel path sits behind a size gate and the `IKPIR_SETUP_THREADS` knob.** Small inputs keep their low-latency sequential path, and one environment variable forces the reference schedule everywhere for bisecting. A gate that no test crosses is a gate that pins nothing — add a fixture above it, asserted.

@@ -99,10 +99,16 @@ cargo bench -p ikpir-server --bench <name> -- --help
 
 ## Setup: reference and optimized
 
-`IkpirServer::new` and `full_rebuild` compute the per-segment hints
-single-threaded — the regime the paper reports. For any backend implementing
-`ParallelSetupBackend` (both shipped ones do), `new_parallel` and
-`full_rebuild_parallel` produce **byte-identical** state across all cores:
+On `main`, `IkpirServer::new` and `full_rebuild` compute the per-segment
+hints single-threaded — the regime the paper reports — and, for any backend
+implementing `ParallelSetupBackend` (both shipped ones do), `new_parallel` and
+`full_rebuild_parallel` produce **byte-identical** state across all cores.
+
+**On `perf/optimized` they are the same code**: the default-on `parallel`
+feature makes `new` itself run the rayon kernels, so the `*_parallel` twins
+delegate to it rather than wrapping a second fan-out around it. Both entry
+points remain, with unchanged behaviour, so nothing calling them has to
+change:
 
 ```rust
 // Interchangeable — same ServerParams, same Hint, same epoch, same wire bytes.
@@ -110,11 +116,16 @@ let server = Segmented2aryIkpirServer::new(store, FrodoConfig::default());
 let server = Segmented2aryIkpirServer::new_parallel(store, FrodoConfig::default());
 ```
 
-Use the reference path when the setup timing itself is the result; use the
-parallel path whenever you just need a server. Worker count comes from
-`IKPIR_SETUP_THREADS`, else the machine's available parallelism (set it to `1`
-to force the reference schedule). Measured on 8 cores: 4.8× (FrodoPIR),
-6.3× (SimplePIR).
+On `main`: use the reference path when the setup timing itself is the result,
+the parallel path whenever you just need a server. On this branch the choice
+is moot — to get the reference schedule, set `IKPIR_SETUP_THREADS=1` or build
+`--no-default-features`.
+
+Worker count comes from `IKPIR_SETUP_THREADS`, else the machine's available
+parallelism; it governs the rayon kernels too. Measured on 8 cores against
+`main`'s reference, whole `IkpirServer::new` over four segments at the dev
+geometry: **10.6× (FrodoPIR)**, **28.1× (SimplePIR)** — see
+[`OPTIMIZATIONS.md`](../../OPTIMIZATIONS.md).
 
 ## Per-segment architecture
 

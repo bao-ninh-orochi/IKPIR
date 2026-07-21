@@ -24,16 +24,18 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/backend/frodo/mod.rs` | Re-exports the FrodoPIR backend's public surface |
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
-| `src/backend/matvec.rs` | `matvec_accumulate` — shared width-adaptive register-blocked `acc += qᵀ·D` kernel used by every online hot loop (`server_answer`, `client_decode` cold path, `compute_c`) in both backends; bit-exact vs the naive loop, no explicit SIMD/threads |
-| `src/backend/patch.rs` | `TouchedRuns` — the entry-level hint patch's inner loop, shared by both backends: coalesces one row's touched hint columns into contiguous runs, then applies `H[k, c] += A[row, k] · Δ_c` with `k` outermost, sweeping the hint once instead of once per touched column |
-| `src/backend/parallel.rs` | `setup_threads` / `balanced_chunk_len` / `par_chunks_mut` — `std::thread::scope` fan-out behind the optimized setup path; no dependency, static disjoint-output partition, worker count via `IKPIR_SETUP_THREADS` (clamped to `MAX_SETUP_THREADS`). Also the single source of truth for the fan-out thresholds `PAR_MIN_HINT_MACS` / `PAR_MIN_WORDS`, which both backends and their tests read |
+| `src/backend/matvec.rs` | `matvec_accumulate` (`acc += qᵀ·D`, the `server_answer` / cold-decode / `compute_c` kernel) and `matvec_rows_accumulate` (`b += A·s`, the query-sampling kernel). Both width-adaptive register-blocked with per-µarch dispatch tables, both bit-exact vs the naive loop, both rayon-parallel above a size gate on this branch |
+| `src/backend/gemm.rs` | `gemm_at_d_accumulate` — register-tiled (`4 × 16`, KC-blocked, contraction innermost) `H += Aᵀ·D`, behind `compute_hint` in both backends and behind the row-level hint patch. Bit-exact vs the reference `i, k, j` rank-one-update loop; tiles are disjoint `H` bands, so the rayon path carries no arithmetic |
+| `src/backend/prg.rs` | `chacha20_fill_words` — the shared ChaCha20 expansion behind both backends' `sample_a`. Chunk-parallel via `set_word_pos`, byte-identical to the sequential stream at any chunking |
+| `src/backend/patch.rs` | `TouchedRuns` — the entry-level hint patch's inner loop, shared by both backends: coalesces one row's touched hint columns into contiguous runs, then applies `H[k, c] += A[row, k] · Δ_c` with `k` outermost, sweeping the hint once instead of once per touched column. Plus `apply_banded` (the same sweep split across rayon over disjoint bands of hint rows) and `row_level_batch_rows` (the row-level pass's chunk cap) |
+| `src/backend/parallel.rs` | The crate's threading policy: `setup_threads` (worker count, `IKPIR_SETUP_THREADS`, clamped to `MAX_SETUP_THREADS`), `balanced_chunk_len` (chunk rule), `kernels_parallel` / `kernel_tasks` (the rayon side's gate and task count), and `par_chunks_mut` (`std::thread::scope` fan-out, compiled only with the `parallel` feature **off**). Also the single source of truth for the thresholds `PAR_MIN_HINT_MACS` / `PAR_MIN_WORDS`, which both backends and their tests read |
 | `src/backend/frodo/arith.rs` | `round_p_to_q` / `round_q_to_p` — plaintext ↔ ciphertext modulus conversion |
-| `src/backend/frodo/sampler.rs` | `sample_a` (LWE public matrix) + `sample_ternary_into` (LWE secret / error sampling) |
+| `src/backend/frodo/sampler.rs` | `sample_a` / `sample_a_parallel` (LWE public matrix, both through `backend/prg.rs`) + `sample_ternary_into` (LWE secret / error sampling) |
 | `src/backend/simple/mod.rs` | Re-exports the SimplePIR backend's public surface + math summary |
 | `src/backend/simple/params.rs` | `SimpleParams` + `SimpleConfig` (user-facing knobs, default `lwe_dim = 1275`, `sigma = 6.4`) |
 | `src/backend/simple/backend.rs` | `SimplePirBackend` impl of all four traits + `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` + internal `reshape_dims` / `translate` helpers |
 | `src/backend/simple/arith.rs` | Δ-scaling (duplicated from frodo per project rule) |
-| `src/backend/simple/sampler.rs` | `sample_a` + `sample_uniform_zq_into` (secret) + `sample_discrete_gaussian_into` (Box–Muller error) |
+| `src/backend/simple/sampler.rs` | `sample_a` / `sample_a_parallel` + `sample_uniform_zq_into` (secret) + `sample_discrete_gaussian_into` (Box–Muller error) |
 | `src/pir_params.rs` | Operating-point selection: `frodo_max_plaintext_bits` / `simple_max_plaintext_bits` — the largest `plaintext_bits` each backend decodes correctly at `q = 2³²`, evaluated at the per-segment matrix shape (full derivation of both correctness bounds in the module docs) |
 | `examples/max_plaintext_bits.rs` | Dependency-free CLI over `pir_params`, consumed by `scripts/lib.sh::backend_plaintext_bits` (sourced by `scripts/bench.sh`) |
 
@@ -63,17 +65,41 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
   wire-size benches. A backend that doesn't implement an optional
   extension is simply unavailable on the corresponding code path.
 
+- **The `parallel` feature (default-on, `perf/optimized` only)** — gates
+  every rayon path in the crate: the matvec / rows-matvec kernels, the
+  GEMM, the ChaCha20 expansion, and the entry-level hint patch's banded
+  sweep. It is the whole difference between this branch and `main`, and
+  it is a *schedule* switch only: bit-identical output either way, pinned
+  by unit tests on both sides of every size gate. Build
+  `--no-default-features` (or set `IKPIR_SETUP_THREADS=1`) to get
+  upstream's behaviour without switching branches. `ikpir-server` and
+  `ikpir-client` forward the feature; the workspace dependency lines keep
+  `default-features = false` so `--no-default-features` actually reaches
+  here instead of the feature returning over a sibling's edge.
+
 - **Two setup implementations, one result** — setup is
   `Θ(n_rows · lwe_dim · row_width)`, minutes to hours at paper scale,
   and it is the price of *reaching* the state most benchmarks want to
-  measure rather than anything they measure. So the base trait's
-  `server_setup` / `expand_hint_material` / `client_setup` stay
+  measure rather than anything they measure. On `main` the base trait's
+  `server_setup` / `expand_hint_material` / `client_setup` therefore stay
   single-threaded and non-SIMD — the regime the paper reports and
   `benches/server_setup.rs` times — and `ParallelSetupBackend` supplies
   `server_setup_parallel` / `expand_hint_material_parallel` /
-  `client_setup_parallel` alongside them. Both shipped backends
-  implement it; measured speedup on 8 cores is 4.8× (FrodoPIR) and
-  6.3× (SimplePIR).
+  `client_setup_parallel` alongside them.
+
+  **Here the two collapse into one.** With the `parallel` feature on,
+  `compute_hint` is the rayon GEMM and `sample_a` the rayon ChaCha20
+  expansion, so `server_setup` is already the optimized path and the
+  three `*_parallel` methods delegate to their reference twins — a
+  second fan-out around them would only oversubscribe. The trait, its
+  equivalence contract, its tests and the protocol-level entry points
+  are all unchanged, so a caller cannot tell. With the feature off, both
+  backends fall back to upstream's scoped-thread banding verbatim.
+  Measured on 8 cores at `n = 16384`, `w = 112`: `server_setup` is
+  **6.5× (FrodoPIR)** and **19.3× (SimplePIR)** faster than `main`'s
+  reference — of which 1.6× / 4.5× is the register-tiled GEMM alone,
+  before any threading. End to end over four segments
+  (`benches/server_setup.rs`, dev geometry) it is 10.6× / 28.1×.
 
   The optimized path is **bit-identical, not merely equivalent**, and
   by construction rather than by argument: it partitions only the
@@ -82,9 +108,11 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
   the same terms in the same order. That is what lets a server built
   on one path interoperate with a client built on the other, which
   `ikpir-server/tests/parallel_setup_equivalence.rs` pins for every
-  combination. Threading is `std::thread::scope`: the partition is
-  already balanced, so a work-stealing runtime would buy nothing and
-  cost a dependency in a crypto crate.
+  combination. Threading is `std::thread::scope` for the
+  setup-only partitions — already balanced, so a work-stealing runtime
+  would buy nothing there — and rayon for the online kernels, which run
+  per query and per mutation and cannot pay a thread spawn each time.
+  `backend/parallel.rs` holds both, and one worker-count knob for both.
 
   The schedule depends only on public shape and the core count, never
   on cell values, so the parallel path inherits the base trait's
@@ -254,7 +282,10 @@ composition.
 | Round-trip cell-modulus conversion | `backend/frodo/arith.rs` (also duplicated in `backend/simple/arith.rs`) |
 | Online matvec hot loop (`acc += qᵀ·D`) | `backend/matvec.rs::matvec_accumulate` — shared by both backends (unlike `arith.rs`, deliberately *not* duplicated: it is backend-agnostic linear algebra whose blocking tunables must never diverge) |
 | Entry-level patch inner loop | `backend/patch.rs::TouchedRuns` — shared for the same reason as `matvec.rs`; the backends differ only in the `column_of` closure they pass (identity for FrodoPIR, the reshape translation for SimplePIR) |
-| Optimized (multi-threaded) setup | `backend/mod.rs::ParallelSetupBackend` (contract) → `compute_hint_parallel` in each `backend/*/backend.rs` + `sample_a_parallel` in each `backend/*/sampler.rs`; fan-out in `backend/parallel.rs` |
+| Optimized (multi-threaded) setup | `backend/mod.rs::ParallelSetupBackend` (contract) → `compute_hint_parallel` in each `backend/*/backend.rs` + `sample_a_parallel` in each `backend/*/sampler.rs`; fan-out in `backend/parallel.rs`. With the `parallel` feature on these delegate to the reference twins, which are themselves the rayon kernels |
+| Setup-time GEMM (`H += Aᵀ·D`) | `backend/gemm.rs::gemm_at_d_accumulate` — also the row-level hint patch's kernel |
+| Public-matrix expansion | `backend/prg.rs::chacha20_fill_words`, called by both samplers |
+| Whether a rayon kernel may fan out | `backend/parallel.rs::kernels_parallel` — cached, honours `IKPIR_SETUP_THREADS=1` |
 | Worker count for the optimized setup | `backend/parallel.rs::setup_threads` — `IKPIR_SETUP_THREADS`, else `available_parallelism()`, clamped to `MAX_SETUP_THREADS` (1024) so a typo cannot spawn a thread per keystream buffer; set to `1` to force the reference schedule when bisecting |
 | LWE sampling (FrodoPIR) | `backend/frodo/sampler.rs` (`sample_a`, `sample_a_parallel`, `sample_ternary_into`) |
 | LWE sampling (SimplePIR) | `backend/simple/sampler.rs` (`sample_a`, `sample_a_parallel`, `sample_uniform_zq_into`, `sample_discrete_gaussian_into`) |
