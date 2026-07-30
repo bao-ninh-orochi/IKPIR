@@ -5,10 +5,11 @@
 #
 # Runs server_setup over PAPER_SETUP_CONFIGS from scripts/lib.sh: the three
 # arity-2/4 cells at N = 2^20 slots, × 2 value widths × 2 backends = 12 runs.
-# Arity 3 is deliberately out of scope here — it is a full-paper addition to the
-# online and mutation tables, and carries no static-rebuild row. To measure it
-# anyway: `./scripts/bench.sh server_setup --arity 3 --bucket-size 2 \
-# --num-buckets 786432 --value-bits 8192`.
+# Every run is at fingerprint_bits = 64, the paper's width (bench.sh's
+# default). Arity 3 is deliberately out of scope here — it is a full-paper
+# addition to the online and mutation tables, and carries no static-rebuild
+# row. To measure it anyway: `./scripts/bench.sh server_setup --arity 3
+# --bucket-size 2 --num-buckets 786432 --value-bits 8192`.
 #
 # Both benched stores are seeded to fill 0.90, matching table4.sh so the two
 # tables describe one store. Setup time does not actually depend on the fill —

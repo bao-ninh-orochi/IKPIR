@@ -102,7 +102,7 @@ Hao 2025).
 (`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,
 `false_positive_rate`) and three `kv_store_*`. They are `clap`-parsed too, but
 every flag is optional: with none, each runs the paper's **Table 2** matrix — the
-five `(arity, bucket_size)` pairs at `fingerprint_bits = 32`, `max_kicks = 2500`,
+five `(arity, bucket_size)` pairs at `fingerprint_bits = 64`, `max_kicks = 2500`,
 ~10^6 buckets. That matrix and every default live in
 `crates/segmented-cuckoo/benches/configs.rs`, the single source of truth;
 `--arity` / `--bucket-size` narrow it, other flags override one axis.

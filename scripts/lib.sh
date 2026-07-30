@@ -90,18 +90,22 @@ default_num_buckets() {
     esac
 }
 
-# Max plaintext_bits admitted by the backend's correctness bound at q = 2^32,
-# per (backend, SCF geometry, value_bits). Single source of truth is the
-# ikpir-common `max_plaintext_bits` example over ikpir_common::pir_params
-# (FrodoPIR paper Eq. 8; SimplePIR paper Theorem C.1). The result depends on
-# value_bits for SimplePIR, so callers pass the full geometry.
+# Max plaintext_bits admitted by the backend's per-cell correctness budget at
+# q = 2^32, per (backend, SCF geometry, value_bits, fingerprint_bits). Single
+# source of truth is the ikpir-common `max_plaintext_bits` example over
+# ikpir_common::pir_params: both backends target the same delta_cell <=
+# 2^-(kappa+1) / (arity * row_width) per-cell budget at kappa = 40 (FrodoPIR's
+# explicit Bernstein tail; SimplePIR's Theorem C.1 bound retargeted from its
+# old fixed delta = 2^-40). The result depends on the FULL geometry for both
+# backends now, including fingerprint_bits, so callers pass it explicitly.
 backend_plaintext_bits() {
-    local backend=$1 arity=$2 bucket_size=$3 num_buckets=$4 value_bits=$5 pb
+    local backend=$1 arity=$2 bucket_size=$3 num_buckets=$4 value_bits=$5 fingerprint_bits=$6 pb
     pb=$(cargo run -q --release -p ikpir-common --example max_plaintext_bits \
              --manifest-path "$IKPIR_ROOT/Cargo.toml" -- \
              "$backend" --arity "$arity" --num-buckets "$num_buckets" \
-             --bucket-size "$bucket_size" --value-bits "$value_bits") \
-        || die "max_plaintext_bits selector failed (backend=$backend arity=$arity bs=$bucket_size nb=$num_buckets vb=$value_bits)"
+             --bucket-size "$bucket_size" --value-bits "$value_bits" \
+             --fingerprint-bits "$fingerprint_bits") \
+        || die "max_plaintext_bits selector failed (backend=$backend arity=$arity bs=$bucket_size nb=$num_buckets vb=$value_bits fb=$fingerprint_bits)"
     echo "$pb"
 }
 

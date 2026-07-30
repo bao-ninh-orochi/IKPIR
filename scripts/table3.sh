@@ -11,7 +11,8 @@
 #
 # — over the paper matrix in scripts/lib.sh, the single source of truth:
 # five (arity, bucket_size) cells × 2 value widths × 2 backends = 20 configs,
-# 3 benches each. Every cell's n_b comes from `paper_num_buckets`.
+# 3 benches each. Every cell's n_b comes from `paper_num_buckets`. Every run
+# is at fingerprint_bits = 64, the paper's width (bench.sh's default).
 #
 # Two key-count regimes, resolved per cell by `paper_num_keys`:
 #
