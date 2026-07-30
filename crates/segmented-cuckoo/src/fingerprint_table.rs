@@ -34,7 +34,8 @@
 /// Bit-packed fingerprint storage for a cuckoo filter.
 ///
 /// All fingerprint widths from 1 to 64 bits are supported. Fingerprints are stored without
-/// byte alignment; the internal representation loads/stores `u128` windows at the byte level.
+/// byte alignment; the internal representation loads/stores `u64` windows at the byte level
+/// up to 56-bit widths and `u128` windows above (see Design rationale).
 ///
 /// # Layout
 ///
@@ -659,11 +660,8 @@ mod tests {
     fn test_read_write_across_window_split_boundary() {
         for fp_bits in [55u32, 56, 57] {
             let mut table = FingerprintTable::new(2, 6, fp_bits);
-            let mask = if fp_bits == 64 {
-                u64::MAX
-            } else {
-                (1u64 << fp_bits) - 1
-            };
+            // fp_bits <= 57 < 64 here, so the mask shift cannot overflow.
+            let mask = (1u64 << fp_bits) - 1;
             let values: Vec<u64> = (0..6u64)
                 .map(|s| (0xA5A5_5A5A_DEAD_BEEFu64.rotate_left(s as u32 * 11) | 1) & mask)
                 .collect();
