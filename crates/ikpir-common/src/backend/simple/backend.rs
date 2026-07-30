@@ -2243,17 +2243,21 @@ mod tests {
     /// matches the protocol, and many draws (not many columns) is what
     /// gives the probe statistical power. Cells are uniform in
     /// `[0, 2^pb)` — the distribution `pack_slot_cells` produces for
-    /// random fingerprints and values. Returns
-    /// `(failed_draws, overflowed_cells, max |noise| / (Δ/2))`.
+    /// random fingerprints and values. `fingerprint_bits` feeds
+    /// `row_width` the same way it feeds
+    /// `crate::pir_params::simple_max_plaintext_bits`, so the probe
+    /// window matches the geometry the selector was evaluated at.
+    /// Returns `(failed_draws, overflowed_cells, max |noise| / (Δ/2))`.
     fn measure_decode_noise(
         segment_rows: u32,
         bucket_size: u32,
+        fingerprint_bits: u32,
         value_bits: u32,
         pb: u32,
         draws: usize,
     ) -> (u64, u64, f64) {
         use rand::SeedableRng;
-        let row_width = bucket_size * (32 + value_bits).div_ceil(pb);
+        let row_width = bucket_size * (fingerprint_bits + value_bits).div_ceil(pb);
         let (_, reshape_rows, _) = reshape_dims(segment_rows, row_width);
         let rows = reshape_rows as usize;
         let window = row_width as usize;
@@ -2300,18 +2304,19 @@ mod tests {
     /// EMPIRICAL EVIDENCE for the `pir_params` history note: the
     /// pre-fix operating point (`pb = 10` keyed on total capacity) at
     /// the paper's largest SimplePIR geometry — `(d, b) = (4, 1)`,
-    /// `n_b = 2^22` (per-segment rows `2^20`), 1 KiB values — pushes
-    /// the decode noise past `Δ/2` on a few percent of ordinary
-    /// queries against random data, versus the `δ = 2⁻⁴⁰` the scheme
-    /// promises. The old bench sweep was measuring a scheme that does
-    /// not reliably decode.
+    /// `n_b = 2^22` (per-segment rows `2^20`), 1 KiB values, 32-bit
+    /// fingerprint (as the pre-fix era ran, before fingerprints widened
+    /// to 64 bits) — pushes the decode noise past `Δ/2` on a few
+    /// percent of ordinary queries against random data, versus the
+    /// `δ = 2⁻⁴⁰` the scheme promises. The old bench sweep was
+    /// measuring a scheme that does not reliably decode.
     #[test]
     #[ignore = "paper-scale probe (~10 s in release; run with --release)"]
     fn noise_margin_rejects_old_pb10_operating_point() {
         let draws = 256;
-        let (failed, cells, ratio) = measure_decode_noise(1 << 20, 1, 8192, 10, draws);
+        let (failed, cells, ratio) = measure_decode_noise(1 << 20, 1, 32, 8192, 10, draws);
         println!(
-            "simple pb=10 @ (s=2^20, b=1, ℓ=8192): failed decodes {failed}/{draws} \
+            "simple pb=10 @ (s=2^20, b=1, f=32, ℓ=8192): failed decodes {failed}/{draws} \
              ({cells} cells), max|noise|/(Δ/2) = {ratio:.3}"
         );
         assert!(
@@ -2321,22 +2326,27 @@ mod tests {
     }
 
     /// The operating points `pir_params::simple_max_plaintext_bits`
-    /// selects keep the measured noise strictly inside `Δ/2` at the
-    /// same geometries (plus two more from the bench matrix).
+    /// selects at the new paper geometries (`fingerprint_bits = 64`)
+    /// keep the measured noise strictly inside `Δ/2`.
     #[test]
     #[ignore = "paper-scale probe (~10 s in release; run with --release)"]
     fn noise_margin_validates_selected_operating_points() {
         let draws = 128;
-        for (s, b, vb) in [
-            (1u32 << 20, 1u32, 8192u32),
-            (1 << 19, 2, 2048),
-            (1 << 17, 4, 256),
+        for (s, b, arity, vb, expected_pb) in [
+            (1u32 << 17, 4u32, 2u32, 8192u32, 8u32),
+            (1 << 18, 2, 3, 8192, 8),
+            (1 << 18, 1, 4, 8192, 9),
+            (1 << 17, 2, 4, 2048, 9),
         ] {
-            let pb = crate::pir_params::simple_max_plaintext_bits(s, b, 32, vb, 6.4);
-            let (failed, _, ratio) = measure_decode_noise(s, b, vb, pb, draws);
+            let pb = crate::pir_params::simple_max_plaintext_bits(arity, s, b, 64, vb, 6.4);
+            assert_eq!(
+                pb, expected_pb,
+                "selector regressed at (s={s}, b={b}, arity={arity}, ℓ={vb})"
+            );
+            let (failed, _, ratio) = measure_decode_noise(s, b, 64, vb, pb, draws);
             println!(
-                "simple pb={pb} @ (s={s}, b={b}, ℓ={vb}): failed decodes {failed}/{draws}, \
-                 max|noise|/(Δ/2) = {ratio:.3}"
+                "simple pb={pb} @ (s={s}, b={b}, arity={arity}, ℓ={vb}): \
+                 failed decodes {failed}/{draws}, max|noise|/(Δ/2) = {ratio:.3}"
             );
             assert_eq!(failed, 0, "selected pb={pb} must not fail decodes");
             assert!(ratio < 1.0);
