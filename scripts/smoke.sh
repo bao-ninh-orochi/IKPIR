@@ -7,6 +7,11 @@
 #
 # This is the "test the properties on small configs" entry point.
 #
+# Every leg runs at bench.sh's default fingerprint_bits = 64 (the paper's
+# width), plus one extra tiny leg at --fingerprint-bits 32 (one bench, the
+# first requested backend) so the narrow fingerprint path — still legal, just
+# not a paper config — keeps smoke coverage too.
+#
 # The segmented-cuckoo filter benches run a fixed large internal matrix (minutes
 # each) and are NOT part of this quick smoke — run them one at a time via
 # `./scripts/bench.sh <name>`, or exercise the filter / kv-store properties fast
@@ -38,10 +43,19 @@ SMOKE_BENCHES=(server_setup server_answer server_mutation
 
 for be in "${BACKENDS[@]}"; do
     validate_backend "$be"
-    log "smoke: backend=$be (${#SMOKE_BENCHES[@]} benches, tiny config)"
+    log "smoke: backend=$be (${#SMOKE_BENCHES[@]} benches, tiny config, fingerprint_bits=64)"
     for b in "${SMOKE_BENCHES[@]}"; do
         "$SCRIPT_DIR/bench.sh" "$b" "${TINY[@]}" --backend "$be"
     done
 done
+
+# One extra leg at the narrow (32-bit) fingerprint width, on the first
+# requested backend only — enough to catch a regression in the
+# fingerprint-width-dependent path (pb derivation, row_width, cells_per_slot)
+# without doubling smoke's runtime.
+NARROW_BACKEND="${BACKENDS[0]}"
+log "smoke: backend=$NARROW_BACKEND (1 bench, tiny config, fingerprint_bits=32 — narrow-path check)"
+"$SCRIPT_DIR/bench.sh" server_answer "${TINY[@]}" --fingerprint-bits 32 --backend "$NARROW_BACKEND"
+
 rm -rf "$IKPIR_RESULTS_BASE"
-ok "smoke: all ${#SMOKE_BENCHES[@]} benches passed on: ${BACKENDS[*]}"
+ok "smoke: all ${#SMOKE_BENCHES[@]} benches passed on: ${BACKENDS[*]} (+ 1 narrow-fingerprint check)"

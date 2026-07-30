@@ -122,7 +122,7 @@ The paper's notation maps onto the code as follows.
 | `b` | slots per bucket | `bucket_size` |
 | `n_b` | total buckets | `num_buckets` |
 | `s = n_b / d` | buckets per segment (a power of two) | `CuckooParams::segment_size()` |
-| `f` | fingerprint bits (benches fix 32) | `fingerprint_bits` |
+| `f` | fingerprint bits (benches fix 64) | `fingerprint_bits` |
 | `ℓ` | value bits | `value_bits` |
 | `fp(k) ‖ v` slot payload | fingerprint-then-value cell packing | `pack_slot_cells` / `unpack_slot_cells` |
 | `MaxKicks` | eviction-walk budget | `MAX_KICKS_DEFAULT` (= 500) |
@@ -177,7 +177,7 @@ adds eight filter / KV-store benches — five `cuckoo_filter_*`
 (`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,
 `false_positive_rate`) and three `kv_store_*`. Their flags are all optional:
 with none, each runs the paper's **Table 2** matrix (five `(arity, bucket_size)`
-pairs, `fingerprint_bits = 32`, `max_kicks = 2500`, ~10⁶ buckets), defined once
+pairs, `fingerprint_bits = 64`, `max_kicks = 2500`, ~10⁶ buckets), defined once
 in `crates/segmented-cuckoo/benches/configs.rs`.
 
 ### Run one bench at one config

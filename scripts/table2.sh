@@ -14,7 +14,7 @@
 #   Throughput / Lookup ← cuckoo_filter_lookup_throughput
 #   Throughput / Delete ← cuckoo_filter_delete_throughput
 #
-# Defaults per the paper: fingerprint_bits = 32, max_kicks = 2500, ~10^6 buckets
+# Defaults per the paper: fingerprint_bits = 64, max_kicks = 2500, ~10^6 buckets
 # (2^20 at arity 2/4; 3·2^19 segmented / 3^13 standard at arity 3).
 #
 # Any flags given are forwarded to all four benches, which is how you narrow the
