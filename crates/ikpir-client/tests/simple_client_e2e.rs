@@ -394,3 +394,56 @@ fn decode_visits_all_candidate_slots() {
         assert_eq!(got, val.to_vec(), "value mismatch for key {key:?}");
     }
 }
+
+/// End-to-end round-trip at `fingerprint_bits = 64` — the newly widened
+/// upper bound. SimplePIR mirror of the FrodoPIR test of the same name:
+/// insert, update, delete, and query all flow through the public
+/// client/server API with 64-bit fingerprints (dev-scale geometry, small
+/// key count to keep the runtime tiny).
+#[test]
+fn decode_roundtrip_at_fingerprint_bits_64() {
+    let store = Segmented2aryCuckooKVStore::new(64, 4, 64, 8, 8).unwrap();
+    let mut server: IkpirServer<Segmented2aryScheme, SimplePirBackend> =
+        IkpirServer::new(store, test_config());
+
+    let mut inserted = Vec::new();
+    for k in 0u32..10 {
+        let (key, val) = pair(k);
+        server.insert(&key, &val).expect("insert ok");
+        inserted.push((key, val));
+    }
+    let mut client: Client = fresh_client(&server);
+
+    // Insert: every inserted key round-trips through query/answer/decode.
+    for (key, val) in &inserted {
+        let q = client.build_query(key);
+        let resp = server.answer(&q).expect("answer ok");
+        let got = client.decode(key, &resp).expect("no error").expect("found");
+        assert_eq!(got, val.to_vec(), "value mismatch for key {key:?}");
+    }
+
+    // Update: the client observes the new value after apply_delta.
+    let (upd_key, _) = pair(3);
+    let new_val = [0x77u8];
+    let delta = server.update(&upd_key, &new_val).unwrap();
+    client.apply_delta(delta).unwrap();
+    let q = client.build_query(&upd_key);
+    let resp = server.answer(&q).unwrap();
+    assert_eq!(
+        client.decode(&upd_key, &resp).unwrap(),
+        Some(new_val.to_vec()),
+        "update not observed at fingerprint_bits = 64"
+    );
+
+    // Delete: the client observes the key is gone after apply_delta.
+    let (del_key, _) = pair(5);
+    let delta = server.delete(&del_key).unwrap();
+    client.apply_delta(delta).unwrap();
+    let q = client.build_query(&del_key);
+    let resp = server.answer(&q).unwrap();
+    assert_eq!(
+        client.decode(&del_key, &resp).unwrap(),
+        None,
+        "delete not observed at fingerprint_bits = 64"
+    );
+}
