@@ -13,16 +13,20 @@
 //! ```text
 //! cargo run -q --release -p ikpir-common --example max_plaintext_bits -- \
 //!     <frodo|simple> --arity D --num-buckets NB --bucket-size B \
-//!     --value-bits V [--fingerprint-bits 32] [--sigma 6.4]
+//!     --value-bits V [--fingerprint-bits 64] [--sigma 6.4]
 //! ```
 //!
 //! Prints a single integer (the `plaintext_bits` to pass to the
 //! benches) on stdout. The per-segment row count is derived as
 //! `num_buckets / arity` (must divide exactly — the SCF constructors
-//! enforce the same). For `frodo` the `--bucket-size`, `--value-bits`,
-//! `--fingerprint-bits`, and `--sigma` flags are accepted-but-ignored
-//! (the FrodoPIR bound depends only on the row count), so callers can
-//! use one uniform invocation for both backends.
+//! enforce the same). Both backends now target the same per-cell
+//! correctness budget (`ikpir_common::pir_params` module docs), so
+//! every flag matters for both: `--arity`, `--bucket-size`,
+//! `--value-bits`, and `--fingerprint-bits` all feed the per-cell
+//! `row_width` / union-bound term for `frodo` too, not only `simple`.
+//! The one flag still accepted-but-ignored for `frodo` is `--sigma`
+//! (the FrodoPIR bound has no discrete-Gaussian error term), kept so
+//! callers can use one uniform invocation for both backends.
 //!
 //! # Related files
 //!
@@ -36,7 +40,7 @@ use ikpir_common::pir_params::{frodo_max_plaintext_bits, simple_max_plaintext_bi
 
 const USAGE: &str = "usage: max_plaintext_bits <frodo|simple> \
      --arity D --num-buckets NB --bucket-size B --value-bits V \
-     [--fingerprint-bits 32] [--sigma 6.4]";
+     [--fingerprint-bits 64] [--sigma 6.4]";
 
 fn die(msg: &str) -> ! {
     eprintln!("max_plaintext_bits: {msg}\n{USAGE}");
@@ -56,7 +60,7 @@ fn main() {
 
     let (mut arity, mut num_buckets, mut bucket_size, mut value_bits) =
         (None::<u32>, None::<u32>, None::<u32>, None::<u32>);
-    let mut fingerprint_bits: u32 = 32;
+    let mut fingerprint_bits: u32 = 64;
     let mut sigma: f64 = 6.4;
 
     let mut it = flags.iter();
@@ -99,8 +103,15 @@ fn main() {
     let segment_rows = num_buckets / arity;
 
     let pb = match backend.as_str() {
-        "frodo" => frodo_max_plaintext_bits(segment_rows),
+        "frodo" => frodo_max_plaintext_bits(
+            arity,
+            segment_rows,
+            bucket_size,
+            fingerprint_bits,
+            value_bits,
+        ),
         "simple" => simple_max_plaintext_bits(
+            arity,
             segment_rows,
             bucket_size,
             fingerprint_bits,
