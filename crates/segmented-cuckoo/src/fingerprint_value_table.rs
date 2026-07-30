@@ -262,17 +262,14 @@ impl FingerprintValueTable {
         let mut filled = pb32 - intra_start;
         cell_idx += 1;
 
-        // Load subsequent cells until we have n_bits. `filled` is always
-        // < n_bits <= 64 here (the loop guard already ensures it), so the
-        // shift below never reaches amount 64 — but a cell landing exactly
-        // at bit 64 would contribute nothing anyway, since the final mask
-        // keeps only the low 64 bits of `acc`; the guard makes that
-        // explicit rather than relying on the invariant alone.
+        // Load subsequent cells until we have n_bits. The loop guard keeps
+        // `filled < n_bits <= 64`, so the shift amount never reaches 64; the
+        // debug_assert catches an invariant break in test builds and
+        // compiles out of release (this runs on benched decode paths).
         while filled < n_bits {
             let v = self.cells[cell_idx as usize] as u64;
-            if filled < 64 {
-                acc |= v << filled;
-            }
+            debug_assert!(filled < 64, "shift amount must stay below 64");
+            acc |= v << filled;
             filled += pb32;
             cell_idx += 1;
         }
@@ -313,15 +310,12 @@ impl FingerprintValueTable {
             let n = hi - lo;
 
             let mask = (1u64 << n) - 1;
-            // `value_bit_pos` never actually reaches 64 while a cell still
-            // needs it (the loop consumes exactly `n_bits <= 64` total
-            // across all cells), but guard the shift explicitly rather
-            // than lean on that invariant.
-            let v_bits = if value_bit_pos < 64 {
-                ((value >> value_bit_pos) & mask) as u32
-            } else {
-                0
-            };
+            // The loop consumes exactly `n_bits <= 64` bits across all cells,
+            // so `value_bit_pos` is below 64 whenever a cell still needs bits;
+            // the debug_assert catches an invariant break in test builds and
+            // compiles out of release.
+            debug_assert!(value_bit_pos < 64, "shift amount must stay below 64");
+            let v_bits = ((value >> value_bit_pos) & mask) as u32;
             let placed = v_bits << lo;
             let cell_mask = (mask as u32) << lo;
 

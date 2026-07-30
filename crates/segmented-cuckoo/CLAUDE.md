@@ -64,8 +64,10 @@ failure reproducible from its test name.
   fixed-index guarantee.
 - **Non-zero fingerprint invariant** — 0 means "empty slot"; the hash layer
   remaps a 0 result to 1, so occupancy is a single zero-test, no presence bit.
-- **`FingerprintTable`: bit-packed `Vec<u8>` + 8-byte tail padding** — unaligned
-  8-byte load = single MOV; padding stops the last-slot load reading past the end.
+- **`FingerprintTable`: bit-packed `Vec<u8>` + 16-byte tail padding** — unaligned
+  8-byte load (single MOV) while `fingerprint_bits <= 56`; a 16-byte `u128`
+  window above, where a shifted 64-bit field can span 9 bytes. Padding keeps
+  either window in-bounds at the last slot.
 - **`FingerprintValueTable`: flat `Vec<u32>` cells, LSB-first, high bits zero** —
   each cell holds ≤ `plaintext_bits` payload in its low bits. This is the
   *ChalametPIR matvec invariant*: `vec_mult_u32_u32` accumulates `u32` cells into

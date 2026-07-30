@@ -446,15 +446,14 @@ const fn slot_read_bits(cells: &[u32], bit_offset: u64, n_bits: u32, pb: u32) ->
     let mut filled = pb - intra_start;
     cell_idx += 1;
 
-    // Same shape as `FingerprintValueTable::read_bits`: guard the shift so
-    // it is never attempted at amount >= 64 (a cell landing there
-    // contributes nothing once the final mask below keeps only the low 64
-    // bits anyway).
+    // Same shape as `FingerprintValueTable::read_bits`: the loop guard keeps
+    // `filled < n_bits <= 64`, so the shift amount never reaches 64. The
+    // debug_assert catches an invariant break in test builds and compiles
+    // out of release — this runs `arity * bucket_size` times per decode.
     while filled < n_bits {
         let v = cells[cell_idx] as u64;
-        if filled < 64 {
-            acc |= v << filled;
-        }
+        debug_assert!(filled < 64, "shift amount must stay below 64");
+        acc |= v << filled;
         filled += pb;
         cell_idx += 1;
     }
@@ -490,15 +489,12 @@ fn slot_write_bits(cells: &mut [u32], bit_offset: u64, n_bits: u32, value: u64, 
         let n = hi - lo;
 
         let mask = (1u64 << n) - 1;
-        // `value_bit_pos` never actually reaches 64 while a cell still
-        // needs it (the loop consumes exactly `n_bits <= 64` total across
-        // all cells), but guard the shift explicitly rather than lean on
-        // that invariant.
-        let v_bits = if value_bit_pos < 64 {
-            ((value >> value_bit_pos) & mask) as u32
-        } else {
-            0
-        };
+        // The loop consumes exactly `n_bits <= 64` bits across all cells, so
+        // `value_bit_pos` is below 64 whenever a cell still needs bits; the
+        // debug_assert catches an invariant break in test builds and
+        // compiles out of release.
+        debug_assert!(value_bit_pos < 64, "shift amount must stay below 64");
+        let v_bits = ((value >> value_bit_pos) & mask) as u32;
         let placed = v_bits << lo;
         let cell_mask = (mask as u32) << lo;
 
