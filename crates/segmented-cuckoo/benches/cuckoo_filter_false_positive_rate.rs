@@ -3,7 +3,7 @@
 //! `arity · bucket_size / 2^fingerprint_bits`.
 //!
 //! **Method:** For each config, sweep `fingerprint_bits` from the minimum the
-//! geometry admits up to 32. At each width: insert until `TableFull`, then query
+//! geometry admits up to 64. At each width: insert until `TableFull`, then query
 //! `--num-queries` never-inserted keys and count how many the filter reports as
 //! present.
 //!
@@ -104,8 +104,10 @@ macro_rules! run_fpr {
                 }
 
                 let fpr_pct = false_positives as f64 / q as f64 * 100.0;
+                // `2f64.powi` rather than `1u64 << fp_bits`: the sweep now reaches
+                // fp_bits = 64, where the integer shift would overflow.
                 let theoretical_pct =
-                    cfg.arity as f64 * cfg.bucket_size as f64 / (1u64 << fp_bits) as f64 * 100.0;
+                    cfg.arity as f64 * cfg.bucket_size as f64 / 2f64.powi(fp_bits as i32) * 100.0;
 
                 writeln!(
                     $csv,
@@ -141,7 +143,7 @@ macro_rules! run_fpr {
 fn run_config(cli: &Cli, cfg: FilterConfig) {
     let widths: Vec<u32> = match cli.config.fingerprint_bits {
         Some(fb) => vec![fb],
-        None => (min_fingerprint_bits(cfg.arity, cfg.bucket_size)..=32).collect(),
+        None => (min_fingerprint_bits(cfg.arity, cfg.bucket_size)..=64).collect(),
     };
 
     let path = format!(

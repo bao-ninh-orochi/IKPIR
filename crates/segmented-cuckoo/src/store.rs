@@ -198,7 +198,7 @@ impl CuckooParams {
     /// # Complexity
     ///
     /// One xxh3 hash of `key` plus `O(arity)` index arithmetic.
-    pub fn candidate_buckets(&self, key: &[u8]) -> (u32, [u32; 4]) {
+    pub fn candidate_buckets(&self, key: &[u8]) -> (u64, [u32; 4]) {
         match self.scheme_kind {
             SchemeKind::Segmented2ary => Segmented2aryScheme {
                 segment_size: self.segment_size(),
@@ -240,9 +240,9 @@ pub struct SlotMutation {
     /// Slot index within the bucket.
     pub slot: u32,
     /// Fingerprint before mutation (`0` = slot was empty).
-    pub old_fingerprint: u32,
+    pub old_fingerprint: u64,
     /// Fingerprint after mutation (`0` = slot is now empty).
-    pub new_fingerprint: u32,
+    pub new_fingerprint: u64,
     /// Value cells before mutation (`value_size_in_cells()` elements).
     pub old_value_cells: Box<[u32]>,
     /// Value cells after mutation (`value_size_in_cells()` elements).
@@ -265,7 +265,7 @@ pub struct OccupiedSlot<'a> {
     pub slot: u32,
     /// Fingerprint stored in this slot (always non-zero — empty slots are
     /// skipped by the iterator).
-    pub fingerprint: u32,
+    pub fingerprint: u64,
     /// Raw `cells_per_slot` cells for this slot, borrowed from the store's
     /// cell array.
     ///
@@ -297,7 +297,7 @@ pub struct CuckooKVStore<S: IndexScheme> {
     num_items: u64,
     max_kicks: u32,
     /// Per-kick metadata reused across `insert` calls; capacity tracks `max_kicks`.
-    chain_meta: Vec<(u32, u32, u32)>,
+    chain_meta: Vec<(u32, u32, u64)>,
     /// Slab of `max_kicks * value_size_in_cells` u32 cells; kick k holds the original
     /// (evicted) value at the k-th kick, used for rollback.
     chain_values: Vec<u32>,
@@ -432,10 +432,10 @@ fn pack_value_bytes_to_cells(bytes: &[u8], cells: &mut [u32], value_bits: u32, p
 
 // ─── Public slot pack / unpack ───────────────────────────────────────────────
 
-/// Read up to 32 bits from a standalone cell slice at `bit_offset` using
+/// Read up to 64 bits from a standalone cell slice at `bit_offset` using
 /// `pb`-bit cells.
 #[inline]
-const fn slot_read_bits(cells: &[u32], bit_offset: u64, n_bits: u32, pb: u32) -> u32 {
+const fn slot_read_bits(cells: &[u32], bit_offset: u64, n_bits: u32, pb: u32) -> u64 {
     let pb64 = pb as u64;
     let mut cell_idx = (bit_offset / pb64) as usize;
     let intra_start = (bit_offset % pb64) as u32;
@@ -446,20 +446,28 @@ const fn slot_read_bits(cells: &[u32], bit_offset: u64, n_bits: u32, pb: u32) ->
     let mut filled = pb - intra_start;
     cell_idx += 1;
 
+    // Same shape as `FingerprintValueTable::read_bits`: guard the shift so
+    // it is never attempted at amount >= 64 (a cell landing there
+    // contributes nothing once the final mask below keeps only the low 64
+    // bits anyway).
     while filled < n_bits {
         let v = cells[cell_idx] as u64;
-        acc |= v << filled;
+        if filled < 64 {
+            acc |= v << filled;
+        }
         filled += pb;
         cell_idx += 1;
     }
 
-    (acc & ((1u64 << n_bits) - 1)) as u32
+    // `u64::MAX >> (64 - n_bits)` rather than `(1u64 << n_bits) - 1`: the
+    // latter overflows (shift amount 64) when n_bits == 64.
+    acc & (u64::MAX >> (64 - n_bits))
 }
 
 /// Write `n_bits` low bits of `value` into a standalone cell slice at
 /// `bit_offset`.
 #[inline]
-fn slot_write_bits(cells: &mut [u32], bit_offset: u64, n_bits: u32, value: u32, pb: u32) {
+fn slot_write_bits(cells: &mut [u32], bit_offset: u64, n_bits: u32, value: u64, pb: u32) {
     let pb64 = pb as u64;
     let first_cell = (bit_offset / pb64) as usize;
     let last_cell = ((bit_offset + n_bits as u64).div_ceil(pb64)) as usize;
@@ -481,10 +489,18 @@ fn slot_write_bits(cells: &mut [u32], bit_offset: u64, n_bits: u32, value: u32, 
         };
         let n = hi - lo;
 
-        let mask = ((1u64 << n) - 1) as u32;
-        let v_bits = (value >> value_bit_pos) & mask;
+        let mask = (1u64 << n) - 1;
+        // `value_bit_pos` never actually reaches 64 while a cell still
+        // needs it (the loop consumes exactly `n_bits <= 64` total across
+        // all cells), but guard the shift explicitly rather than lean on
+        // that invariant.
+        let v_bits = if value_bit_pos < 64 {
+            ((value >> value_bit_pos) & mask) as u32
+        } else {
+            0
+        };
         let placed = v_bits << lo;
-        let cell_mask = mask << lo;
+        let cell_mask = (mask as u32) << lo;
 
         cells[cell_idx] = (cells[cell_idx] & !cell_mask) | placed;
 
@@ -521,7 +537,7 @@ fn slot_write_bits(cells: &mut [u32], bit_offset: u64, n_bits: u32, value: u32, 
 /// `O(params.cells_per_slot())` cell writes.
 pub fn pack_slot_cells(
     params: &CuckooParams,
-    fingerprint: u32,
+    fingerprint: u64,
     value_cells: &[u32],
     out: &mut [u32],
 ) {
@@ -543,7 +559,7 @@ pub fn pack_slot_cells(
         let n = (params.value_bits - i as u32 * pb).min(pb);
         let mask = ((1u64 << n) - 1) as u32;
         let masked = value_cells[i] & mask;
-        slot_write_bits(out, off0 + (i as u64) * pb as u64, n, masked, pb);
+        slot_write_bits(out, off0 + (i as u64) * pb as u64, n, masked as u64, pb);
     }
 }
 
@@ -566,7 +582,7 @@ pub fn pack_slot_cells(
 /// # Complexity
 ///
 /// `O(params.cells_per_slot())` cell reads.
-pub fn unpack_slot_cells(params: &CuckooParams, slot_cells: &[u32]) -> (u32, Vec<u8>) {
+pub fn unpack_slot_cells(params: &CuckooParams, slot_cells: &[u32]) -> (u64, Vec<u8>) {
     let pb = params.plaintext_bits;
     let fp_bits = params.fingerprint_bits;
     let vb = params.value_bits;
@@ -585,7 +601,7 @@ pub fn unpack_slot_cells(params: &CuckooParams, slot_cells: &[u32]) -> (u32, Vec
         let n = (vb - ci as u32 * pb).min(pb);
         let bit_off = val_start_bit + ci as u64 * pb as u64;
         let c = slot_read_bits(slot_cells, bit_off, n, pb);
-        acc |= (c as u64) << bits_in_acc;
+        acc |= c << bits_in_acc;
         bits_in_acc += n;
         while bits_in_acc >= 8 && byte_off < vbytes {
             out[byte_off] = acc as u8;
@@ -618,7 +634,7 @@ impl CuckooKVStore<Segmented2aryScheme> {
     /// - `num_buckets`      — total number of buckets. Must be a power of 2 and ≥ 2.
     /// - `bucket_size`      — slots per bucket. Must be in `1..=4`.
     /// - `fingerprint_bits` — fingerprint bit width. Must be in
-    ///   `[⌊log2(2·bucket_size)⌋+1, 32]`.
+    ///   `[⌊log2(2·bucket_size)⌋+1, 64]`.
     /// - `value_bits`       — value bit width. Must be ≥ 1.
     /// - `plaintext_bits`   — PIR plaintext cell width (1–32). Recommended
     ///   `8` for byte-typed values (byte↔cell becomes a no-op when
@@ -766,7 +782,7 @@ impl CuckooKVStore<Segmented3aryScheme> {
     ///   `t ≥ 0` (so each of the 3 segments is a power of 2).
     /// - `bucket_size`      — slots per bucket. Must be in `1..=4`.
     /// - `fingerprint_bits` — fingerprint bit width. Must be in
-    ///   `[⌊log2(3·bucket_size)⌋+1, 32]`.
+    ///   `[⌊log2(3·bucket_size)⌋+1, 64]`.
     /// - `value_bits`       — value bit width. Must be ≥ 1.
     /// - `plaintext_bits`   — PIR plaintext cell width (1–32).
     ///
@@ -886,7 +902,7 @@ impl CuckooKVStore<Segmented4aryScheme> {
     ///   (so each of the 4 segments is a power of 2).
     /// - `bucket_size`      — slots per bucket. Must be in `1..=4`.
     /// - `fingerprint_bits` — fingerprint bit width. Must be in
-    ///   `[⌊log2(4·bucket_size)⌋+1, 32]`.
+    ///   `[⌊log2(4·bucket_size)⌋+1, 64]`.
     /// - `value_bits`       — value bit width. Must be ≥ 1.
     /// - `plaintext_bits`   — PIR plaintext cell width (1–32).
     ///
@@ -2854,12 +2870,12 @@ mod tests {
             let value_bytes = make_masked_value(value_bits, 0x5A);
             let value_cells = value_cells_for(&params, &value_bytes);
 
-            let fp_mask = if fp_bits < 32 {
-                (1u32 << fp_bits) - 1
+            let fp_mask: u64 = if fp_bits >= 64 {
+                u64::MAX
             } else {
-                u32::MAX
+                (1u64 << fp_bits) - 1
             };
-            let fp = (0xDEAD_BEEFu32 & fp_mask).max(1);
+            let fp = (0xDEAD_BEEFu64 & fp_mask).max(1);
 
             let mut packed = vec![0u32; params.cells_per_slot() as usize];
             pack_slot_cells(&params, fp, &value_cells, &mut packed);

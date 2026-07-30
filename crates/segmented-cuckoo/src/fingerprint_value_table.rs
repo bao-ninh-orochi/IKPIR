@@ -63,7 +63,7 @@ pub struct FingerprintValueTable {
     num_buckets: u32,
     /// Slots per bucket.
     bucket_size: u32,
-    /// Bit width of each fingerprint (1–32).
+    /// Bit width of each fingerprint (1–64).
     fingerprint_bits: u32,
     /// Bit width of each value (≥ 1).
     value_bits: u32,
@@ -93,7 +93,7 @@ impl FingerprintValueTable {
     ///
     /// # Constraints
     ///
-    /// - `fingerprint_bits` must be in `1..=32`.
+    /// - `fingerprint_bits` must be in `1..=64`.
     /// - `value_bits` must be ≥ 1.
     /// - `plaintext_bits` must be in `1..=32`.
     /// - `num_buckets · bucket_size · cells_per_slot` must fit in `usize`.
@@ -114,8 +114,8 @@ impl FingerprintValueTable {
         plaintext_bits: u32,
     ) -> Self {
         assert!(
-            (1..=32).contains(&fingerprint_bits),
-            "fingerprint_bits must be in 1..=32, got {fingerprint_bits}"
+            (1..=64).contains(&fingerprint_bits),
+            "fingerprint_bits must be in 1..=64, got {fingerprint_bits}"
         );
         assert!(value_bits >= 1, "value_bits must be >= 1, got {value_bits}");
         assert!(
@@ -156,7 +156,7 @@ impl FingerprintValueTable {
         self.bucket_size
     }
 
-    /// Bit width of each fingerprint (1–32).
+    /// Bit width of each fingerprint (1–64).
     #[inline]
     pub(crate) const fn fingerprint_bits(&self) -> u32 {
         self.fingerprint_bits
@@ -243,12 +243,12 @@ impl FingerprintValueTable {
         );
     }
 
-    /// Read up to 32 bits from the cell stream starting at `bit_offset`.
+    /// Read up to 64 bits from the cell stream starting at `bit_offset`.
     ///
-    /// `n_bits` must be in `1..=32`. Reads at most
+    /// `n_bits` must be in `1..=64`. Reads at most
     /// `⌈n_bits / plaintext_bits⌉ + 1` cells.
     #[inline]
-    fn read_bits(&self, bit_offset: u64, n_bits: u32) -> u32 {
+    fn read_bits(&self, bit_offset: u64, n_bits: u32) -> u64 {
         let pb = self.plaintext_bits as u64;
         let mut cell_idx = bit_offset / pb;
         let intra_start = (bit_offset % pb) as u32;
@@ -262,24 +262,33 @@ impl FingerprintValueTable {
         let mut filled = pb32 - intra_start;
         cell_idx += 1;
 
-        // Load subsequent cells until we have n_bits.
+        // Load subsequent cells until we have n_bits. `filled` is always
+        // < n_bits <= 64 here (the loop guard already ensures it), so the
+        // shift below never reaches amount 64 — but a cell landing exactly
+        // at bit 64 would contribute nothing anyway, since the final mask
+        // keeps only the low 64 bits of `acc`; the guard makes that
+        // explicit rather than relying on the invariant alone.
         while filled < n_bits {
             let v = self.cells[cell_idx as usize] as u64;
-            acc |= v << filled;
+            if filled < 64 {
+                acc |= v << filled;
+            }
             filled += pb32;
             cell_idx += 1;
         }
 
-        (acc & ((1u64 << n_bits) - 1)) as u32
+        // `u64::MAX >> (64 - n_bits)` rather than `(1u64 << n_bits) - 1`: the
+        // latter overflows (shift amount 64) when n_bits == 64.
+        acc & (u64::MAX >> (64 - n_bits))
     }
 
     /// Write `n_bits` low bits of `value` into the cell stream at `bit_offset`.
     ///
-    /// `n_bits` must be in `1..=32`. Preserves bits outside
+    /// `n_bits` must be in `1..=64`. Preserves bits outside
     /// `[bit_offset, bit_offset + n_bits)`. High `(32 − plaintext_bits)` bits
     /// of touched cells remain zero.
     #[inline]
-    fn write_bits(&mut self, bit_offset: u64, n_bits: u32, value: u32) {
+    fn write_bits(&mut self, bit_offset: u64, n_bits: u32, value: u64) {
         let pb = self.plaintext_bits as u64;
         let first_cell = bit_offset / pb;
         // Exclusive end cell index (ceiling division).
@@ -303,10 +312,18 @@ impl FingerprintValueTable {
             };
             let n = hi - lo;
 
-            let mask = ((1u64 << n) - 1) as u32;
-            let v_bits = (value >> value_bit_pos) & mask;
+            let mask = (1u64 << n) - 1;
+            // `value_bit_pos` never actually reaches 64 while a cell still
+            // needs it (the loop consumes exactly `n_bits <= 64` total
+            // across all cells), but guard the shift explicitly rather
+            // than lean on that invariant.
+            let v_bits = if value_bit_pos < 64 {
+                ((value >> value_bit_pos) & mask) as u32
+            } else {
+                0
+            };
             let placed = v_bits << lo;
-            let cell_mask = mask << lo;
+            let cell_mask = (mask as u32) << lo;
 
             let idx = cell_idx as usize;
             self.cells[idx] = (self.cells[idx] & !cell_mask) | placed;
@@ -352,7 +369,7 @@ impl FingerprintValueTable {
     /// # Complexity
     ///
     /// `O(⌈fingerprint_bits / plaintext_bits⌉)` cell reads.
-    pub(crate) fn read_fingerprint(&self, bucket: u32, slot: u32) -> u32 {
+    pub(crate) fn read_fingerprint(&self, bucket: u32, slot: u32) -> u64 {
         self.assert_in_range(bucket, slot);
         self.read_bits(self.slot_bit_offset(bucket, slot), self.fingerprint_bits)
     }
@@ -373,7 +390,7 @@ impl FingerprintValueTable {
     /// # Complexity
     ///
     /// `O(⌈fingerprint_bits / plaintext_bits⌉)` cell read-modify-writes.
-    pub(crate) fn write_fingerprint(&mut self, bucket: u32, slot: u32, fp: u32) {
+    pub(crate) fn write_fingerprint(&mut self, bucket: u32, slot: u32, fp: u64) {
         self.assert_in_range(bucket, slot);
         self.write_bits(
             self.slot_bit_offset(bucket, slot),
@@ -416,7 +433,10 @@ impl FingerprintValueTable {
         let off0 = self.slot_bit_offset(bucket, slot) + self.fingerprint_bits as u64;
         for i in 0..n_cells {
             let n = (self.value_bits - i * pb).min(pb);
-            out[i as usize] = self.read_bits(off0 + (i as u64) * pb as u64, n);
+            // Value cells are always <= plaintext_bits (<= 32) wide, so the
+            // truncation to u32 is lossless — only fingerprint reads use the
+            // full u64 range `read_bits` now supports.
+            out[i as usize] = self.read_bits(off0 + (i as u64) * pb as u64, n) as u32;
         }
     }
 
@@ -454,7 +474,7 @@ impl FingerprintValueTable {
             // Mask stray high bits defensively.
             let mask_n = ((1u64 << n) - 1) as u32;
             let masked = value[i as usize] & mask_n;
-            self.write_bits(off0 + (i as u64) * pb as u64, n, masked);
+            self.write_bits(off0 + (i as u64) * pb as u64, n, masked as u64);
         }
     }
 
@@ -486,7 +506,7 @@ impl FingerprintValueTable {
     /// # Complexity
     ///
     /// `O(cells_per_slot)` cell read-modify-writes.
-    pub(crate) fn write(&mut self, bucket: u32, slot: u32, fp: u32, value: &[u32]) {
+    pub(crate) fn write(&mut self, bucket: u32, slot: u32, fp: u64, value: &[u32]) {
         self.write_fingerprint(bucket, slot, fp);
         self.write_value(bucket, slot, value);
     }
@@ -511,7 +531,7 @@ impl FingerprintValueTable {
     /// # Complexity
     ///
     /// `O(bucket_size · ⌈fingerprint_bits / plaintext_bits⌉)` cell reads.
-    pub(crate) fn contain(&self, bucket: u32, fp: u32) -> bool {
+    pub(crate) fn contain(&self, bucket: u32, fp: u64) -> bool {
         (0..self.bucket_size).any(|s| self.read_fingerprint(bucket, s) == fp)
     }
 
@@ -534,7 +554,7 @@ impl FingerprintValueTable {
     ///
     /// `O(bucket_size · ⌈fingerprint_bits / plaintext_bits⌉)` worst case;
     /// short-circuits on first match.
-    pub(crate) fn find(&self, bucket: u32, fp: u32) -> Option<u32> {
+    pub(crate) fn find(&self, bucket: u32, fp: u64) -> Option<u32> {
         (0..self.bucket_size).find(|&s| self.read_fingerprint(bucket, s) == fp)
     }
 
@@ -566,7 +586,7 @@ impl FingerprintValueTable {
     ///
     /// `O(bucket_size + cells_per_slot)` — scan for empty slot, then one
     /// `write`.
-    pub(crate) fn insert(&mut self, bucket: u32, fp: u32, value: &[u32]) -> Option<u32> {
+    pub(crate) fn insert(&mut self, bucket: u32, fp: u64, value: &[u32]) -> Option<u32> {
         assert!(fp != 0, "fingerprint cannot be zero");
         assert_eq!(
             value.len(),
@@ -608,7 +628,7 @@ impl FingerprintValueTable {
     ///
     /// `O(bucket_size + cells_per_slot)` on hit, `O(bucket_size)` on miss.
     #[allow(dead_code)]
-    pub(crate) fn delete(&mut self, bucket: u32, fp: u32) -> bool {
+    pub(crate) fn delete(&mut self, bucket: u32, fp: u64) -> bool {
         assert!(fp != 0, "fingerprint cannot be zero");
         for s in 0..self.bucket_size {
             if self.read_fingerprint(bucket, s) == fp {
@@ -727,7 +747,8 @@ impl FingerprintValueTable {
         for (i, c) in out.iter_mut().enumerate() {
             let ci = cell_start + i;
             let n = (self.value_bits - ci as u32 * pb).min(pb);
-            *c = self.read_bits(off0 + ci as u64 * pb as u64, n);
+            // Value cells are always <= plaintext_bits (<= 32) wide.
+            *c = self.read_bits(off0 + ci as u64 * pb as u64, n) as u32;
         }
     }
 
@@ -787,7 +808,7 @@ impl FingerprintValueTable {
     /// `O(bucket_size + value_size_in_cells())` on hit, `O(bucket_size)` on
     /// miss.
     #[allow(dead_code)]
-    pub(crate) fn update_value(&mut self, bucket: u32, fp: u32, new_value: &[u32]) -> bool {
+    pub(crate) fn update_value(&mut self, bucket: u32, fp: u64, new_value: &[u32]) -> bool {
         assert_eq!(
             new_value.len(),
             self.value_size_in_cells() as usize,
@@ -833,12 +854,18 @@ mod tests {
         let mut fvt = make_fvt(nb, bs, fp_bits, vb, pb);
         let vcells = fvt.value_size_in_cells() as usize;
 
-        let fp_mask = ((1u64 << fp_bits) - 1) as u32;
+        // `u64` throughout (not `(1u64 << fp_bits) as u32`): fp_bits now
+        // ranges up to 64, where `1u64 << 64` would overflow.
+        let fp_mask: u64 = if fp_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << fp_bits) - 1
+        };
         let cell_mask = if pb >= 32 { u32::MAX } else { (1u32 << pb) - 1 };
 
         for b in 0..nb {
             for s in 0..bs {
-                let fp = ((b * bs + s + 1) & fp_mask).max(1);
+                let fp = (u64::from(b * bs + s + 1) & fp_mask).max(1);
                 let value: Vec<u32> = (0..vcells)
                     .map(|i| ((b * 7 + s * 3 + i as u32 + 1) & cell_mask))
                     .collect();
@@ -889,6 +916,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `fingerprint_bits = 64` with `plaintext_bits = 8`: the fingerprint
+    /// alone occupies `⌈(64+8)/8⌉ = 9` cells — the widened "9-cell
+    /// straddle" case `roundtrip_param` is already generic enough to cover.
+    #[test]
+    fn roundtrip_fp64_pb8_nine_cell_straddle() {
+        roundtrip_param(8, 64, 8);
+    }
+
+    /// `fingerprint_bits = 33` — one bit past the old 32-bit cap.
+    #[test]
+    fn roundtrip_fp33() {
+        roundtrip_param(8, 33, 8);
+    }
+
+    /// `fingerprint_bits = 64`, fingerprint value = all-ones (`u64::MAX`):
+    /// exercises the exact top-of-range mask with no truncation.
+    #[test]
+    fn fp64_all_ones_value_roundtrips() {
+        let mut fvt = make_fvt(4, 4, 64, 8, 8);
+        let value = [0x11u32];
+        fvt.write(0, 0, u64::MAX, &value);
+        assert_eq!(fvt.read_fingerprint(0, 0), u64::MAX);
+    }
+
+    /// Even at `fingerprint_bits = 64`, an empty slot still reads back
+    /// exactly `0` and stays distinguishable from every non-zero
+    /// fingerprint — including the all-ones one — across an insert/delete
+    /// cycle.
+    #[test]
+    fn empty_slot_still_distinguishable_at_f64() {
+        let mut fvt = make_fvt(4, 4, 64, 8, 8);
+        assert_eq!(fvt.read_fingerprint(0, 0), 0);
+        let value = [0x22u32];
+        assert_eq!(fvt.insert(0, u64::MAX, &value), Some(0));
+        assert_eq!(fvt.read_fingerprint(0, 0), u64::MAX);
+        assert!(fvt.delete(0, u64::MAX));
+        assert_eq!(fvt.read_fingerprint(0, 0), 0);
     }
 
     /// A freshly constructed table has all slots empty (`fingerprint == 0`).
@@ -965,7 +1031,7 @@ mod tests {
         let hi_mask = !((1u32 << pb) - 1);
         for b in 0..8u32 {
             for s in 0..4u32 {
-                let fp = (b * 4 + s + 1) % ((1 << 12) - 1) + 1;
+                let fp = u64::from((b * 4 + s + 1) % ((1 << 12) - 1) + 1);
                 let value: Vec<u32> = (0..vcells)
                     .map(|i| (i as u32 * 13 + 7) & ((1 << pb) - 1))
                     .collect();
