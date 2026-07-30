@@ -664,14 +664,15 @@ impl FingerprintValueTable {
     ///
     /// # Constraints
     ///
-    /// Validates `cells.len()` and the high-bits-zero invariant
+    /// Validates `fingerprint_bits ∈ 1..=64`, `cells.len()`, and the
+    /// high-bits-zero invariant
     /// (`cell & ~((1 << plaintext_bits) - 1) == 0`) on every cell. Cheap
     /// integrity guard against a corrupt or wrong-shape snapshot.
     ///
     /// # Returns
     ///
-    /// `Ok(table)` on success, `Err(&'static str)` on length mismatch or
-    /// invariant violation.
+    /// `Ok(table)` on success, `Err(&'static str)` on a width out of range,
+    /// length mismatch, or invariant violation.
     ///
     /// # Complexity
     ///
@@ -685,6 +686,9 @@ impl FingerprintValueTable {
         value_bits: u32,
         plaintext_bits: u32,
     ) -> Result<Self, &'static str> {
+        if !(1..=64).contains(&fingerprint_bits) {
+            return Err("fingerprint_bits must be in 1..=64");
+        }
         let entry_bits = fingerprint_bits + value_bits;
         let cells_per_slot = entry_bits.div_ceil(plaintext_bits);
         let expected = (num_buckets as u64)

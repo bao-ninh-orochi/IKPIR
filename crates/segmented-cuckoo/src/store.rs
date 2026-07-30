@@ -2816,7 +2816,7 @@ mod tests {
     const CELL_LAYOUT_GRID: &[(u32, u32, u32)] = &{
         // Kept as an explicit cross-product so a failure names its own triple.
         const PB: [u32; 6] = [1, 7, 8, 9, 12, 32];
-        const FP: [u32; 4] = [5, 12, 17, 32];
+        const FP: [u32; 7] = [5, 12, 17, 32, 33, 40, 64];
         const VB: [u32; 6] = [1, 8, 13, 64, 100, 1024];
         let mut out = [(0u32, 0u32, 0u32); PB.len() * FP.len() * VB.len()];
         let mut i = 0;
@@ -2875,7 +2875,10 @@ mod tests {
             } else {
                 (1u64 << fp_bits) - 1
             };
-            let fp = (0xDEAD_BEEFu64 & fp_mask).max(1);
+            // 64-bit seed so the masked fingerprint has bits above 31 set
+            // whenever fp_bits > 32 — a 32-bit seed would leave the widened
+            // rows of the grid exercising only narrow values.
+            let fp = (0xDEAD_BEEF_CAFE_F00Du64 & fp_mask).max(1);
 
             let mut packed = vec![0u32; params.cells_per_slot() as usize];
             pack_slot_cells(&params, fp, &value_cells, &mut packed);
