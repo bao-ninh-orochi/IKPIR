@@ -34,7 +34,7 @@ Two filter families plus a KV-store layer. No PIR, crypto, or network I/O
 Five `cuckoo_filter_*` benches (load factor, insert/lookup/delete throughput,
 false-positive rate) and three `kv_store_*` benches. Every flag is optional;
 with none, each bench runs the paper's Table 2 matrix — the five
-`(arity, bucket_size)` pairs at `fingerprint_bits = 32`, `max_kicks = 2500`, and
+`(arity, bucket_size)` pairs at `fingerprint_bits = 64`, `max_kicks = 2500`, and
 ~10^6 buckets. `../../scripts/table2.sh` is the entry point that reproduces the
 table; `../../scripts/bench.sh <name> [flags]` runs one bench.
 

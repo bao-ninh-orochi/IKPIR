@@ -20,7 +20,7 @@
 //! width suffices, which is why this bench has no `--trials` loop.
 //!
 //! Unlike the other filter benches, this one *sweeps* `--fingerprint-bits`
-//! rather than fixing it at the default 32 — that axis is the independent
+//! rather than fixing it at the default 64 — that axis is the independent
 //! variable here. Passing `--fingerprint-bits N` narrows the sweep to the single
 //! width `N`.
 //!

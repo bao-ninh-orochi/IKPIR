@@ -216,7 +216,7 @@ Defaults, and the reasoning behind them, live in one place —
 
 | Parameter | Default | Why |
 |---|---|---|
-| `fingerprint_bits` | **32** | Drives FPR to `k·b / 2^f` (`k·b / 2^32` at the default); a false positive never perturbs a load-factor or throughput measurement, so the numbers isolate the indexing scheme. `f` up to 64 is supported (the default stays 32) |
+| `fingerprint_bits` | **64** | Drives FPR to `k·b / 2^f` (`k·b / 2^64` at the default, the widest the slot layout admits); a false positive never perturbs a load-factor or throughput measurement, so the numbers isolate the indexing scheme |
 | `max_kicks` | **2500** | High enough that measured load factor reflects the scheme rather than the kick budget; a small budget caps it well below the true threshold at ~10^6 buckets |
 | `num_buckets` | **~10^6** | Per arity, below |
 | trials | 10 (20 for load factor) | Load factor reports one headline number per config, so it buys a tighter error bar |
@@ -286,7 +286,7 @@ The filter / KV-store properties also have fast unit-test coverage:
 ## Results
 
 Reproduce with `./scripts/table2.sh`. This is Table 2 of the CANS 2026 paper,
-measured on an Apple M1 MacBook Pro with 16 GiB of memory, 32-bit fingerprint,
+measured on an Apple M1 MacBook Pro with 16 GiB of memory, 64-bit fingerprint,
 each filter filled to capacity. **Theory** is the k-partite information-theoretic
 threshold, from Walzer's tabulation of Dietzfelbinger et al. 2010 and Sanders &
 Walzer 2022. Bold marks the better filter on each metric.

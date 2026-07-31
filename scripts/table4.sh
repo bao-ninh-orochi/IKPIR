@@ -12,7 +12,8 @@
 # Five (arity, bucket_size) cells × 2 value widths × 2 backends = 20 configs, 2
 # benches each. Every cell's n_b comes from `paper_num_buckets`; the arity-2/4
 # cells share N = 2^20 slots, and arity 3 lands on its own ladder (1 572 864 for
-# (3,2), 1 179 648 for (3,3)) — see lib.sh for why it cannot reach 2^20.
+# (3,2), 1 179 648 for (3,3)) — see lib.sh for why it cannot reach 2^20. Every
+# run is at fingerprint_bits = 64, the paper's width (bench.sh's default).
 #
 # Each bench seeds to fill 0.90, applies one batch of τ = 1% of the table's
 # slots per (kind, patch mode) pair, and divides the batch by the measured time.

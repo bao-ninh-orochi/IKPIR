@@ -102,7 +102,7 @@ Hao 2025).
 (`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,
 `false_positive_rate`) and three `kv_store_*`. They are `clap`-parsed too, but
 every flag is optional: with none, each runs the paper's **Table 2** matrix — the
-five `(arity, bucket_size)` pairs at `fingerprint_bits = 32`, `max_kicks = 2500`,
+five `(arity, bucket_size)` pairs at `fingerprint_bits = 64`, `max_kicks = 2500`,
 ~10^6 buckets. That matrix and every default live in
 `crates/segmented-cuckoo/benches/configs.rs`, the single source of truth;
 `--arity` / `--bucket-size` narrow it, other flags override one axis.
@@ -128,14 +128,26 @@ correctness/property check. Shared derivation (pb/lwe, the bench→crate map) an
 `configs.rs`, and the single source of truth for what `table{3,4,5}.sh` sweep.
 
 `plaintext_bits` is **not fixed across configs**. For each
-`(backend, SCF geometry, value_bits)` triple, `bench.sh` picks the maximum `pb`
-whose correctness bound holds at `q = 2^32`, evaluated at the **per-segment**
-matrix each backend actually multiplies — FrodoPIR paper Eq. 8 (`q ≥ 8·p²·√m`
-with `m = num_buckets / arity`), SimplePIR paper Theorem C.1 adjusted for
-uncentered cells and the near-square reshape (`q/p ≥ 2√2·σ·√ln(2/δ)·p·√R`,
-σ = 6.4, δ = 2⁻⁴⁰, `R` = reshape row count, which depends on `value_bits`). The
-single source of truth is `ikpir_common::pir_params` (full derivation in its
-module docs); `scripts/lib.sh::backend_plaintext_bits` shells out to the
+`(backend, SCF geometry, value_bits)` quadruple, `bench.sh` picks the maximum
+`pb` whose correctness bound holds at `q = 2^32`, evaluated at the
+**per-segment** matrix each backend actually multiplies. Both selectors target
+an explicit **per-cell** decode-failure budget
+`δ_cell ≤ 2⁻⁽ᵏᵃᵖᵖᵃ⁺¹⁾ / (arity · row_width)` — half the paper's overall
+`κ = 40` correctness target (Lemma 2, corrected: `δ, ξ ≤ κ`'s index term gets
+half the budget in log-space, union-bounded over the `row_width` cells each of
+the `arity` per-segment reads returns; the filter term is negligible at the
+shipped `fingerprint_bits = 64` and is not this bound's concern). FrodoPIR
+evaluates its uniform-ternary error's exact Bernstein tail against `δ_cell`
+(replacing the old paper Eq. 8, `q ≥ 8·p²·√m`, whose implicit "w.h.p." constant
+was far too weak for a `κ = 40` target); SimplePIR retargets its Theorem C.1
+bound — adjusted for uncentered cells and the near-square reshape,
+`q/p ≥ 2√2·σ·√ln(2/δ_cell)·p·√R` (σ = 6.4, `R` = reshape row count) — from a
+fixed `δ = 2⁻⁴⁰` to the same per-config `δ_cell`. Both backends now depend on
+the full per-segment geometry, including `fingerprint_bits`, not only
+`segment_rows` (FrodoPIR) or `(segment_rows, value_bits)` (SimplePIR). The
+single source of truth is `ikpir_common::pir_params` (full derivation,
+including the History note on why Eq. 8 was replaced, in its module docs);
+`scripts/lib.sh::backend_plaintext_bits` shells out to the
 `max_plaintext_bits` example and passes the result as `--plaintext-bits`. Each
 CSV row carries its `plaintext_bits`. The `#[ignore]`d `noise_margin` tests in
 `ikpir-common` (`cargo test -p ikpir-common --release -- --ignored
