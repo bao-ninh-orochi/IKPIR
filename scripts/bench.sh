@@ -18,6 +18,7 @@
 #                          The paper reports these two widths. 256 (= 32B) still
 #                          runs if you pass it; it is just not a paper config.
 #     --backend B          frodo | simple                    (default frodo)
+#     --fingerprint-bits N (default 64; the paper's width)
 #     --plaintext-bits N                    (default: max the backend admits)
 #     --lwe-dim N                           (default: 1566 frodo / 1275 simple)
 #   server_setup and the mutation benches also take:
@@ -40,8 +41,8 @@
 #     --patch-mode M       entry | row | entry,row           (default entry,row)
 #   Head-to-head benches also take:
 #     --num-keys N         (default: ~90% of capacity)
-#   Any other flag (--batch, --fingerprint-bits, --trials, --warmup, …) is
-#   forwarded to the bench unchanged.
+#   Any other flag (--batch, --trials, --warmup, …) is forwarded to the bench
+#   unchanged.
 #
 # Geometry defaults here are DEV SCALE (~2^16 slots), not the paper's. This is
 # the everyday one-config runner; the paper's matrix lives in scripts/lib.sh and
@@ -58,7 +59,7 @@
 #     --arity N            2 | 3 | 4          (default: every arity in the matrix)
 #     --bucket-size N      1..4               (default: every size in the matrix)
 #     --num-buckets N                         (default: per-arity, per Table 2)
-#     --fingerprint-bits N                    (default 32)
+#     --fingerprint-bits N                    (default 64)
 #     --max-kicks N                           (default 2500)
 #     --warmup N / --trials N   (default 3 / 10; load_factor defaults to 20 trials)
 #   Filter-bench extras:  --hit-rate (lookup), --num-queries (false_positive_rate)
@@ -114,23 +115,24 @@ if [[ "$CRATE" == segmented-cuckoo ]]; then
 fi
 
 # ── PIR bench: managed single-config surface ─────────────────────────────────
-ARITY=""; NUM_BUCKETS=""; BUCKET_SIZE=""; VALUE_BITS=""; BACKEND=""
+ARITY=""; NUM_BUCKETS=""; BUCKET_SIZE=""; VALUE_BITS=""; BACKEND=""; FINGERPRINT_BITS=""
 PB=""; LWE=""; NUM_KEYS=""; N_MUT=""; LOAD_FACTOR=""; PATCH_MODE=""
 EXTRA=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --arity)          ARITY=$2;       shift 2 ;;
-        --num-buckets)    NUM_BUCKETS=$2; shift 2 ;;
-        --bucket-size)    BUCKET_SIZE=$2; shift 2 ;;
-        --value-bits)     VALUE_BITS=$2;  shift 2 ;;
-        --backend)        BACKEND=$2;     shift 2 ;;
-        --plaintext-bits) PB=$2;          shift 2 ;;
-        --lwe-dim)        LWE=$2;         shift 2 ;;
-        --num-keys)       NUM_KEYS=$2;    shift 2 ;;
-        --n-mutations)    N_MUT=$2;       shift 2 ;;
-        --load-factor)    LOAD_FACTOR=$2; shift 2 ;;
-        --patch-mode)     PATCH_MODE=$2;  shift 2 ;;
-        *)                EXTRA+=("$1");  shift ;;
+        --arity)             ARITY=$2;            shift 2 ;;
+        --num-buckets)       NUM_BUCKETS=$2;       shift 2 ;;
+        --bucket-size)       BUCKET_SIZE=$2;       shift 2 ;;
+        --value-bits)        VALUE_BITS=$2;        shift 2 ;;
+        --backend)           BACKEND=$2;           shift 2 ;;
+        --fingerprint-bits)  FINGERPRINT_BITS=$2;  shift 2 ;;
+        --plaintext-bits)    PB=$2;                shift 2 ;;
+        --lwe-dim)           LWE=$2;               shift 2 ;;
+        --num-keys)          NUM_KEYS=$2;          shift 2 ;;
+        --n-mutations)       N_MUT=$2;             shift 2 ;;
+        --load-factor)       LOAD_FACTOR=$2;       shift 2 ;;
+        --patch-mode)        PATCH_MODE=$2;        shift 2 ;;
+        *)                   EXTRA+=("$1");        shift ;;
     esac
 done
 
@@ -139,14 +141,20 @@ BUCKET_SIZE=${BUCKET_SIZE:-4}
 VALUE_BITS=${VALUE_BITS:-2048}
 BACKEND=${BACKEND:-frodo}
 validate_backend "$BACKEND"
+# 64 = the paper's fingerprint width (see crate CLAUDE.md / README notation
+# tables). Both backends' plaintext-bits selector needs this explicitly now
+# (see backend_plaintext_bits below) — it is no longer frodo-ignorable.
+FINGERPRINT_BITS=${FINGERPRINT_BITS:-64}
 NUM_BUCKETS=${NUM_BUCKETS:-$(default_num_buckets "$ARITY")}
 [[ -n "$LWE" ]] || LWE=$(backend_lwe_dim "$BACKEND")
 if [[ -z "$PB" ]]; then
-    PB=$(backend_plaintext_bits "$BACKEND" "$ARITY" "$BUCKET_SIZE" "$NUM_BUCKETS" "$VALUE_BITS") || exit 1
+    PB=$(backend_plaintext_bits "$BACKEND" "$ARITY" "$BUCKET_SIZE" "$NUM_BUCKETS" \
+             "$VALUE_BITS" "$FINGERPRINT_BITS") || exit 1
 fi
 
 ARGS=(--arity "$ARITY" --num-buckets "$NUM_BUCKETS" --bucket-size "$BUCKET_SIZE"
-      --value-bits "$VALUE_BITS" --backend "$BACKEND" --plaintext-bits "$PB" --lwe-dim "$LWE")
+      --value-bits "$VALUE_BITS" --backend "$BACKEND" --fingerprint-bits "$FINGERPRINT_BITS"
+      --plaintext-bits "$PB" --lwe-dim "$LWE")
 
 # A flag that does not apply to this bench is parsed above but never forwarded.
 # Say so: silently dropping it would run a config the caller did not ask for.
@@ -178,6 +186,6 @@ fi
 
 ARGS+=("${EXTRA[@]+"${EXTRA[@]}"}")
 
-log "$BENCH  (crate=$CRATE backend=$BACKEND arity=$ARITY nb=$NUM_BUCKETS bs=$BUCKET_SIZE vb=$VALUE_BITS pb=$PB lwe=$LWE)"
+log "$BENCH  (crate=$CRATE backend=$BACKEND arity=$ARITY nb=$NUM_BUCKETS bs=$BUCKET_SIZE vb=$VALUE_BITS fb=$FINGERPRINT_BITS pb=$PB lwe=$LWE)"
 cargo bench -p "$CRATE" --bench "$BENCH" -- "${ARGS[@]}"
 ok "CSV(s) under $REL_DIR/"
