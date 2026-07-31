@@ -128,7 +128,7 @@ pub use store::{
 ///
 /// - `num_buckets` must be a power of 2 and ≥ 2.
 /// - `bucket_size` (fingerprints per bucket) must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 64]`.
 ///
 /// # Examples
 ///
@@ -151,7 +151,7 @@ pub type Segmented2aryCuckooFilter = CuckooFilter<Segmented2aryScheme>;
 ///
 /// - `num_buckets` must equal `3 · 2^t` for some `t ≥ 0` (`num_buckets/3` must be a power of 2).
 /// - `bucket_size` must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 64]`.
 ///
 /// # Examples
 ///
@@ -175,7 +175,7 @@ pub type Segmented3aryCuckooFilter = CuckooFilter<Segmented3aryScheme>;
 ///
 /// - `num_buckets` must be a power of 2 and ≥ 4 (ensures each segment is also a power of 2).
 /// - `bucket_size` must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 64]`.
 ///
 /// # Examples
 ///
@@ -202,7 +202,7 @@ pub type Segmented4aryCuckooFilter = CuckooFilter<Segmented4aryScheme>;
 ///
 /// - `num_buckets` must be a power of 2 and ≥ 1.
 /// - `bucket_size` (fingerprints per bucket) must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 64]`.
 ///
 /// # Examples
 ///
@@ -225,7 +225,7 @@ pub type Standard2aryCuckooFilter = CuckooFilter<Standard2aryScheme>;
 ///
 /// - `num_buckets` must be a power of 3 (`3^t`) and ≥ 1.
 /// - `bucket_size` must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 64]`.
 ///
 /// # Examples
 ///
@@ -248,7 +248,7 @@ pub type Standard3aryCuckooFilter = CuckooFilter<Standard3aryScheme>;
 ///
 /// - `num_buckets` must be a power of 4 (`4^t`) and ≥ 1.
 /// - `bucket_size` must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 64]`.
 ///
 /// # Examples
 ///
@@ -276,7 +276,7 @@ pub type Standard4aryCuckooFilter = CuckooFilter<Standard4aryScheme>;
 ///
 /// - `num_buckets` must be a power of 2 and ≥ 2.
 /// - `bucket_size` must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(2 · bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(2 · bucket_size)⌋+1, 64]`.
 /// - `value_bits` must be ≥ 1 (otherwise the store degenerates to a filter — use
 ///   [`Segmented2aryCuckooFilter`] instead).
 ///
@@ -305,7 +305,7 @@ pub type Segmented2aryCuckooKVStore = CuckooKVStore<Segmented2aryScheme>;
 ///
 /// - `num_buckets` must equal `3 · 2^t` for some `t ≥ 0`.
 /// - `bucket_size` must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(3 · bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(3 · bucket_size)⌋+1, 64]`.
 /// - `value_bits` must be ≥ 1.
 ///
 /// # Examples
@@ -329,7 +329,7 @@ pub type Segmented3aryCuckooKVStore = CuckooKVStore<Segmented3aryScheme>;
 ///
 /// - `num_buckets` must be a power of 2 and ≥ 4 (so each of the four segments is a power of 2).
 /// - `bucket_size` must be in `1..=4`.
-/// - `fingerprint_bits` must be in `[⌊log2(4 · bucket_size)⌋+1, 32]`.
+/// - `fingerprint_bits` must be in `[⌊log2(4 · bucket_size)⌋+1, 64]`.
 /// - `value_bits` must be ≥ 1.
 ///
 /// # Examples

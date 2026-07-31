@@ -3,23 +3,25 @@
 //! # Purpose
 //!
 //! [`FingerprintTable`] is the physical storage layer of every [`CuckooFilter`]. It stores
-//! fingerprints at arbitrary bit widths (1–32 bits) in a flat byte buffer,
+//! fingerprints at arbitrary bit widths (1–64 bits) in a flat byte buffer,
 //! without byte alignment. This allows, for example, 12-bit fingerprints to be packed at
 //! 66% of the space that 16-bit (byte-aligned) storage would consume.
 //!
 //! # Memory layout
 //!
 //! Fingerprints are packed contiguously, LSB-first. To read or write a fingerprint, the code
-//! loads an aligned 8-byte window, shifts, and masks:
+//! loads an unaligned window, shifts, and masks — an 8-byte `u64` window while
+//! `fingerprint_bits <= 56` (a shifted field then fits in 63 bits), a 16-byte `u128`
+//! window above (a sub-byte-aligned 64-bit field spans up to 9 bytes):
 //!
 //! ```text
 //! bit offset = (bucket * bucket_size + slot) * fingerprint_bits
 //! byte index = bit_offset / 8
 //! shift      = bit_offset % 8
-//! value      = (u64_at(byte_index) >> shift) & mask
+//! value      = (window_at(byte_index) >> shift) & mask
 //! ```
 //!
-//! Eight bytes of padding are appended to the allocation so that every 8-byte load stays
+//! Sixteen bytes of padding are appended to the allocation so that either window stays
 //! within bounds regardless of alignment.
 //!
 //! # Security
@@ -31,8 +33,9 @@
 
 /// Bit-packed fingerprint storage for a cuckoo filter.
 ///
-/// All fingerprint widths from 1 to 32 bits are supported. Fingerprints are stored without
-/// byte alignment; the internal representation loads/stores `u64` windows at the byte level.
+/// All fingerprint widths from 1 to 64 bits are supported. Fingerprints are stored without
+/// byte alignment; the internal representation loads/stores `u64` windows at the byte level
+/// up to 56-bit widths and `u128` windows above (see Design rationale).
 ///
 /// # Layout
 ///
@@ -57,24 +60,30 @@
 ///   lines), and a layout that *is* the on-disk wire format. The only cost is unaligned
 ///   access, which is free on x86_64 and aarch64.
 ///
-/// - **`u64` arithmetic despite the 32-bit width cap.** The mask is built as
-///   `(1u64 << fingerprint_bits) - 1`: at `fingerprint_bits == 32`, `1u32 << 32` is
-///   undefined behaviour in Rust (shift ≥ bit-width), whereas `1u64 << 32` is well-defined
-///   and yields the correct `0xFFFF_FFFF`. `u64` also matches the load/store window,
-///   sparing a truncation; the final cast back to `u32` is lossless because
-///   `mask ≤ 2³² − 1`.
+/// - **Width-split load window: `u64` up to 56 bits, `u128` above.** A sub-byte-aligned
+///   field spans `bit_shift` (≤ 7) plus `fingerprint_bits` bits of its window, so up to 56
+///   bits the original single 8-byte load still covers it (≤ 63 bits) at one `MOV` +
+///   `SHR` — and the cuckoo-filter throughput benches, which hot-loop `read`/`write`,
+///   keep their pre-widening cost at every legacy width. Past 56 bits the field can span
+///   9 bytes; no mainstream ISA has a 9-byte load, so that path loads a 16-byte `u128`
+///   window (register pair on x86-64 — the cost of genuinely wide fingerprints, paid only
+///   by them). The branch predicate `fingerprint_bits <= 56` is a per-table constant, so
+///   the predictor resolves it for free inside any loop over one table.
 ///
-/// - **Fixed 8-byte window, not the minimum 5.** A sub-byte-aligned 32-bit field fits in
-///   5 bytes, but 64-bit ISAs have no 5-byte load — it would be synthesised from a 4-byte
-///   plus a 1-byte load. An 8-byte unaligned load is a single `MOV` / `LDR`, and
-///   `u64::from_le_bytes` on a `[u8; 8]` produces branch-free code. The 8-byte tail
-///   padding allocated by [`new`](Self::new) keeps `data[byte_pos..byte_pos + 8]`
-///   in-bounds for every legal `(bucket, slot)`, so the `try_into` in
-///   [`read`](Self::read) / [`write`](Self::write)
+/// - **`u128` arithmetic on the wide path.** Its mask is built as
+///   `(1u128 << fingerprint_bits) - 1`: at `fingerprint_bits == 64`, `1u64 << 64` would be
+///   undefined behaviour in Rust (shift ≥ bit-width), whereas `1u128 << 64` is well-defined
+///   and yields the correct `0xFFFF_FFFF_FFFF_FFFF`; the final cast back to `u64` is
+///   lossless because `mask ≤ 2⁶⁴ − 1`. The narrow path stays in `u64` throughout
+///   (`fingerprint_bits ≤ 56 < 64`, so its mask shift cannot overflow).
+///
+/// - **16-byte tail padding either way.** The padding allocated by [`new`](Self::new)
+///   keeps both `data[byte_pos..byte_pos + 8]` and `..+ 16` in-bounds for every legal
+///   `(bucket, slot)`, so the `try_into` in [`read`](Self::read) / [`write`](Self::write)
 ///   cannot fail — the `expect` documents this invariant, not an error path.
 ///
 /// - **LSB-first / little-endian packing.** Higher byte indices map to higher bits of the
-///   loaded `u64`, so extraction is `(val >> bit_shift) & mask` and insertion is
+///   loaded window, so extraction is `(val >> bit_shift) & mask` and insertion is
 ///   `val |= (fp & mask) << bit_shift` with `bit_shift = bit_pos % 8` in both directions.
 ///   Byte-crossing fields need no special case; an MSB-first layout would require
 ///   splitting them across two masks with inverted shifts. Every Rust tier-1 target is
@@ -85,7 +94,7 @@
 ///
 /// These are not checked by `FingerprintTable` itself:
 ///
-/// - `fingerprint_bits ∈ 1..=32` — enforced upstream in `validate_common_params`
+/// - `fingerprint_bits ∈ 1..=64` — enforced upstream in `validate_common_params`
 ///   (in `filter.rs`); every public constructor path goes through it.
 /// - Fingerprint value `0` is reserved to mean "empty slot"; the hash layer must never
 ///   produce `0` for a real key. [`insert`](Self::insert)
@@ -97,13 +106,13 @@
 ///   assertions in the read/write primitives, which panic out of range.
 #[derive(Clone)]
 pub struct FingerprintTable {
-    /// Raw fingerprint data: `⌈num_buckets · bucket_size · fingerprint_bits / 8⌉ + 8` bytes (8 bytes padding).
+    /// Raw fingerprint data: `⌈num_buckets · bucket_size · fingerprint_bits / 8⌉ + 16` bytes (16 bytes padding).
     data: Vec<u8>,
     /// Total number of buckets.
     num_buckets: u32,
     /// Slots (fingerprints) per bucket.
     bucket_size: u32,
-    /// Bit width of each fingerprint (1–32).
+    /// Bit width of each fingerprint (1–64).
     fingerprint_bits: u32,
 }
 
@@ -118,13 +127,13 @@ impl FingerprintTable {
     ///
     /// # Constraints
     ///
-    /// - `fingerprint_bits` must be in `1..=32`.
+    /// - `fingerprint_bits` must be in `1..=64`.
     ///
     /// Constraints on these parameters are not enforced by this constructor, but must be upheld by callers to ensure correct filter behavior.
     ///
     /// # Returns
     ///
-    /// A zero-initialised [`FingerprintTable`] with `⌈num_buckets·bucket_size·fingerprint_bits/8⌉ + 8` bytes allocated.
+    /// A zero-initialised [`FingerprintTable`] with `⌈num_buckets·bucket_size·fingerprint_bits/8⌉ + 16` bytes allocated.
     ///
     /// # Examples
     ///
@@ -140,7 +149,7 @@ impl FingerprintTable {
         let total_bits = num_buckets as u64 * bucket_size as u64 * fingerprint_bits as u64;
         let total_bytes = total_bits.div_ceil(8) as usize;
         Self {
-            data: vec![0u8; total_bytes + 8],
+            data: vec![0u8; total_bytes + 16],
             num_buckets,
             bucket_size,
             fingerprint_bits,
@@ -159,13 +168,13 @@ impl FingerprintTable {
         self.bucket_size
     }
 
-    /// Bit width of each fingerprint (1–32).
+    /// Bit width of each fingerprint (1–64).
     #[inline]
     pub const fn fingerprint_bits(&self) -> u32 {
         self.fingerprint_bits
     }
 
-    /// Return the byte size of the fingerprint storage, excluding the trailing 8-byte padding.
+    /// Return the byte size of the fingerprint storage, excluding the trailing 16-byte padding.
     ///
     /// This is the *logical* storage cost: `⌈num_buckets · bucket_size · fingerprint_bits / 8⌉`. Callers use this to
     /// report memory usage without counting implementation overhead.
@@ -205,8 +214,9 @@ impl FingerprintTable {
 
     /// Read the fingerprint stored at `(bucket, slot)`.
     ///
-    /// Loads an 8-byte little-endian word from the byte boundary at or before the
-    /// fingerprint's bit offset, then shifts and masks to extract exactly `fingerprint_bits` bits.
+    /// Loads a little-endian window (8-byte while `fingerprint_bits <= 56`, 16-byte above)
+    /// from the byte boundary at or before the fingerprint's bit offset, then shifts and
+    /// masks to extract exactly `fingerprint_bits` bits.
     ///
     /// # Arguments
     ///
@@ -220,12 +230,15 @@ impl FingerprintTable {
     ///
     /// # Returns
     ///
-    /// The fingerprint value, zero-padded to `u32`. A return value of `0` means the slot
+    /// The fingerprint value, zero-padded to `u64`. A return value of `0` means the slot
     /// is empty (the "empty = 0" invariant is enforced by [`insert`]).
     ///
     /// # Performance
     ///
-    /// O(1) — one unaligned `u64` load, shift, mask.
+    /// O(1) — one unaligned load (`u64` while `fingerprint_bits <= 56`, `u128` above),
+    /// shift, mask. Past 56 bits a fingerprint can span up to 9 bytes at a non-zero
+    /// intra-byte offset, which an 8-byte load cannot cover; see the width-split note in
+    /// the type-level docs.
     ///
     /// # Panics
     ///
@@ -244,11 +257,11 @@ impl FingerprintTable {
     ///
     /// [`insert`]: Self::insert
     ///
-    /// The `expect` is an invariant: the 8-byte padding allocation guarantees the slice is
-    /// always exactly 8 bytes, so `try_into()` cannot fail.
+    /// The `expect` is an invariant: the 16-byte padding allocation guarantees the slice is
+    /// always exactly 16 bytes, so `try_into()` cannot fail.
     #[inline]
     #[allow(clippy::expect_used)]
-    pub fn read(&self, bucket: u32, slot: u32) -> u32 {
+    pub fn read(&self, bucket: u32, slot: u32) -> u64 {
         assert!(
             bucket < self.num_buckets && slot < self.bucket_size,
             "(bucket, slot) out of range: ({bucket}, {slot}) not in [0, {}) x [0, {})",
@@ -258,21 +271,42 @@ impl FingerprintTable {
         let bit_pos = self.bit_offset(bucket, slot);
         let byte_pos = bit_pos / 8;
         let bit_shift = bit_pos % 8;
-        let mask = (1u64 << self.fingerprint_bits) - 1;
-        // SAFETY-equivalent: the 8-byte padding at the end of `data` guarantees that loading
-        // 8 bytes at `byte_pos` never exceeds the allocation.
-        let val = u64::from_le_bytes(
-            self.data[byte_pos..byte_pos + 8]
-                .try_into()
-                .expect("invariant: 8-byte slice always converts to [u8; 8]"),
-        );
-        ((val >> bit_shift) & mask) as u32
+        // Window split: `bit_shift` <= 7, so a `fingerprint_bits`-wide field spans at
+        // most `7 + fingerprint_bits` bits of the load. Up to 56 bits that is <= 63,
+        // and the original single 8-byte load still covers it — keeping the
+        // Table 2 throughput benches (which hot-loop this path) at their
+        // pre-widening cost. Only wider fingerprints pay the two-register
+        // u128 window that a 9-byte span requires.
+        if self.fingerprint_bits <= 56 {
+            // fingerprint_bits <= 56 < 64, so the u64 mask shift cannot overflow.
+            let mask = (1u64 << self.fingerprint_bits) - 1;
+            // SAFETY-equivalent: the 16-byte padding at the end of `data` covers
+            // this 8-byte load a fortiori.
+            let val = u64::from_le_bytes(
+                self.data[byte_pos..byte_pos + 8]
+                    .try_into()
+                    .expect("invariant: 8-byte slice always converts to [u8; 8]"),
+            );
+            (val >> bit_shift) & mask
+        } else {
+            // `fingerprint_bits` is at most 64, so this shift is always < 127.
+            let mask = (1u128 << self.fingerprint_bits) - 1;
+            // SAFETY-equivalent: the 16-byte padding at the end of `data` guarantees
+            // that loading 16 bytes at `byte_pos` never exceeds the allocation.
+            let val = u128::from_le_bytes(
+                self.data[byte_pos..byte_pos + 16]
+                    .try_into()
+                    .expect("invariant: 16-byte slice always converts to [u8; 16]"),
+            );
+            ((val >> bit_shift) & mask) as u64
+        }
     }
 
     /// Write `fingerprint` into the slot at `(bucket, slot)`.
     ///
-    /// Performs a read-modify-write on the 8-byte word that covers the fingerprint's bit
-    /// range: clears the existing `fingerprint_bits` bits, then OR-in the new value.
+    /// Performs a read-modify-write on the window that covers the fingerprint's bit
+    /// range (8-byte while `fingerprint_bits <= 56`, 16-byte above): clears the existing
+    /// `fingerprint_bits` bits, then OR-in the new value.
     ///
     /// # Arguments
     ///
@@ -288,7 +322,8 @@ impl FingerprintTable {
     ///
     /// # Performance
     ///
-    /// O(1) — one unaligned `u64` load, mask, OR, store.
+    /// O(1) — one unaligned load, mask, OR, store (`u64` window while
+    /// `fingerprint_bits <= 56`, `u128` above; see the type-level docs).
     ///
     /// # Panics
     ///
@@ -311,7 +346,7 @@ impl FingerprintTable {
     /// See [`read`](Self::read) for the `expect` invariant rationale.
     #[inline]
     #[allow(clippy::expect_used)]
-    pub fn write(&mut self, bucket: u32, slot: u32, fingerprint: u32) {
+    pub fn write(&mut self, bucket: u32, slot: u32, fingerprint: u64) {
         assert!(
             bucket < self.num_buckets && slot < self.bucket_size,
             "(bucket, slot) out of range: ({bucket}, {slot}) not in [0, {}) x [0, {})",
@@ -321,16 +356,30 @@ impl FingerprintTable {
         let bit_pos = self.bit_offset(bucket, slot);
         let byte_pos = bit_pos / 8;
         let bit_shift = bit_pos % 8;
-        let mask = (1u64 << self.fingerprint_bits) - 1;
-        // SAFETY-equivalent: see read — 8-byte padding prevents out-of-bounds.
-        let mut val = u64::from_le_bytes(
-            self.data[byte_pos..byte_pos + 8]
-                .try_into()
-                .expect("invariant: 8-byte slice always converts to [u8; 8]"),
-        );
-        val &= !(mask << bit_shift);
-        val |= (fingerprint as u64 & mask) << bit_shift;
-        self.data[byte_pos..byte_pos + 8].copy_from_slice(&val.to_le_bytes());
+        // Same width split as `read`: 8-byte window up to 56 bits, u128 above.
+        if self.fingerprint_bits <= 56 {
+            let mask = (1u64 << self.fingerprint_bits) - 1;
+            // SAFETY-equivalent: see read — 16-byte padding covers the 8-byte window.
+            let mut val = u64::from_le_bytes(
+                self.data[byte_pos..byte_pos + 8]
+                    .try_into()
+                    .expect("invariant: 8-byte slice always converts to [u8; 8]"),
+            );
+            val &= !(mask << bit_shift);
+            val |= (fingerprint & mask) << bit_shift;
+            self.data[byte_pos..byte_pos + 8].copy_from_slice(&val.to_le_bytes());
+        } else {
+            let mask = (1u128 << self.fingerprint_bits) - 1;
+            // SAFETY-equivalent: see read — 16-byte padding prevents out-of-bounds.
+            let mut val = u128::from_le_bytes(
+                self.data[byte_pos..byte_pos + 16]
+                    .try_into()
+                    .expect("invariant: 16-byte slice always converts to [u8; 16]"),
+            );
+            val &= !(mask << bit_shift);
+            val |= (fingerprint as u128 & mask) << bit_shift;
+            self.data[byte_pos..byte_pos + 16].copy_from_slice(&val.to_le_bytes());
+        }
     }
 
     /// Return `true` if `fingerprint` is present in any slot of `bucket`.
@@ -375,7 +424,7 @@ impl FingerprintTable {
     /// ```
     ///
     /// [`CuckooFilter::contain`]: crate::CuckooFilter::contain
-    pub fn contain(&self, bucket: u32, fingerprint: u32) -> bool {
+    pub fn contain(&self, bucket: u32, fingerprint: u64) -> bool {
         for slot in 0..self.bucket_size {
             if self.read(bucket, slot) == fingerprint {
                 return true;
@@ -424,7 +473,7 @@ impl FingerprintTable {
     ///
     /// [`contain`]: Self::contain
     #[allow(dead_code)]
-    pub fn find(&self, bucket: u32, fingerprint: u32) -> Option<u32> {
+    pub fn find(&self, bucket: u32, fingerprint: u64) -> Option<u32> {
         (0..self.bucket_size).find(|&slot| self.read(bucket, slot) == fingerprint)
     }
 
@@ -462,7 +511,7 @@ impl FingerprintTable {
     /// assert!(!table.contain(0, 42)); // gone
     /// assert!(!table.delete(0, 99)); // not present
     /// ```
-    pub fn delete(&mut self, bucket: u32, fingerprint: u32) -> bool {
+    pub fn delete(&mut self, bucket: u32, fingerprint: u64) -> bool {
         assert!(fingerprint != 0, "fingerprint cannot be zero");
         for slot in 0..self.bucket_size {
             if self.read(bucket, slot) == fingerprint {
@@ -512,7 +561,7 @@ impl FingerprintTable {
     /// assert_eq!(table.insert(0, 20), Some(1));
     /// assert_eq!(table.insert(0, 30), None);  // bucket full (bucket_size=2)
     /// ```
-    pub fn insert(&mut self, bucket: u32, fingerprint: u32) -> Option<u32> {
+    pub fn insert(&mut self, bucket: u32, fingerprint: u64) -> Option<u32> {
         assert!(fingerprint != 0, "fingerprint cannot be zero");
         for slot in 0..self.bucket_size {
             if self.read(bucket, slot) == 0 {
@@ -558,6 +607,71 @@ mod tests {
         let mut table = FingerprintTable::new(4, 2, 32);
         table.write(1, 0, 0xDEADBEEF);
         assert_eq!(table.read(1, 0), 0xDEADBEEF);
+    }
+
+    #[test]
+    fn test_read_write_64bit() {
+        let mut table = FingerprintTable::new(4, 2, 64);
+        table.write(1, 0, 0xDEAD_BEEF_1234_5678);
+        assert_eq!(table.read(1, 0), 0xDEAD_BEEF_1234_5678);
+        assert_eq!(table.read(1, 1), 0);
+    }
+
+    /// `fingerprint_bits = 64`, all-ones value: exercises the exact mask
+    /// `u64::MAX`, computed as `(1u128 << 64) - 1` without ever needing the
+    /// UB-adjacent `1u64 << 64`.
+    #[test]
+    fn test_read_write_64bit_all_ones() {
+        let mut table = FingerprintTable::new(4, 2, 64);
+        table.write(2, 1, u64::MAX);
+        assert_eq!(table.read(2, 1), u64::MAX);
+        assert_eq!(table.read(2, 0), 0);
+    }
+
+    /// `fingerprint_bits = 33` — one bit past the old 32-bit cap — at slots
+    /// whose bit offsets (`slot_index * 33`) land at different, non-zero
+    /// intra-byte positions (`slot_index * 33 mod 8` = 0, 1, 2, 3, 4 for
+    /// slots 0..5). Exercises the general straddling path at a width the
+    /// pre-widening code could never reach.
+    #[test]
+    fn test_read_write_33bit_odd_offsets() {
+        let mut table = FingerprintTable::new(4, 5, 33);
+        let values: [u64; 5] = [
+            0x1_FFFF_FFFF, // 2^33 - 1: every one of the 33 bits set
+            1,
+            0x1_0000_0001,
+            0x1_5555_5555,
+            0x1_AAAA_AAAA,
+        ];
+        for (s, &v) in values.iter().enumerate() {
+            table.write(0, s as u32, v);
+        }
+        for (s, &v) in values.iter().enumerate() {
+            assert_eq!(table.read(0, s as u32), v, "slot {s}");
+        }
+    }
+
+    /// Round-trips on both sides of the load-window split (`u64` while
+    /// `fingerprint_bits <= 56`, `u128` above): 55 and 56 take the 8-byte
+    /// window at its widest, 57 is the narrowest width on the `u128` path.
+    /// Odd widths make successive slots land at different intra-byte
+    /// offsets, so the straddling arithmetic is exercised on each path.
+    #[test]
+    fn test_read_write_across_window_split_boundary() {
+        for fp_bits in [55u32, 56, 57] {
+            let mut table = FingerprintTable::new(2, 6, fp_bits);
+            // fp_bits <= 57 < 64 here, so the mask shift cannot overflow.
+            let mask = (1u64 << fp_bits) - 1;
+            let values: Vec<u64> = (0..6u64)
+                .map(|s| (0xA5A5_5A5A_DEAD_BEEFu64.rotate_left(s as u32 * 11) | 1) & mask)
+                .collect();
+            for (s, &v) in values.iter().enumerate() {
+                table.write(1, s as u32, v);
+            }
+            for (s, &v) in values.iter().enumerate() {
+                assert_eq!(table.read(1, s as u32), v, "fp_bits={fp_bits} slot {s}");
+            }
+        }
     }
 
     #[test]

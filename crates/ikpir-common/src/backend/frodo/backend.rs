@@ -2171,31 +2171,43 @@ mod tests {
     }
 
     /// The operating points `pir_params::frodo_max_plaintext_bits`
-    /// selects — including the exact Eq. 8 equality boundary
-    /// `(s, pb) = (2^18, 10)` where `8·p²·√m = 2^32` — keep the measured
-    /// noise strictly inside `Δ/2`.
+    /// selects at the paper shapes (`fingerprint_bits = 64`) keep the
+    /// measured noise strictly inside `Δ/2`.
     #[test]
     #[ignore = "paper-scale probe (~5 s in release; run with --release)"]
     fn noise_margin_validates_selected_operating_points() {
         let draws = 32;
-        for s in [1u32 << 18, 1 << 19] {
-            let pb = crate::pir_params::frodo_max_plaintext_bits(s);
+        for (arity, s, b, vb) in [(4u32, 1u32 << 18, 1u32, 8192u32), (2, 1 << 17, 4, 2048)] {
+            let pb = crate::pir_params::frodo_max_plaintext_bits(arity, s, b, 64, vb);
+            assert_eq!(
+                pb, 9,
+                "selector regressed at (arity={arity}, s={s}, b={b}, ℓ={vb})"
+            );
             let (failed, _, ratio) = measure_decode_noise(s, pb, 256, draws);
             println!(
-                "frodo pb={pb} @ s={s}: failed decodes {failed}/{draws}, \
-                 max|noise|/(Δ/2) = {ratio:.3}"
+                "frodo pb={pb} @ (arity={arity}, s={s}, b={b}, ℓ={vb}): \
+                 failed decodes {failed}/{draws}, max|noise|/(Δ/2) = {ratio:.3}"
             );
             assert_eq!(failed, 0, "selected pb={pb} must not fail decodes");
             assert!(ratio < 1.0);
         }
     }
 
-    /// One plaintext bit past the Eq. 8 boundary (`pb = 11` at
-    /// `s = 2^18`) overflows `Δ/2` on ordinary random data — the
-    /// equation is tight in practice, not just a safety margin.
+    /// The δ_cell-targeted rule selects `pb = 9` at `s = 2^18` (the
+    /// paper's `(4, 1)` cell, `ℓ = 8192` — see
+    /// `noise_margin_validates_selected_operating_points`). `pb = 10`,
+    /// the old Eq. 8 operating point, does **not** overflow `Δ/2` on
+    /// uniform random data — the regime this probe measures — but its
+    /// worst-case Bernstein tail misses the per-cell budget by tens of
+    /// bits (see the module docs' History note); that worst-case,
+    /// explicit-`δ` insurance is precisely what the new rule buys, and
+    /// is invisible to an empirical probe on random data. `pb = 11`,
+    /// two bits past the new selection, DOES overflow even on random
+    /// data, showing the ceiling is real rather than merely a
+    /// theoretical artifact.
     #[test]
     #[ignore = "paper-scale probe (~3 s in release; run with --release)"]
-    fn noise_margin_rejects_one_bit_past_boundary() {
+    fn noise_margin_shows_empirical_cliff_two_bits_past_selection() {
         let draws = 64;
         let (failed, cells, ratio) = measure_decode_noise(1 << 18, 11, 256, draws);
         println!(
@@ -2204,7 +2216,7 @@ mod tests {
         );
         assert!(
             failed > 0,
-            "expected failed decodes one bit past the Eq. 8 boundary (got none)"
+            "expected failed decodes two bits past the new selection (got none)"
         );
     }
 }

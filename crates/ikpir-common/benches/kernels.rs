@@ -209,19 +209,36 @@ fn run_backend<B: IndexPirBackend + IncrementalPirBackend + PrecomputingPirBacke
 fn main() {
     let heavy = std::env::args().any(|a| a == "--heavy");
 
-    // Default: the paper's mid-size per-segment shape (num_buckets 65536,
-    // arity 4 → 16384 rows; bucket_size 4 × ~28 cells/slot → width 112).
-    // --heavy adds the wide-value shape (1 KiB values → width ~832).
+    // Both shapes are real paper per-segment widths at the shipped
+    // `fingerprint_bits = 64`, taken from the (4, 1) cell (bucket_size 1):
+    //
+    //   row_width = bucket_size · ⌈(f + ℓ)/pb⌉,  f = 64, pb = 9
+    //     ℓ = 2048 (256 B) → 235
+    //     ℓ = 8192 (1 kB)  → 918
+    //
+    // `n_rows` stays at the dev-scale 16 384 rather than the paper's
+    // 262 144, so a run is seconds instead of hours; the kernels'
+    // schedules key on `row_width` and `lwe_dim`, not on how many rows
+    // are stacked underneath.
+    //
+    // The previous shapes (112 and 832 at `plaintext_bits = 10`) were
+    // illustrative rather than derived, and predate both the 64-bit
+    // fingerprint and the δ_cell-targeted `pb`. The wide one was about
+    // right — at f = 32, pb = 10, bucket_size 1, width 832 is a ~1036 B
+    // value, and 823 would have been exactly 1 kB. The narrow one was
+    // not: OPTIMIZATIONS.md labels width 112 "256 B values", but under
+    // the same reading it is a ~136 B value; 256 B at that geometry is
+    // width 208. These two shapes are the widths the labels claim.
     let mut shapes = vec![Shape {
         n_rows: 16_384,
-        row_width: 112,
-        plaintext_bits: 10,
+        row_width: 235,
+        plaintext_bits: 9,
     }];
     if heavy {
         shapes.push(Shape {
             n_rows: 16_384,
-            row_width: 832,
-            plaintext_bits: 10,
+            row_width: 918,
+            plaintext_bits: 9,
         });
     }
 

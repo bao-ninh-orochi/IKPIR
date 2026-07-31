@@ -32,14 +32,14 @@
 
 /// Fingerprint width, in bits.
 ///
-/// The paper's filter evaluation uses a 32-bit fingerprint (Section 6.2), the
+/// The paper's filter evaluation uses a 64-bit fingerprint (Section 6.2), the
 /// widest the slot layout admits. It drives the false-positive rate to
-/// `arity·bucket_size / 2^32` — low enough that a false positive never
+/// `arity·bucket_size / 2^64` — low enough that a false positive never
 /// perturbs a load-factor or throughput measurement, so those numbers isolate
 /// the indexing scheme rather than the fingerprint width. The
 /// `cuckoo_filter_false_positive_rate` bench sweeps this axis deliberately and
 /// so ignores this default.
-pub const DEFAULT_FINGERPRINT_BITS: u32 = 32;
+pub const DEFAULT_FINGERPRINT_BITS: u32 = 64;
 
 /// Cuckoo kick budget: relocations attempted before an insert reports
 /// `TableFull`.

@@ -82,86 +82,110 @@ cargo bench -p ikpir-common --no-default-features --bench kernels
 **Machine:** Apple M1 (4 performance + 4 efficiency cores), 16 GB,
 macOS 26.5.2, Rust 1.85.0 (the pinned toolchain), `-C target-cpu=native`.
 
-**Baseline:** `orochi-network/IKPIR` `main` at `8032a2c`, in a clean
-worktree, with `benches/kernels.rs` copied in unmodified (the harness
-lives only on this branch; nothing else about the worktree was changed).
-Both sides therefore run the same measurement contract — which matters,
-because `6da0b7a` and `44b9eab` changed it, and the pre-merge numbers in
-this file's previous revision were taken under the old one. They have
-been discarded rather than carried forward.
+**Baseline:** `orochi-network/IKPIR` `main` **at the commit this branch
+merges** — i.e. carrying the 64-bit fingerprint and the δ_cell-targeted
+`plaintext_bits`, not `8032a2c` — in a clean worktree, with
+`benches/kernels.rs` copied in unmodified (the harness lives only on
+this branch) and no `.cargo/config.toml`, since `-C target-cpu=native`
+is technique #1 and belongs on the measured side only. Nothing else
+about the worktree was changed.
 
-**Protocol:** one segment of `n_rows = 16384`, `plaintext_bits = 10`,
+Measuring against a reference that ran the *old* parameters would
+conflate the geometry change with the optimization ratios, so the
+baseline moves with the branch. Both sides run the same measurement
+contract, which matters because `6da0b7a` and `44b9eab` changed it.
+
+**Protocol:** one segment of `n_rows = 16384`, `plaintext_bits = 9`,
 FrodoPIR `lwe_dim = 1566` / SimplePIR `lwe_dim = 1275`; two runs per
 side, per-op minimum across both (the `min` a single run reports is
 already the least-noise sample; taking it across runs removes the rest).
+
+**Operating point:** `fingerprint_bits = 64` and the `pb` the
+δ_cell-targeted selector chooses (9 at both widths below). The two
+shapes are real per-segment widths from the paper's (4, 1) cell:
+`row_width = ⌈(64 + ℓ)/9⌉` = **235** at ℓ = 2048 and **918** at
+ℓ = 8192. The previous revision measured `plaintext_bits = 10` at
+widths 112 and 832, a parameter set this branch no longer defaults to;
+those numbers have been discarded rather than carried forward. Its
+`width = 112` table was additionally labelled "256 B values", which that
+width never was (~136 B; 256 B is width 208 at that geometry).
 
 The **seq** column is `--no-default-features` on this branch: techniques
 1–4 with no threading, i.e. what the algorithmic and codegen work buys
 on one core.
 
-### Kernel level, `width = 112` (256 B values)
+### Kernel level, `width = 235` (256 B values, ℓ = 2048)
 
 | op | main | seq | branch | seq × | branch × |
 |----|-----:|----:|-------:|------:|---------:|
-| frodo setup | 463.7 ms | 294.7 ms | **71.83 ms** | 1.57 | **6.46** |
-| frodo expand_a | 180.6 ms | 175.0 ms | 38.35 ms | 1.03 | 4.71 |
-| frodo query_cold | 2.169 ms | 2.105 ms | 1.953 ms | 1.03 | 1.11 |
-| frodo answer | 125.0 µs | 126.4 µs | 47.67 µs | 0.99 | 2.62 |
-| frodo decode_cold | 11.96 µs | 11.96 µs | 11.92 µs | 1.00 | 1.00 |
-| frodo precompute B×16 | 36.68 ms | 35.99 ms | 19.89 ms | 1.02 | 1.84 |
-| frodo precompute BC×16 | 36.99 ms | 36.21 ms | 19.63 ms | 1.02 | 1.88 |
-| frodo patch_entry | 1.077 ms | 1.075 ms | 254.6 µs | 1.00 | 4.23 |
-| frodo patch_row | 1.105 ms | 459.0 µs | 457.5 µs | 2.41 | 2.42 |
-| simple setup | 411.7 ms | 91.63 ms | **21.34 ms** | 4.49 | **19.3** |
-| simple expand_a | 12.18 ms | 11.84 ms | 2.666 ms | 1.03 | 4.57 |
-| simple query_cold | 165.0 µs | 133.3 µs | 69.83 µs | 1.24 | 2.36 |
-| simple answer | 144.1 µs | 144.7 µs | 61.96 µs | 1.00 | 2.33 |
-| simple decode_cold | 135.0 µs | 139.6 µs | 57.33 µs | 0.97 | 2.35 |
-| simple precompute B×16 | 2.651 ms | 2.140 ms | 488.2 µs | 1.24 | 5.43 |
-| simple precompute BC×16 | 4.870 ms | 4.526 ms | 1.245 ms | 1.08 | 3.91 |
-| simple patch_entry | 917.9 µs | 898.7 µs | 288.1 µs | 1.02 | 3.19 |
-| simple patch_row | 10.92 ms | 3.564 ms | **877.2 µs** | 3.06 | **12.5** |
+| frodo setup | 841.6 ms | 487.3 ms | **108.7 ms** | 1.73 | **7.74** |
+| frodo expand_a | 178.8 ms | 173.4 ms | 37.10 ms | 1.03 | 4.82 |
+| frodo query_cold | 2.130 ms | 2.040 ms | 1.900 ms | 1.04 | 1.12 |
+| frodo answer | 292.7 µs | 283.0 µs | 150.1 µs | 1.03 | 1.95 |
+| frodo decode_cold | 25.29 µs | 25.29 µs | 25.75 µs | 1.00 | 0.98 |
+| frodo precompute B×16 | 34.66 ms | 33.43 ms | 16.82 ms | 1.04 | 2.06 |
+| frodo precompute BC×16 | 35.21 ms | 34.57 ms | 17.90 ms | 1.02 | 1.97 |
+| frodo patch_entry | 1.077 ms | 1.079 ms | 252.4 µs | 1.00 | 4.27 |
+| frodo patch_row | 2.515 ms | 1.217 ms | **303.8 µs** | 2.07 | **8.28** |
+| simple setup | 796.6 ms | 194.3 ms | **47.32 ms** | 4.10 | **16.83** |
+| simple expand_a | 18.10 ms | 17.34 ms | 3.775 ms | 1.04 | 4.79 |
+| simple query_cold | 256.5 µs | 228.0 µs | 113.2 µs | 1.12 | 2.27 |
+| simple answer | 315.2 µs | 321.4 µs | 153.0 µs | 0.98 | 2.06 |
+| simple decode_cold | 193.4 µs | 199.1 µs | 69.04 µs | 0.97 | 2.80 |
+| simple precompute B×16 | 4.206 ms | 3.726 ms | 814.1 µs | 1.13 | 5.17 |
+| simple precompute BC×16 | 7.361 ms | 6.951 ms | 1.784 ms | 1.06 | 4.13 |
+| simple patch_entry | 1.172 ms | 1.156 ms | 295.0 µs | 1.01 | 3.97 |
+| simple patch_row | 15.96 ms | 5.220 ms | **1.258 ms** | 3.06 | **12.69** |
 
-### Kernel level, `width = 832` (1 kB values)
+### Kernel level, `width = 918` (1 kB values, ℓ = 8192)
 
 | op | main | seq | branch | seq × | branch × |
 |----|-----:|----:|-------:|------:|---------:|
-| frodo setup | 2.317 s | 903.3 ms | **209.9 ms** | 2.57 | **11.0** |
-| frodo expand_a | 181.1 ms | 175.2 ms | 39.26 ms | 1.03 | 4.61 |
-| frodo query_cold | 2.186 ms | 2.117 ms | 1.953 ms | 1.03 | 1.12 |
-| frodo answer | 1.012 ms | 1.001 ms | 900.4 µs | 1.01 | 1.12 |
-| frodo decode_cold | 89.50 µs | 89.33 µs | 43.63 µs | 1.00 | 2.05 |
-| frodo precompute B×16 | 38.30 ms | 36.43 ms | 20.15 ms | 1.05 | 1.90 |
-| frodo precompute BC×16 | 39.20 ms | 37.76 ms | 19.79 ms | 1.04 | 1.98 |
-| frodo patch_entry | 1.082 ms | 1.084 ms | 258.0 µs | 1.00 | 4.19 |
-| frodo patch_row | 8.264 ms | 2.706 ms | **690.5 µs** | 3.05 | **12.0** |
-| simple setup | 5.291 s | 632.5 ms | **180.8 ms** | 8.37 | **29.3** |
-| simple expand_a | 37.09 ms | 35.61 ms | 7.938 ms | 1.04 | 4.67 |
-| simple query_cold | 502.4 µs | 454.9 µs | 382.8 µs | 1.10 | 1.31 |
-| simple answer | 1.085 ms | 1.078 ms | 927.2 µs | 1.01 | 1.17 |
-| simple decode_cold | 346.1 µs | 347.1 µs | 199.0 µs | 1.00 | 1.74 |
-| simple precompute B×16 | 8.542 ms | 7.724 ms | 2.726 ms | 1.11 | 3.13 |
-| simple precompute BC×16 | 14.09 ms | 13.40 ms | 4.525 ms | 1.05 | 3.11 |
-| simple patch_entry | 952.7 µs | 932.5 µs | 290.3 µs | 1.02 | 3.28 |
-| simple patch_row | 28.48 ms | 10.20 ms | **2.257 ms** | 2.79 | **12.6** |
+| frodo setup | 2.709 s | 1.021 s | **224.5 ms** | 2.65 | **12.07** |
+| frodo expand_a | 177.4 ms | 172.1 ms | 37.15 ms | 1.03 | 4.77 |
+| frodo query_cold | 2.126 ms | 2.061 ms | 1.906 ms | 1.03 | 1.12 |
+| frodo answer | 1.081 ms | 1.084 ms | 984.2 µs | 1.00 | 1.10 |
+| frodo decode_cold | 96.21 µs | 94.75 µs | 43.38 µs | 1.02 | 2.22 |
+| frodo precompute B×16 | 34.74 ms | 33.30 ms | 16.36 ms | 1.04 | 2.12 |
+| frodo precompute BC×16 | 36.37 ms | 34.90 ms | 19.07 ms | 1.04 | 1.91 |
+| frodo patch_entry | 1.078 ms | 1.077 ms | 251.3 µs | 1.00 | 4.29 |
+| frodo patch_row | 9.731 ms | 3.173 ms | **755.2 µs** | 3.07 | **12.89** |
+| simple setup | 3.809 s | 723.2 ms | **195.2 ms** | 5.27 | **19.51** |
+| simple expand_a | 36.24 ms | 34.72 ms | 7.243 ms | 1.04 | 5.00 |
+| simple query_cold | 489.2 µs | 438.1 µs | 394.0 µs | 1.12 | 1.24 |
+| simple answer | 1.180 ms | 1.171 ms | 1.020 ms | 1.01 | 1.16 |
+| simple decode_cold | 371.8 µs | 371.2 µs | 236.2 µs | 1.00 | 1.57 |
+| simple precompute B×16 | 7.947 ms | 7.200 ms | 2.475 ms | 1.10 | 3.21 |
+| simple precompute BC×16 | 14.03 ms | 13.27 ms | 4.597 ms | 1.06 | 3.05 |
+| simple patch_entry | 1.021 ms | 1.008 ms | 293.5 µs | 1.01 | 3.48 |
+| simple patch_row | 30.77 ms | 10.79 ms | **2.450 ms** | 2.85 | **12.56** |
+
+No op is slower on the branch than on `main`. The single sub-1.00 cell,
+frodo `decode_cold` at `width = 235` (0.98×), is a 460 ns difference on a
+25 µs operation: that op is a `row_width`-long scan with nothing to
+thread and nothing to block, and it read 1.00× in the previous
+revision too.
 
 ### Reading the flat rows
 
 They are not failures, they are the memory wall — and where the wall
 sits is legible in the numbers.
 
-- **`frodo answer` is 2.62× at `width = 112` and 1.12× at `width = 832`.**
-  The narrow segment is 7.3 MB, which fits M1's 8 MB system-level cache;
-  the wide one is 54 MB, which does not. Once the pass is streaming from
+- **`frodo answer` is 1.95× at `width = 235` and 1.10× at `width = 918`.**
+  The narrow segment is 15 MB and the wide one 60 MB, against M1's 8 MB
+  system-level cache. Neither fits now — which is why the narrow row
+  fell from the 2.62× the previous (much narrower, 7.3 MB) shape showed:
+  that shape fit the cache and this one does not. Once the pass is streaming from
   DRAM, threads cannot add bandwidth the machine does not have. On a
   server-class part with more memory channels — the paper's EPYC — the
   parallel answer path has real headroom this laptop cannot show.
 - **`frodo query_cold` barely moves** (1.11–1.12×): `A` is
   `16384 × 1566` = 102 MB, streamed once per sampled slot. Same wall.
-- **`frodo decode_cold` at `width = 112` is exactly `main`.** The hint is
-  `1566 × 112` = 175 k cells, under the 2²⁰-cell fan-out gate, so it runs
-  the identical sequential kernel — which is the right call: fork/join
-  would cost more than the 12 µs pass.
+- **`frodo decode_cold` at `width = 235` is `main`** (0.98×, a 460 ns
+  difference on a 25 µs op). The hint is `1566 × 235` = 368 k cells,
+  under the 2²⁰-cell fan-out gate, so it runs the identical sequential
+  kernel — which is the right call: fork/join would cost more than the
+  pass itself.
 
   There is one honest caveat here. On a heterogeneous machine, a
   sub-gate sequential kernel measured *right after* a parallel one is
@@ -169,18 +193,18 @@ sits is legible in the numbers.
   calling thread can land on an efficiency core once rayon's workers
   have occupied every core. It is a scheduler artifact, not a code-path
   change: `RAYON_NUM_THREADS=1` on the same binary reproduces `main`'s
-  12.0 µs exactly. Taking the minimum across runs recovers the
+  number exactly. Taking the minimum across runs recovers the
   performance-core number, which is what the table reports. Expect this
   to disappear on a homogeneous server part.
 
 ### Where the big wins come from
 
-- **Setup, 6.5–29×.** Two independent factors: the register-tiled GEMM
-  (the **seq** column — 1.57–8.37× on its own, biggest for SimplePIR
+- **Setup, 7.7–19.5×.** Two independent factors: the register-tiled GEMM
+  (the **seq** column — 1.73–5.27× on its own, biggest for SimplePIR
   where the reshape lets the whole segment go through one dense product)
-  and threading on top. SimplePIR's 29.3× at `width = 832` is the
+  and threading on top. SimplePIR's 19.5× at `width = 918` is the
   headline number of the branch.
-- **Row-level hint patch, 2.4–12.6×.** Upstream's `5201dbd` made the
+- **Row-level hint patch, 8.3–12.9×.** Upstream's `5201dbd` made the
   pass stream through one dense buffer instead of materialising the
   whole grouping (~70 MB → ~31 kB); this branch batches the densified
   rows into **chunks** and fires one GEMM per chunk, so the hint is
@@ -191,7 +215,7 @@ sits is legible in the numbers.
   rank-one pass — with one row there is no contraction for the tiles to
   amortise, and routing a single-mutation patch through the GEMM
   measured 0.69–0.80× `main` before that gate went in.
-- **Entry-level hint patch, 3.2–4.2×.** Entirely threading: the **seq**
+- **Entry-level hint patch, 3.5–4.3×.** Entirely threading: the **seq**
   column is 1.00, because sequential entry-level *is* upstream's
   `TouchedRuns` loop inversion, unchanged. The branch's contribution is
   splitting that single sweep across bands of hint rows, which composes
@@ -201,6 +225,18 @@ sits is legible in the numbers.
   core count until the write bandwidth for `A` caps it.
 
 ### End-to-end
+
+> **These rows were measured at `fingerprint_bits = 32` and the
+> pre-Lemma-2 `plaintext_bits`, and have _not_ been re-taken at the
+> branch's current default.** The kernel tables above have; these have
+> not. They are kept because the *shape* of the result — where the
+> branch wins and where it is flat — does not depend on the operating
+> point, and every ratio here is confirmed by a re-measured kernel row.
+> Read the absolute numbers as the old geometry, and expect roughly
+> `+11-13%` on `server_setup` / `server_answer` wall-clock at the new
+> one, tracking the growth of `cells_per_slot = ⌈(f + ℓ)/pb⌉` as `f`
+> doubles and `pb` drops a bit. Re-take them before quoting an absolute
+> figure anywhere.
 
 Same machine, `./scripts/bench.sh <bench> --arity 4 --num-buckets 65536
 --bucket-size 4 --value-bits 2048`, both backends, against the same
@@ -237,8 +273,8 @@ Two things this table says, and neither is a disappointment:
   per-segment matrix is 12.4 M cells (50 MB), four of them per query;
   the pass is bandwidth-bound on a laptop with one memory controller, so
   threads add coordination and no throughput. The 5–13% shortfall is
-  that coordination. The same kernels show 2.3–2.6× at the cache-resident
-  `width = 112` shape above, which is the regime a server with more
+  that coordination. The same kernels show 1.95–2.06× at the narrower
+  `width = 235` shape above, which is the regime a server with more
   memory channels would extend.
 - **The mutation benches never reach the branch's mutation work.** They
   apply one mutation per call, so `row_deltas.len() == 1` and every path
@@ -338,7 +374,7 @@ None of these landed upstream in the sync, and none is started here.
 - **Packed DB cells** (SimplePIR packs 3×10-bit cells per `u32`, YPIR
   4×8-bit): ~3× less DRAM traffic on the bandwidth-bound answer pass —
   the single highest-leverage remaining optimization, and the one the
-  `width = 832` rows above are begging for. It changes the cell layout
+  `width = 918` rows above are begging for. It changes the cell layout
   that `segmented-cuckoo` owns and every mutation path touches. Needs
   its own design pass.
 - **Multi-query batching** (YPIR-style 8-query register blocks): near-8×

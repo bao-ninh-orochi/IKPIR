@@ -66,7 +66,7 @@ struct Cli {
     /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
     #[arg(long, default_value_t = 2048)]
     value_bits: u32,
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 64)]
     fingerprint_bits: u32,
     #[arg(long, default_value_t = 8)]
     plaintext_bits: u32,
