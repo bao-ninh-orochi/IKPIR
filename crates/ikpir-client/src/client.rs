@@ -342,7 +342,9 @@ where
     /// happen to share `fp` (rare false positive at the cuckoo layer),
     /// the returned `Vec<u8>` is the bitwise OR of their values. This
     /// matches the cuckoo-layer FPR bound; callers that need certainty
-    /// should retry on a different fingerprint.
+    /// should retry on a different fingerprint. This OR-of-matching-values
+    /// under ambiguity is the same failure event the scheme's correctness
+    /// lemma charges (the collision event), so the bound covers it.
     ///
     /// # Returns
     ///
@@ -383,7 +385,7 @@ where
         let value_size = self.params.value_size_in_bytes();
 
         let mut acc = vec![0u8; value_size];
-        let mut found_mask: u32 = 0;
+        let mut found_mask: u64 = 0;
 
         for j in 0..arity {
             let row: Vec<u32> = B::client_decode(&self.states[j], &resp.responses[j]);
@@ -393,27 +395,27 @@ where
             for s in 0..bucket_size {
                 let slot = &row[s * cps..(s + 1) * cps];
                 let (decoded_fp, value_bytes) = unpack_slot_cells(&self.params, slot);
-                let mask32 = ct_eq_u32_mask(decoded_fp, fp);
-                let mask8 = (mask32 & 0xFF) as u8;
+                let mask64 = ct_eq_u64_mask(decoded_fp, fp);
+                let mask8 = (mask64 & 0xFF) as u8;
                 for (a, v) in acc.iter_mut().zip(value_bytes.iter()) {
                     *a |= mask8 & *v;
                 }
-                found_mask |= mask32;
+                found_mask |= mask64;
             }
         }
         Ok(if found_mask != 0 { Some(acc) } else { None })
     }
 }
 
-/// Branchless `u32` equality mask: returns `0xFFFFFFFF` if `a == b`, else `0`.
+/// Branchless `u64` equality mask: returns `u64::MAX` if `a == b`, else `0`.
 ///
 /// Standard constant-time trick: `x ^ b == 0` iff `a == b`; squeeze that
-/// zero/non-zero into bit 31 via `x | -x`, shift down, then subtract 1 to
+/// zero/non-zero into bit 63 via `x | -x`, shift down, then subtract 1 to
 /// flip the meaning.
 #[inline]
-const fn ct_eq_u32_mask(a: u32, b: u32) -> u32 {
+const fn ct_eq_u64_mask(a: u64, b: u64) -> u64 {
     let x = a ^ b;
-    ((x | x.wrapping_neg()) >> 31).wrapping_sub(1)
+    ((x | x.wrapping_neg()) >> 63).wrapping_sub(1)
 }
 
 impl<B: PrecomputingPirBackend> IkpirClient<B> {

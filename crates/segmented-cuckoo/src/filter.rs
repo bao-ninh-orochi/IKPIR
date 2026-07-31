@@ -202,7 +202,7 @@ pub struct CuckooFilter<S: IndexScheme> {
     max_kicks: u32,
     /// Pre-allocated rollback chain reused across `insert` calls; capacity tracks
     /// `max_kicks` so the kicking loop never allocates on the hot path.
-    chain: Vec<(u32, u32, u32)>,
+    chain: Vec<(u32, u32, u64)>,
 }
 
 /// Supported arity values (candidate buckets per item).
@@ -217,7 +217,7 @@ pub const SUPPORTED_BUCKET_SIZES: std::ops::RangeInclusive<u32> = 1..=4;
 /// - `arity` ∈ {2, 3, 4} (see [`SUPPORTED_ARITIES`]).
 /// - `bucket_size` ∈ 1..=4 (see [`SUPPORTED_BUCKET_SIZES`]).
 /// - `fingerprint_bits` must satisfy `2^fingerprint_bits > arity*bucket_size` (guarantees FPR < 1)
-///   and be ≤ 32.
+///   and be ≤ 64.
 pub fn validate_common_params(
     arity: u32,
     bucket_size: u32,
@@ -234,9 +234,9 @@ pub fn validate_common_params(
         )));
     }
     let min_fingerprint_bits = (arity * bucket_size).ilog2() + 1;
-    if fingerprint_bits < min_fingerprint_bits || fingerprint_bits > 32 {
+    if fingerprint_bits < min_fingerprint_bits || fingerprint_bits > 64 {
         return Err(CuckooError::InvalidParams(format!(
-            "fingerprint_bits must be in {min_fingerprint_bits}..=32 for arity={arity}, bucket_size={bucket_size} (ensures FPR < 1)"
+            "fingerprint_bits must be in {min_fingerprint_bits}..=64 for arity={arity}, bucket_size={bucket_size} (ensures FPR < 1)"
         )));
     }
     Ok(())
@@ -257,7 +257,7 @@ impl CuckooFilter<Segmented2aryScheme> {
     ///
     /// - `num_buckets` must be a power of 2 and ≥ 2.
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -316,7 +316,7 @@ impl CuckooFilter<Segmented2aryScheme> {
     /// # Constraints
     ///
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(2 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -376,7 +376,7 @@ impl CuckooFilter<Segmented3aryScheme> {
     ///
     /// - `num_buckets` must equal `3 · 2^t` for some `t ≥ 0` (i.e., `num_buckets/3` is a power of 2).
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -434,7 +434,7 @@ impl CuckooFilter<Segmented3aryScheme> {
     /// # Constraints
     ///
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -498,7 +498,7 @@ impl CuckooFilter<Segmented4aryScheme> {
     ///
     /// - `num_buckets` must be a power of 2 and ≥ 4 (so each of the four segments is also a power of 2).
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -557,7 +557,7 @@ impl CuckooFilter<Segmented4aryScheme> {
     /// # Constraints
     ///
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -619,7 +619,7 @@ impl CuckooFilter<Standard2aryScheme> {
     ///
     /// - `num_buckets` must be a power of 2 and ≥ 1.
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(2b)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(2b)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -671,7 +671,7 @@ impl CuckooFilter<Standard2aryScheme> {
     /// # Constraints
     ///
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(2b)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(2b)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -734,7 +734,7 @@ impl CuckooFilter<Standard3aryScheme> {
     ///
     /// - `num_buckets` must be a power of 3 (`3^t`) and ≥ 1.
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -787,7 +787,7 @@ impl CuckooFilter<Standard3aryScheme> {
     /// # Constraints
     ///
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(3 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -850,7 +850,7 @@ impl CuckooFilter<Standard4aryScheme> {
     ///
     /// - `num_buckets` must be a power of 4 (`4^t`) and ≥ 1.
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -903,7 +903,7 @@ impl CuckooFilter<Standard4aryScheme> {
     /// # Constraints
     ///
     /// - `bucket_size` must be in `1..=4`.
-    /// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 32]`.
+    /// - `fingerprint_bits` must be in `[⌊log2(4 * bucket_size)⌋+1, 64]`.
     ///
     /// # Returns
     ///
@@ -1398,7 +1398,9 @@ mod tests {
         assert!(CuckooFilter::<Segmented2aryScheme>::new(1, 4, 12).is_err());
         assert!(CuckooFilter::<Segmented2aryScheme>::new(4, 0, 12).is_err());
         assert!(CuckooFilter::<Segmented2aryScheme>::new(4, 4, 0).is_err());
-        assert!(CuckooFilter::<Segmented2aryScheme>::new(4, 4, 33).is_err());
+        // fingerprint_bits widened to a 64-bit cap: 65 (not 33) is now the
+        // first value past the valid range.
+        assert!(CuckooFilter::<Segmented2aryScheme>::new(4, 4, 65).is_err());
         assert!(CuckooFilter::<Segmented2aryScheme>::new(4, 4, 3).is_err());
     }
 
@@ -1473,7 +1475,9 @@ mod tests {
         assert!(CuckooFilter::<Standard2aryScheme>::new(0, 4, 12).is_err());
         assert!(CuckooFilter::<Standard2aryScheme>::new(4, 0, 12).is_err());
         assert!(CuckooFilter::<Standard2aryScheme>::new(4, 4, 0).is_err());
-        assert!(CuckooFilter::<Standard2aryScheme>::new(4, 4, 33).is_err());
+        // fingerprint_bits widened to a 64-bit cap: 65 (not 33) is now the
+        // first value past the valid range.
+        assert!(CuckooFilter::<Standard2aryScheme>::new(4, 4, 65).is_err());
         assert!(CuckooFilter::<Standard2aryScheme>::new(4, 4, 3).is_err());
     }
 

@@ -52,8 +52,8 @@ pub trait IndexScheme {
     /// Hash an item to produce a fingerprint and candidate bucket indices.
     ///
     /// This is the primary entry point for the filter's insert, lookup, and delete paths.
-    /// The fingerprint is derived from the lower 32 bits of the xxh3 hash; the indices are
-    /// derived from the upper 32 bits plus XOR chaining with fingerprint-hash offsets.
+    /// The fingerprint is derived from the low 64 bits of the xxh3_128 digest; the indices
+    /// are derived from the high 64 bits plus XOR chaining with fingerprint-hash offsets.
     ///
     /// # Arguments
     ///
@@ -62,7 +62,7 @@ pub trait IndexScheme {
     ///
     /// # Constraints
     ///
-    /// - `fingerprint_bits` must be in `1..=32` and must match the filter's `fingerprint_bits`.
+    /// - `fingerprint_bits` must be in `1..=64` and must match the filter's `fingerprint_bits`.
     ///
     /// # Returns
     ///
@@ -70,7 +70,7 @@ pub trait IndexScheme {
     /// - `fingerprint` is a non-zero value in `[1, 2^fingerprint_bits]`.
     /// - `indices[0..arity()]` are the valid candidate bucket indices.
     /// - `indices[arity()..]` are `0` (unused padding).
-    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]);
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u64, [u32; 4]);
 
     /// Reconstruct all candidate indices from one known index and its fingerprint.
     ///
@@ -87,7 +87,7 @@ pub trait IndexScheme {
     /// # Returns
     ///
     /// The full candidate array; `result[0..arity()]` are valid; remainder is `0`.
-    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4];
+    fn all_indices(&self, cur_index: u32, fingerprint: u64) -> [u32; 4];
 }
 
 // ─── 2-ary schemes ──────────────────────────────────────────────────────────
@@ -122,10 +122,10 @@ impl IndexScheme for Standard2aryScheme {
     fn arity(&self) -> usize {
         2
     }
-    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u64, [u32; 4]) {
         hash::hash_item_standard_2ary(item, self.num_buckets, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+    fn all_indices(&self, cur_index: u32, fingerprint: u64) -> [u32; 4] {
         hash::all_indices_standard_2ary(cur_index, fingerprint, self.num_buckets)
     }
 }
@@ -160,10 +160,10 @@ impl IndexScheme for Segmented2aryScheme {
     fn arity(&self) -> usize {
         2
     }
-    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u64, [u32; 4]) {
         hash::hash_item_segmented_2ary(item, self.segment_size, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+    fn all_indices(&self, cur_index: u32, fingerprint: u64) -> [u32; 4] {
         hash::all_indices_segmented_2ary(cur_index, fingerprint, self.segment_size)
     }
 }
@@ -198,10 +198,10 @@ impl IndexScheme for Standard3aryScheme {
     fn arity(&self) -> usize {
         3
     }
-    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u64, [u32; 4]) {
         hash::hash_item_standard_3ary(item, self.num_buckets, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+    fn all_indices(&self, cur_index: u32, fingerprint: u64) -> [u32; 4] {
         hash::all_indices_standard_3ary(cur_index, fingerprint, self.num_buckets)
     }
 }
@@ -236,10 +236,10 @@ impl IndexScheme for Segmented3aryScheme {
     fn arity(&self) -> usize {
         3
     }
-    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u64, [u32; 4]) {
         hash::hash_item_segmented_3ary(item, self.segment_size, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+    fn all_indices(&self, cur_index: u32, fingerprint: u64) -> [u32; 4] {
         hash::all_indices_segmented_3ary(cur_index, fingerprint, self.segment_size)
     }
 }
@@ -274,10 +274,10 @@ impl IndexScheme for Standard4aryScheme {
     fn arity(&self) -> usize {
         4
     }
-    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u64, [u32; 4]) {
         hash::hash_item_standard_4ary(item, self.num_buckets, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+    fn all_indices(&self, cur_index: u32, fingerprint: u64) -> [u32; 4] {
         hash::all_indices_standard_4ary(cur_index, fingerprint, self.num_buckets)
     }
 }
@@ -313,10 +313,10 @@ impl IndexScheme for Segmented4aryScheme {
     fn arity(&self) -> usize {
         4
     }
-    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u32, [u32; 4]) {
+    fn hash_item(&self, item: &[u8], fingerprint_bits: u32) -> (u64, [u32; 4]) {
         hash::hash_item_segmented_4ary(item, self.segment_size, fingerprint_bits)
     }
-    fn all_indices(&self, cur_index: u32, fingerprint: u32) -> [u32; 4] {
+    fn all_indices(&self, cur_index: u32, fingerprint: u64) -> [u32; 4] {
         hash::all_indices_segmented_4ary(cur_index, fingerprint, self.segment_size)
     }
 }

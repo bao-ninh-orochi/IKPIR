@@ -4,11 +4,11 @@
 //!
 //! This module provides three layers of hashing:
 //!
-//! 1. **Item hashing** — xxHash3 (64-bit, non-cryptographic) maps arbitrary byte slices
-//!    to a 64-bit digest. The upper 32 bits seed the primary bucket index; the lower 32
-//!    bits seed the fingerprint.
+//! 1. **Item hashing** — xxHash3 (128-bit, non-cryptographic) maps arbitrary byte slices
+//!    to a 128-bit digest. The high 64 bits seed the primary bucket index; the low 64
+//!    bits seed the fingerprint (masked down to `fingerprint_bits`, up to the full 64).
 //!
-//! 2. **Fingerprint hash functions** — Three independent Murmur-constant mixers produce the
+//! 2. **Fingerprint hash functions** — Three independent multiply-shift mixers produce the
 //!    XOR offsets that link candidate indices in the cuckoo chain. Each uses a distinct
 //!    multiplier so their outputs are independently distributed for typical fingerprint values.
 //!
@@ -23,15 +23,27 @@
 //! function outputs can craft items that collide on fingerprint or bucket index, leading
 //! to elevated false-positive rates or targeted denial-of-service via table-full
 //! conditions (hash-flooding attack). If adversarial inputs are expected, replace
-//! `xxh3_64` with a keyed hash (e.g., SipHash-1-3).
+//! `xxh3_128` with a keyed hash (e.g., SipHash-1-3). The intended hardened posture is a
+//! seeded `xxh3_128` with the seed sampled at store initialization and carried in the
+//! parameters (not implemented here; it would change no bound).
 //!
 //! # Bit layout
 //!
 //! ```text
-//!   xxh3_64(item) → h: u64
-//!   fingerprint        = lower 32 bits, masked to fingerprint_bits, non-zero
-//!   primary index i1   = upper 32 bits, masked to (range - 1)
+//!   xxh3_128(item) → h: u128
+//!   fingerprint        = low 64 bits, masked to fingerprint_bits, non-zero
+//!   primary index i1   = high 64 bits, masked to (range - 1)
 //! ```
+//!
+//! ## Why low/high split matters
+//!
+//! The correctness analysis requires the fingerprint and the bucket-derivation randomness
+//! (`i1`/the xor-chain offsets) to not share randomness. Drawing them from disjoint halves
+//! of one 128-bit digest preserves that at every `fingerprint_bits ≤ 64`: at the old cap of
+//! `fingerprint_bits ≤ 32`, the two halves of a 64-bit digest already sufficed, but at
+//! `fingerprint_bits = 64` they cannot — a 64-bit fingerprint would have to consume the
+//! *entire* 64-bit digest, leaving nothing independent for the bucket index. The 128-bit
+//! digest keeps a full, disjoint 64 bits for each role regardless of fingerprint width.
 //!
 //! # File layout
 //!
@@ -39,20 +51,31 @@
 //! variants. Within each section, scheme order is 2-ary → 3-ary → 4-ary, and each arity
 //! groups its `hash_item_*` entry point with its `all_indices_*` reconstruction helper.
 
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::xxh3_128;
 
 // ── Fingerprint hash functions ──────────────────────────────────────────────
 // Each uses a different mixing constant to produce independent hashes.
 // `range` must be a power of 2; output is in [0, range).
+//
+// Why the HIGH 32 bits of the 64-bit product: the low 32 bits of
+// `fingerprint.wrapping_mul(C) mod 2^64` depend only on the low 32 bits of
+// `fingerprint` — multiplication never carries information from a factor's
+// high bits down into the product's low bits. Masking the low half would
+// therefore let two fingerprints that differ only above bit 31 collide on
+// every offset, once `fingerprint_bits > 32` makes that difference possible.
+// The high 32 bits of the product depend on all 64 input bits, so they stay
+// well-mixed across the full widened range.
 
 /// Compute the first XOR offset for a fingerprint.
 ///
-/// Multiplies `fingerprint` by the MurmurHash2 constant `0x5bd1e995` (with wrapping) and
-/// masks the result to `[0, range)`. Used to derive `i2` from `i1` in all schemes.
+/// Multiplies `fingerprint` by the MurmurHash3 fmix64 constant
+/// `0xff51afd7ed558ccd` (with wrapping), keeps the high 32 bits of the
+/// 64-bit product, and masks the result to `[0, range)`. Used to derive
+/// `i2` from `i1` in all schemes.
 ///
 /// # Arguments
 ///
-/// - `fingerprint` — non-zero fingerprint value.
+/// - `fingerprint` — non-zero fingerprint value (1–64 bits wide).
 /// - `range` — table size or segment size.
 ///
 /// # Constraints
@@ -65,7 +88,7 @@ use xxhash_rust::xxh3::xxh3_64;
 ///
 /// # Performance
 ///
-/// O(1) — one multiply, one AND.
+/// O(1) — one multiply, one shift, one AND.
 ///
 /// # Examples
 ///
@@ -76,18 +99,20 @@ use xxhash_rust::xxh3::xxh3_64;
 /// assert!(offset < 256);
 /// ```
 #[inline]
-pub const fn fingerprint_hash1(fingerprint: u32, range: u32) -> u32 {
-    fingerprint.wrapping_mul(0x5bd1e995) & (range - 1)
+pub const fn fingerprint_hash1(fingerprint: u64, range: u32) -> u32 {
+    ((fingerprint.wrapping_mul(0xff51afd7ed558ccd)) >> 32) as u32 & (range - 1)
 }
 
 /// Compute the second XOR offset for a fingerprint.
 ///
-/// Multiplies `fingerprint` by the MurmurHash3 c1 constant `0xcc9e2d51` and masks to
-/// `[0, range)`. Used to derive `i3` from `i2` in 3-ary and 4-ary schemes.
+/// Multiplies `fingerprint` by the MurmurHash3 fmix64 constant
+/// `0xc4ceb9fe1a85ec53`, keeps the high 32 bits of the 64-bit product, and
+/// masks to `[0, range)`. Used to derive `i3` from `i2` in 3-ary and 4-ary
+/// schemes.
 ///
 /// # Arguments
 ///
-/// - `fingerprint` — non-zero fingerprint value.
+/// - `fingerprint` — non-zero fingerprint value (1–64 bits wide).
 /// - `range` — table size or segment size.
 ///
 /// # Constraints
@@ -112,18 +137,20 @@ pub const fn fingerprint_hash1(fingerprint: u32, range: u32) -> u32 {
 /// assert!(offset < 256);
 /// ```
 #[inline]
-pub const fn fingerprint_hash2(fingerprint: u32, range: u32) -> u32 {
-    fingerprint.wrapping_mul(0xcc9e2d51) & (range - 1)
+pub const fn fingerprint_hash2(fingerprint: u64, range: u32) -> u32 {
+    ((fingerprint.wrapping_mul(0xc4ceb9fe1a85ec53)) >> 32) as u32 & (range - 1)
 }
 
 /// Compute the third XOR offset for a fingerprint.
 ///
-/// Multiplies `fingerprint` by the MurmurHash3 c2 constant `0x1b873593` and masks to
-/// `[0, range)`. Used to derive `i4` from `i3` in 4-ary schemes.
+/// Multiplies `fingerprint` by `0x9e3779b97f4a7c15` (`2^64 / φ`, rounded to
+/// the nearest odd integer), keeps the high 32 bits of the 64-bit product,
+/// and masks to `[0, range)`. Used to derive `i4` from `i3` in 4-ary
+/// schemes.
 ///
 /// # Arguments
 ///
-/// - `fingerprint` — non-zero fingerprint value.
+/// - `fingerprint` — non-zero fingerprint value (1–64 bits wide).
 /// - `range` — table size or segment size.
 ///
 /// # Constraints
@@ -148,13 +175,13 @@ pub const fn fingerprint_hash2(fingerprint: u32, range: u32) -> u32 {
 /// assert!(offset < 256);
 /// ```
 #[inline]
-pub const fn fingerprint_hash3(fingerprint: u32, range: u32) -> u32 {
-    fingerprint.wrapping_mul(0x1b873593) & (range - 1)
+pub const fn fingerprint_hash3(fingerprint: u64, range: u32) -> u32 {
+    ((fingerprint.wrapping_mul(0x9e3779b97f4a7c15)) >> 32) as u32 & (range - 1)
 }
 
 // ── Common helpers ──────────────────────────────────────────────────────────
 
-/// Extract a non-zero fingerprint from the lower 32 bits of an xxh3 hash.
+/// Extract a non-zero fingerprint from the low 64 bits of an xxh3 digest.
 ///
 /// Fingerprint 0 is reserved to mean "slot empty" in [`FingerprintTable`]. When the masked
 /// hash value is 0, this function returns 1 instead, introducing a tiny bias toward
@@ -162,8 +189,8 @@ pub const fn fingerprint_hash3(fingerprint: u32, range: u32) -> u32 {
 ///
 /// # Arguments
 ///
-/// - `h` — 64-bit xxh3 hash of the item.
-/// - `fingerprint_bits` — fingerprint bit width (1–32). Must be ≥ 1.
+/// - `h` — low 64 bits of the item's xxh3_128 digest.
+/// - `fingerprint_bits` — fingerprint bit width (1–64). Must be ≥ 1.
 ///
 /// # Returns
 ///
@@ -178,31 +205,36 @@ pub const fn fingerprint_hash3(fingerprint: u32, range: u32) -> u32 {
 /// ```rust,ignore
 /// use segmented_cuckoo::hash::extract_fingerprint;
 ///
-/// // When the lower bits happen to be 0, fingerprint is forced to 1.
+/// // When the masked bits happen to be 0, fingerprint is forced to 1.
 /// let fp = extract_fingerprint(0xFFFF_FFFF_0000_0000u64, 12);
 /// assert_eq!(fp, 1);
 ///
 /// // Normal case: mask to fingerprint_bits.
 /// let fp2 = extract_fingerprint(0x0000_0000_0000_0FFFu64, 12);
 /// assert_eq!(fp2, 0xFFF);
+///
+/// // fingerprint_bits = 64: mask is u64::MAX, computed without `1u64 << 64` (which
+/// // would overflow).
+/// let fp3 = extract_fingerprint(u64::MAX, 64);
+/// assert_eq!(fp3, u64::MAX);
 /// ```
 ///
 /// [`FingerprintTable`]: crate::fingerprint_table::FingerprintTable
 #[inline]
-pub const fn extract_fingerprint(h: u64, fingerprint_bits: u32) -> u32 {
-    let mask = if fingerprint_bits >= 32 {
-        u32::MAX
+pub const fn extract_fingerprint(h: u64, fingerprint_bits: u32) -> u64 {
+    let mask = if fingerprint_bits >= 64 {
+        u64::MAX
     } else {
-        (1u32 << fingerprint_bits) - 1
+        (1u64 << fingerprint_bits) - 1
     };
-    let mut fingerprint = (h as u32) & mask;
+    let mut fingerprint = h & mask;
     if fingerprint == 0 {
         fingerprint = 1;
     }
     fingerprint
 }
 
-/// Hash `item` with xxh3_64, extract the fingerprint, and derive the primary index `i1`.
+/// Hash `item` with xxh3_128, extract the fingerprint, and derive the primary index `i1`.
 ///
 /// This is the entry point for all `hash_item_*` functions. It wraps the xxh3 call and
 /// the two extraction steps into a single reusable helper.
@@ -210,16 +242,17 @@ pub const fn extract_fingerprint(h: u64, fingerprint_bits: u32) -> u32 {
 /// # Arguments
 ///
 /// - `item` — arbitrary byte slice to hash.
-/// - `fingerprint_bits` — fingerprint bit width (1–32).
+/// - `fingerprint_bits` — fingerprint bit width (1–64).
 /// - `range` — table size or segment size; **must be a power of 2**. `i1` is masked to
 ///   `[0, range)`.
 ///
 /// # Returns
 ///
 /// `(h, fingerprint, i1)` where:
-/// - `h` — raw 64-bit xxh3 hash (exposed for tests / debugging).
-/// - `fingerprint` — non-zero fingerprint in `[1, 2^fingerprint_bits]`.
-/// - `i1` — primary bucket index in `[0, range)`.
+/// - `h` — raw 128-bit xxh3 digest (exposed for tests / debugging).
+/// - `fingerprint` — non-zero fingerprint in `[1, 2^fingerprint_bits]`, drawn from the
+///   digest's low 64 bits.
+/// - `i1` — primary bucket index in `[0, range)`, drawn from the digest's high 64 bits.
 ///
 /// # Performance
 ///
@@ -236,10 +269,10 @@ pub const fn extract_fingerprint(h: u64, fingerprint_bits: u32) -> u32 {
 /// assert!(i1 < 128);
 /// ```
 #[inline]
-pub fn hash_and_i1(item: &[u8], fingerprint_bits: u32, range: u32) -> (u64, u32, u32) {
-    let h = xxh3_64(item);
-    let fingerprint = extract_fingerprint(h, fingerprint_bits);
-    let i1 = ((h >> 32) as u32) & (range - 1);
+pub fn hash_and_i1(item: &[u8], fingerprint_bits: u32, range: u32) -> (u128, u64, u32) {
+    let h = xxh3_128(item);
+    let fingerprint = extract_fingerprint(h as u64, fingerprint_bits);
+    let i1 = ((h >> 64) as u32) & (range - 1);
     (h, fingerprint, i1)
 }
 
@@ -345,10 +378,13 @@ pub const fn xor4(a: u32, b: u32) -> u32 {
 
 /// Fingerprint hash using modulo (for power-of-3 ranges where bitmask doesn't apply).
 ///
+/// Same high-32-bits-of-the-product rationale as [`fingerprint_hash1`], with `%` in
+/// place of `&` since `range` need not be a power of 2 here.
+///
 /// - `range` — table size; need not be a power of 2.
 #[inline]
-pub const fn fingerprint_hash_mod(fingerprint: u32, range: u32) -> u32 {
-    fingerprint.wrapping_mul(0x5bd1e995) % range
+pub const fn fingerprint_hash_mod(fingerprint: u64, range: u32) -> u32 {
+    (((fingerprint.wrapping_mul(0xff51afd7ed558ccd)) >> 32) as u32) % range
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -390,7 +426,7 @@ pub fn hash_item_segmented_2ary(
     item: &[u8],
     segment_size: u32,
     fingerprint_bits: u32,
-) -> (u32, [u32; 4]) {
+) -> (u64, [u32; 4]) {
     let (_h, fingerprint, i1) = hash_and_i1(item, fingerprint_bits, segment_size);
     let i2 = segment_size + (i1 ^ fingerprint_hash1(fingerprint, segment_size));
     (fingerprint, [i1, i2, 0, 0])
@@ -429,7 +465,7 @@ pub fn hash_item_segmented_2ary(
 /// ```
 pub const fn all_indices_segmented_2ary(
     cur_index: u32,
-    fingerprint: u32,
+    fingerprint: u64,
     segment_size: u32,
 ) -> [u32; 4] {
     let h1 = fingerprint_hash1(fingerprint, segment_size);
@@ -480,7 +516,7 @@ pub fn hash_item_segmented_3ary(
     item: &[u8],
     segment_size: u32,
     fingerprint_bits: u32,
-) -> (u32, [u32; 4]) {
+) -> (u64, [u32; 4]) {
     let (_h, fingerprint, i1) = hash_and_i1(item, fingerprint_bits, segment_size);
     let h1 = fingerprint_hash1(fingerprint, segment_size);
     let h2 = fingerprint_hash2(fingerprint, segment_size);
@@ -522,7 +558,7 @@ pub fn hash_item_segmented_3ary(
 /// let r = all_indices_segmented_3ary(idx[2], fingerprint, segment_size);
 /// assert_eq!(r[0], idx[0]);
 /// ```
-pub fn all_indices_segmented_3ary(cur_index: u32, fingerprint: u32, segment_size: u32) -> [u32; 4] {
+pub fn all_indices_segmented_3ary(cur_index: u32, fingerprint: u64, segment_size: u32) -> [u32; 4] {
     let h1 = fingerprint_hash1(fingerprint, segment_size);
     let h2 = fingerprint_hash2(fingerprint, segment_size);
     let position = cur_index / segment_size;
@@ -576,7 +612,7 @@ pub fn hash_item_segmented_4ary(
     item: &[u8],
     segment_size: u32,
     fingerprint_bits: u32,
-) -> (u32, [u32; 4]) {
+) -> (u64, [u32; 4]) {
     let (_h, fingerprint, i1) = hash_and_i1(item, fingerprint_bits, segment_size);
     let h1 = fingerprint_hash1(fingerprint, segment_size);
     let h2 = fingerprint_hash2(fingerprint, segment_size);
@@ -624,7 +660,7 @@ pub fn hash_item_segmented_4ary(
 /// let r = all_indices_segmented_4ary(idx[2], fingerprint, segment_size);
 /// assert_eq!(r, idx);
 /// ```
-pub fn all_indices_segmented_4ary(cur_index: u32, fingerprint: u32, segment_size: u32) -> [u32; 4] {
+pub fn all_indices_segmented_4ary(cur_index: u32, fingerprint: u64, segment_size: u32) -> [u32; 4] {
     let h1 = fingerprint_hash1(fingerprint, segment_size);
     let h2 = fingerprint_hash2(fingerprint, segment_size);
     let h3 = fingerprint_hash3(fingerprint, segment_size);
@@ -691,7 +727,7 @@ pub fn hash_item_standard_2ary(
     item: &[u8],
     num_buckets: u32,
     fingerprint_bits: u32,
-) -> (u32, [u32; 4]) {
+) -> (u64, [u32; 4]) {
     let (_h, fingerprint, i1) = hash_and_i1(item, fingerprint_bits, num_buckets);
     let i2 = i1 ^ fingerprint_hash1(fingerprint, num_buckets);
     (fingerprint, [i1, i2, 0, 0])
@@ -735,7 +771,7 @@ pub fn hash_item_standard_2ary(
 /// ```
 pub const fn all_indices_standard_2ary(
     cur_index: u32,
-    fingerprint: u32,
+    fingerprint: u64,
     num_buckets: u32,
 ) -> [u32; 4] {
     let h1 = fingerprint_hash1(fingerprint, num_buckets);
@@ -780,10 +816,10 @@ pub fn hash_item_standard_3ary(
     item: &[u8],
     num_buckets: u32,
     fingerprint_bits: u32,
-) -> (u32, [u32; 4]) {
-    let raw = xxh3_64(item);
-    let fingerprint = extract_fingerprint(raw, fingerprint_bits);
-    let i1 = ((raw >> 32) as u32) % num_buckets;
+) -> (u64, [u32; 4]) {
+    let raw = xxh3_128(item);
+    let fingerprint = extract_fingerprint(raw as u64, fingerprint_bits);
+    let i1 = ((raw >> 64) as u32) % num_buckets;
     let h = fingerprint_hash_mod(fingerprint, num_buckets);
     let i2 = xor3(i1, h);
     let i3 = xor3(i2, h);
@@ -827,7 +863,7 @@ pub fn hash_item_standard_3ary(
 /// ```
 pub const fn all_indices_standard_3ary(
     cur_index: u32,
-    fingerprint: u32,
+    fingerprint: u64,
     num_buckets: u32,
 ) -> [u32; 4] {
     // xor3 cycling: applying h three times returns to start.
@@ -876,7 +912,7 @@ pub fn hash_item_standard_4ary(
     item: &[u8],
     num_buckets: u32,
     fingerprint_bits: u32,
-) -> (u32, [u32; 4]) {
+) -> (u64, [u32; 4]) {
     let (_h, fingerprint, i1) = hash_and_i1(item, fingerprint_bits, num_buckets);
     let h = fingerprint_hash1(fingerprint, num_buckets);
     let i2 = xor4(i1, h);
@@ -922,7 +958,7 @@ pub fn hash_item_standard_4ary(
 /// ```
 pub const fn all_indices_standard_4ary(
     cur_index: u32,
-    fingerprint: u32,
+    fingerprint: u64,
     num_buckets: u32,
 ) -> [u32; 4] {
     // xor4 cycling: applying h four times returns to start.
@@ -1124,7 +1160,7 @@ mod tests {
     #[test]
     fn fingerprint_hash_mod_range() {
         for range in [3u32, 9, 27, 243] {
-            for fp in 1u32..=100 {
+            for fp in 1u64..=100 {
                 assert!(fingerprint_hash_mod(fp, range) < range);
             }
         }
@@ -1166,7 +1202,7 @@ mod tests {
         // Ensure h1, h2, h3 produce different outputs for typical fingerprints
         let range = 256u32;
         let mut same_count = 0;
-        for fp in 1u32..1000 {
+        for fp in 1u64..1000 {
             let h1 = fingerprint_hash1(fp, range);
             let h2 = fingerprint_hash2(fp, range);
             let h3 = fingerprint_hash3(fp, range);
@@ -1180,6 +1216,39 @@ mod tests {
             "too many hash collisions: {}/999",
             same_count
         );
+    }
+
+    /// Two fingerprints that differ only *above* bit 31 must map to
+    /// different offsets for most of a small deterministic sample. This
+    /// pins that the high 32 bits of the 64-bit product feed the result —
+    /// masking the low 32 bits instead would make every such pair collide
+    /// on every offset, since the low 32 bits of `a * C mod 2^64` depend
+    /// only on the low 32 bits of `a`. Deterministic (no RNG), so a
+    /// regression here can never be dismissed as a flaky sample.
+    #[test]
+    fn fingerprint_hash_functions_spread_high_bit_only_differences() {
+        let range = 1u32 << 20;
+        let n = 200u64;
+        let mut same1 = 0u64;
+        let mut same2 = 0u64;
+        let mut same3 = 0u64;
+        for i in 0..n {
+            let low = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) & 0xFFFF_FFFF;
+            let a = low; // high bits all zero
+            let b = low | (1u64 << 40); // same low 32 bits, differs above bit 31
+            if fingerprint_hash1(a, range) == fingerprint_hash1(b, range) {
+                same1 += 1;
+            }
+            if fingerprint_hash2(a, range) == fingerprint_hash2(b, range) {
+                same2 += 1;
+            }
+            if fingerprint_hash3(a, range) == fingerprint_hash3(b, range) {
+                same3 += 1;
+            }
+        }
+        assert!(same1 < n / 2, "fingerprint_hash1: {same1}/{n} collided");
+        assert!(same2 < n / 2, "fingerprint_hash2: {same2}/{n} collided");
+        assert!(same3 < n / 2, "fingerprint_hash3: {same3}/{n} collided");
     }
 
     // ── extract_fingerprint ──
@@ -1198,6 +1267,26 @@ mod tests {
         assert_eq!(extract_fingerprint(h, 8), 0xFF);
         assert_eq!(extract_fingerprint(h, 12), 0xFFF);
         assert_eq!(extract_fingerprint(h, 32), 0xFFFF_FFFF);
+    }
+
+    /// At `fingerprint_bits = 64` the mask is `u64::MAX` (computed without the
+    /// UB-adjacent `1u64 << 64`), so an all-zero low half still folds to 1
+    /// exactly like every narrower width.
+    #[test]
+    fn extract_fingerprint_never_zero_at_f64() {
+        assert_eq!(extract_fingerprint(0, 64), 1);
+    }
+
+    /// At every width from 33 through 64 bits, an all-ones hash must mask
+    /// down to exactly `2^f - 1` (`u64::MAX` at `f = 64`, where `1u64 << 64`
+    /// would overflow) — pins mask exactness across the newly widened range.
+    #[test]
+    fn extract_fingerprint_masks_exactly_for_f_33_to_64() {
+        let all_ones = u64::MAX;
+        for f in 33u32..=64 {
+            let expected = if f == 64 { u64::MAX } else { (1u64 << f) - 1 };
+            assert_eq!(extract_fingerprint(all_ones, f), expected, "f={f}");
+        }
     }
 
     // ── xor3 ──
@@ -1255,7 +1344,7 @@ mod tests {
         // `fingerprint_hash_mod` actually produces for it.
         let num_buckets = 3u32.pow(13);
         for a in 0..num_buckets {
-            let h = fingerprint_hash_mod(a | 1, num_buckets);
+            let h = fingerprint_hash_mod((a | 1) as u64, num_buckets);
             assert_eq!(xor3(a, h), xor3_reference(a, h), "a={a} h={h}");
         }
     }
@@ -1312,7 +1401,7 @@ mod tests {
         // `all_indices_standard_3ary` can rebuild the candidate set from any of them.
         let num_buckets = 3u32.pow(13);
         for a in (0..num_buckets).step_by(37) {
-            let h = fingerprint_hash_mod(a | 1, num_buckets);
+            let h = fingerprint_hash_mod((a | 1) as u64, num_buckets);
             assert_eq!(xor3(xor3(xor3(a, h), h), h), a, "a={a} h={h}");
         }
     }

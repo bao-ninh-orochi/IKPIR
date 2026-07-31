@@ -6,6 +6,13 @@ on:
   push:
     branches: [main, master]
 
+# `orochi-runners` is a shared, finite self-hosted pool — unlike the elastic
+# GitHub-hosted fleet, a rapid push sequence here holds real executors hostage.
+# Cancel superseded runs on the same ref so the queue stays short for everyone.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
@@ -13,19 +20,37 @@ env:
 jobs:
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: orochi-runners
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: rustfmt
+      # No `cc` guard here: `cargo fmt` parses, it never compiles or links.
       - run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: orochi-runners
     steps:
       - uses: actions/checkout@v4
+
+      # This workspace is pure Rust (no `cc` build scripts anywhere in Cargo.lock),
+      # but rustc still invokes `cc` as its linker driver, and `--all-targets` links
+      # the proc-macro cdylibs (syn, serde_derive, clap_derive). The self-hosted
+      # orochi-runners image ships no gcc, so install it if it isn't there.
+      - name: Ensure C toolchain (cc) — the self-hosted orochi-runners image ships no gcc
+        shell: bash
+        run: |
+          if command -v cc >/dev/null 2>&1; then echo "cc already present"; exit 0; fi
+          if command -v apt-get >/dev/null 2>&1; then
+            (sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config) \
+              || (apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config)
+          else
+            echo "::error::no cc and no apt-get on this runner — bake build-essential/gcc into the orochi-runners image"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@1.85.0
         with:
           components: clippy
@@ -34,9 +59,22 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: orochi-runners
     steps:
       - uses: actions/checkout@v4
+
+      - name: Ensure C toolchain (cc) — the self-hosted orochi-runners image ships no gcc
+        shell: bash
+        run: |
+          if command -v cc >/dev/null 2>&1; then echo "cc already present"; exit 0; fi
+          if command -v apt-get >/dev/null 2>&1; then
+            (sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config) \
+              || (apt-get update && apt-get install -y --no-install-recommends build-essential pkg-config)
+          else
+            echo "::error::no cc and no apt-get on this runner — bake build-essential/gcc into the orochi-runners image"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features

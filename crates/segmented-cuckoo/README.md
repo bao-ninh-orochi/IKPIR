@@ -145,24 +145,25 @@ xor4(xor4(xor4(xor4(a,b),b),b),b) = a          (4 applications)
 fingerprint-derived offset; e.g. standard 4-ary (n a power of 4):
 
 ```
-fingerprint_hash(fp) = (fp * 0x5bd1e995) & (n-1)
-i1 = (H(x) >> 32) & (n-1)
+fingerprint_hash(fp) = ((fp * 0xff51afd7ed558ccd) >> 32) & (n-1)
+i1 = (H(x) >> 64) & (n-1)
 i2 = xor4(i1, fingerprint_hash(fp))
 i3 = xor4(i2, fingerprint_hash(fp))
 i4 = xor4(i3, fingerprint_hash(fp))
 ```
 
-Standard 3-ary uses `(fp * 0x5bd1e995) % n` because n = 3^k is not a power of 2.
-This modulo is what the arity-3 throughput gap in the results below comes down
-to.
+Standard 3-ary uses `((fp * 0xff51afd7ed558ccd) >> 32) % n` because n = 3^k is not
+a power of 2. This modulo is what the arity-3 throughput gap in the results below
+comes down to.
 
 **No position storage.** The same offset is applied at each step, so the cycling
 property reconstructs all k candidates from any one of them — no per-slot chain
 position is stored, even for standard k > 2 filters.
 
-The item hash is xxHash3 (64-bit, non-cryptographic): fingerprint from the lower
-32 bits, primary index from the upper 32 bits. A fingerprint of 0 is forbidden
-(marks empty); a 0 hash is replaced with 1.
+The item hash is xxHash3_128 (128-bit, non-cryptographic): fingerprint from the
+low 64 bits (masked to `fingerprint_bits`, up to the full 64), primary index from
+the high 64 bits. A fingerprint of 0 is forbidden (marks empty); a 0 hash is
+replaced with 1.
 
 ---
 
@@ -181,7 +182,7 @@ candidate to its own segment. The partial-key XOR formulas operate *within* a
 segment; writing `i_j = j*segment_size + i_j_local`, e.g. segmented 4-ary:
 
 ```
-i1_local = (H(x) >> 32) & (segment_size - 1)
+i1_local = (H(x) >> 64) & (segment_size - 1)
 i2_local = i1_local XOR h1(fp)
 i3_local = i2_local XOR h2(fp)
 i4_local = i3_local XOR h3(fp)
@@ -215,7 +216,7 @@ Defaults, and the reasoning behind them, live in one place —
 
 | Parameter | Default | Why |
 |---|---|---|
-| `fingerprint_bits` | **32** | Drives FPR to `k·b / 2^32`, so a false positive never perturbs a load-factor or throughput measurement and the numbers isolate the indexing scheme |
+| `fingerprint_bits` | **32** | Drives FPR to `k·b / 2^f` (`k·b / 2^32` at the default); a false positive never perturbs a load-factor or throughput measurement, so the numbers isolate the indexing scheme. `f` up to 64 is supported (the default stays 32) |
 | `max_kicks` | **2500** | High enough that measured load factor reflects the scheme rather than the kick budget; a small budget caps it well below the true threshold at ~10^6 buckets |
 | `num_buckets` | **~10^6** | Per arity, below |
 | trials | 10 (20 for load factor) | Load factor reports one headline number per config, so it buys a tighter error bar |
