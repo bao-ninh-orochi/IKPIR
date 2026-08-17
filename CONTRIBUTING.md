@@ -57,5 +57,5 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
 Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in the work by you, as defined in the Apache-2.0
-license, shall be dual licensed as in [README § License](README.md#license),
-without any additional terms or conditions.
+license, shall be licensed as in [README § License](README.md#license) —
+Apache-2.0 — without any additional terms or conditions.
