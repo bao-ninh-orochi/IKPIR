@@ -1,0 +1,46 @@
+# cargo-deny — license policy for the RisePIR workspace.
+#
+# The workspace is distributed under Apache-2.0 alone (see LICENSE / NOTICE).
+# That is only sound while every crate in the resolved dependency graph carries
+# a license permitting redistribution inside an Apache-2.0 work. The point of
+# this file is that the property is *checked*, not merely true today: the
+# `licenses` CI job runs `cargo deny check licenses` on every PR.
+#
+# Note the asymmetry — a dependency does not have to be Apache-2.0 or MIT. It
+# has to be *compatible*: permissive, imposing no reciprocal obligation on the
+# work it is linked into. Copyleft (GPL, AGPL, LGPL, MPL, SSPL) is what breaks
+# the property, and is absent from the allow-list below by design rather than
+# by omission. Adding such a crate fails CI; the fix is a different crate, not
+# a wider allow-list.
+
+[licenses]
+version = 2
+
+# Permissive licenses only. Every entry has been checked to impose no term
+# Apache-2.0 redistribution cannot carry.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",     # xxhash-rust — Boost; no obligation on binary redistribution
+    "Unicode-3.0", # unicode-ident — joined by AND, so mandatory, not electable
+    "Unlicense",
+    "CC0-1.0",
+]
+
+# Several entries above cover licenses no current dependency resolves to; they
+# are kept so a routine dependency bump onto an equally permissive license does
+# not fail CI for no reason. Don't warn about the slack.
+unused-allowed-license = "allow"
+
+# `r-efi` declares `MIT OR Apache-2.0 OR LGPL-2.1-or-later`. The disjunction is
+# ours to resolve and we elect Apache-2.0; the LGPL branch is never taken. It
+# reaches the graph only through wasm-target build machinery, and never through
+# a native build. Recorded here so the election is a decision on the record
+# rather than a silent artifact of allow-list ordering.
+[[licenses.exceptions]]
+name = "r-efi"
+allow = ["Apache-2.0"]
