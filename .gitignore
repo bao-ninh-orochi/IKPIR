@@ -1,5 +1,8 @@
-# Rust build artefacts
-/target
+# Rust build artefacts. `target*/` rather than `/target`: an out-of-tree build
+# dir (`CARGO_TARGET_DIR=target-remeasure cargo bench`, as the OPTIMIZATIONS.md
+# runs used) is still a build dir, and 252 of those files were committed to this
+# branch once already.
+target*/
 debug
 # rustfmt backup files
 **/*.rs.bk
