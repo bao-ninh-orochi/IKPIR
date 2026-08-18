@@ -6,9 +6,15 @@ on:
   push:
     branches: [main, master]
 
-# `orochi-runners` is a shared, finite self-hosted pool — unlike the elastic
-# GitHub-hosted fleet, a rapid push sequence here holds real executors hostage.
-# Cancel superseded runs on the same ref so the queue stays short for everyone.
+# Cancel superseded runs on the same ref so a rapid push sequence does not sit
+# in the queue behind its own stale jobs. Inherited from orochi-network/IKPIR
+# main, where it protects the shared self-hosted pool; kept here because it is
+# good hygiene on the GitHub-hosted fleet too.
+#
+# `runs-on` deliberately stays `ubuntu-latest` on this branch, where main uses
+# `orochi-runners`: that label belongs to the orochi-network org and resolves to
+# no runner at all on this personal fork, so a job asking for it would queue
+# until it timed out. Do not "sync" it back when merging main in.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,7 +26,7 @@ env:
 jobs:
   fmt:
     name: Format
-    runs-on: orochi-runners
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
@@ -31,7 +37,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: orochi-runners
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -59,7 +65,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: orochi-runners
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
