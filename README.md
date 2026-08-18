@@ -26,8 +26,21 @@ choosing a backend at the `B: IndexPirBackend` type parameter.
 > number. [`OPTIMIZATIONS.md`](OPTIMIZATIONS.md) has the design, the measured
 > speedups, and how to get `main`'s regime back
 > (`IKPIR_SETUP_THREADS=1`, or `--no-default-features`). The reference
-> implementation lives on `orochi-network/IKPIR`; this branch never merges
-> upstream.
+> implementation lives on `orochi-network/IKPIR`, which this branch tracks:
+> it is merged in, never out, so `perf/optimized` stays a strict superset of
+> upstream `main`.
+
+> **Tagged as `v0.1.0-perf`.** This branch's tip carries that tag, and the tag
+> is immutable — a future perf revision gets a new one, never a moved one.
+> It is also a pinned dependency: the `eth_getBalance`-over-RisePIR PoC for the
+> CANS 2026 paper, `orochi-network/private-eth-getbalance`, resolves
+> `ikpir-common`, `segmented-cuckoo`, and `ikpir-server` from here at that tag.
+> It has to. Upstream `main` cannot serve that dependency at all: its
+> `ikpir-common` declares no `[features]` section, so there is no `parallel`
+> feature to enable — and none of `backend/gemm.rs`, `backend/prg.rs` or the
+> rayon kernels exist there. The PoC's browser client subtracts `parallel`
+> (rayon panics on `wasm32-unknown-unknown`); every other crate re-enables it.
+> Treat this branch and that tag as published surface, not scratch space.
 
 > **Status.** Research prototype. Interfaces, parameters, and internals are
 > subject to change.
