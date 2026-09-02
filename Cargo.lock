@@ -361,7 +361,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "ikpir-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "criterion",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "ikpir-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rand",
  "rand_chacha",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "ikpir-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "criterion",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "segmented-cuckoo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "rand",

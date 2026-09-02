@@ -30,7 +30,7 @@ choosing a backend at the `B: IndexPirBackend` type parameter.
 > it is merged in, never out, so `perf/optimized` stays a strict superset of
 > upstream `main`.
 
-> **Tagged as `v0.1.0-perf`.** This branch's tip carries that tag, and the tag
+> **Tagged as `v0.2.0-perf`.** This branch's tip carries that tag, and the tag
 > is immutable — a future perf revision gets a new one, never a moved one.
 > It is also a pinned dependency: the `eth_getBalance`-over-RisePIR PoC for the
 > CANS 2026 paper, `orochi-network/private-eth-getbalance`, resolves
