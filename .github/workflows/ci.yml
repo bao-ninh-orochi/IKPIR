@@ -79,3 +79,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features
       - run: cargo bench --workspace --no-run --all-features
+
+  licenses:
+    name: Licenses
+    runs-on: orochi-runners
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `cc` guard: cargo-deny reads Cargo.lock and the registry index, it
+      # never builds the graph it audits.
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # The workspace ships under Apache-2.0 alone, which holds only while every
+      # dependency stays permissively licensed. `deny.toml` is the allow-list.
+      - run: cargo deny check licenses

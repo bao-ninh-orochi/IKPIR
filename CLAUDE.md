@@ -19,8 +19,9 @@ RisePIR/                          ← workspace root
 ├── README.md
 ├── CONTRIBUTING.md               ← toolchain pin, local CI gates, PR conventions
 ├── SECURITY.md                   ← threat-model caveats, private vulnerability reporting
-├── LICENSE-APACHE / LICENSE-MIT  ← dual license (MIT OR Apache-2.0)
-├── .github/workflows/            ← ci.yml (fmt / clippy / test / bench compile check)
+├── LICENSE / NOTICE              ← Apache-2.0 only, plus the copyright notice
+├── deny.toml                     ← cargo-deny allow-list: dependencies stay permissive
+├── .github/workflows/            ← ci.yml (fmt / clippy / test / bench compile check / licenses)
 ├── crates/
 │   ├── segmented-cuckoo/         ← filter + key-value store primitives
 │   ├── ikpir-common/             ← shared: backend traits, FrodoPIR, wire bundles, IkpirError
