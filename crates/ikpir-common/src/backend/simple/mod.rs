@@ -43,10 +43,11 @@
 //! `σ = 6.4` for 128-bit security at correctness error `δ = 2⁻⁴⁰`. The
 //! reference implementation at `github.com/ahenzinger/simplepir` matches.
 //!
-//! The implementation approximates the discrete Gaussian by a rounded
-//! continuous Gaussian (Box–Muller in `sampler.rs`); for `σ ≈ 6.4` this
-//! is statistically indistinguishable from a strict discrete-Gaussian
-//! sampler for the lattice-attack regimes relevant here.
+//! The error is a *true* discrete Gaussian `D_σ` (`P(X = x) ∝
+//! exp(−x²/(2σ²))`), sampled by the weight-table rejection method of the
+//! canonical SimplePIR reference (`sampler.rs`, after
+//! `ahenzinger/simplepir pir/gauss.go`) — matching the lattice-estimator's
+//! `DiscreteGaussian(σ)` noise model exactly, not merely approximating it.
 //!
 //! # Reshape derivation
 //!
@@ -73,7 +74,7 @@
 //!   `frodo/arith.rs` per project rule "don't refactor beyond what the
 //!   task requires").
 //! - `sampler.rs` — `sample_a` (deterministic public matrix), uniform
-//!   `Z_q` secret sampler, and Box–Muller discrete-Gaussian error sampler.
+//!   `Z_q` secret sampler, and discrete-Gaussian error sampler.
 
 mod arith;
 mod backend;
