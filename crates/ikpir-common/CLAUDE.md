@@ -33,7 +33,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/backend/simple/params.rs` | `SimpleParams` + `SimpleConfig` (user-facing knobs, default `lwe_dim = 1275`, `sigma = 6.4`) |
 | `src/backend/simple/backend.rs` | `SimplePirBackend` impl of all four traits + `SimpleServerParams / SimpleHint / SimpleClientState / SimpleQuery / SimpleResponse` + internal `reshape_dims` / `translate` helpers |
 | `src/backend/simple/arith.rs` | Δ-scaling (duplicated from frodo per project rule) |
-| `src/backend/simple/sampler.rs` | `sample_a` + `sample_uniform_zq_into` (secret) + `sample_discrete_gaussian_into` (Box–Muller error) |
+| `src/backend/simple/sampler.rs` | `sample_a` + `sample_uniform_zq_into` (secret) + `sample_discrete_gaussian_into` (true discrete Gaussian `D_σ`, table rejection sampler after `ahenzinger/simplepir pir/gauss.go`) |
 | `src/pir_params.rs` | Operating-point selection: `frodo_max_plaintext_bits` / `simple_max_plaintext_bits` — the largest `plaintext_bits` each backend decodes correctly at `q = 2³²`, evaluated at the per-segment matrix shape (full derivation of both correctness bounds in the module docs) |
 | `examples/max_plaintext_bits.rs` | Dependency-free CLI over `pir_params`, consumed by `scripts/lib.sh::backend_plaintext_bits` (sourced by `scripts/bench.sh`) |
 
