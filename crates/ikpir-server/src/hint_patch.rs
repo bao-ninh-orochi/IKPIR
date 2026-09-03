@@ -292,4 +292,106 @@ mod tests {
         assert_eq!(out[0][0].0, 2);
         assert_eq!(out[0][1].0, 5);
     }
+
+    /// Two writes to the SAME `(bucket, slot)` within one batch must
+    /// telescope to `final − initial` exactly, and the result must
+    /// satisfy `|delta| < p` for every cell -- even when each *individual*
+    /// mutation's delta is itself near the `±(p−1)` extreme, so their
+    /// naive (non-cancelling) sum could look like it exceeds `(−p, p)`.
+    /// This pins the invariant `docs/hint-delta-wire-format.md` §8 relies
+    /// on to justify `|γ| < p` as a protocol invariant for the wire
+    /// encoder: it would catch a fold that clamped or reduced each
+    /// mutation's delta independently (instead of summing exactly and
+    /// letting the intermediate term cancel), which would corrupt the
+    /// telescoped total whenever a slot is written more than once in a
+    /// batch.
+    #[test]
+    fn repeated_writes_to_one_slot_telescope() {
+        let p = params_2ary();
+
+        // fp/value chosen to push every packed cell toward its bit-packed
+        // maximum ("hits p-1 where possible" -- fp and value bits straddle
+        // cell boundaries, so not every cell lands exactly on p-1, but
+        // every cell is pushed to the top of its packed range).
+        let old1_fp = 0u64;
+        let old1_val = zero_value_cells(&p);
+        let new1_fp = 0xFFFu64; // fingerprint_bits = 12, all bits set
+        let new1_val = nonzero_value_cells(&p, 0xFF); // value_bits = 8, all bits set
+
+        let new2_fp = 0x001u64;
+        let new2_val = nonzero_value_cells(&p, 0x01);
+
+        let m1 = SlotMutation {
+            bucket: 9,
+            slot: 2,
+            old_fingerprint: old1_fp,
+            new_fingerprint: new1_fp,
+            old_value_cells: old1_val.clone(),
+            new_value_cells: new1_val.clone(),
+        };
+        let m2 = SlotMutation {
+            bucket: 9,
+            slot: 2,
+            old_fingerprint: new1_fp,
+            new_fingerprint: new2_fp,
+            old_value_cells: new1_val.clone(),
+            new_value_cells: new2_val.clone(),
+        };
+
+        let batched = fold_mutations_into_row_deltas(&[m1, m2], &p);
+
+        let net = SlotMutation {
+            bucket: 9,
+            slot: 2,
+            old_fingerprint: old1_fp,
+            new_fingerprint: new2_fp,
+            old_value_cells: old1_val,
+            new_value_cells: new2_val,
+        };
+        let expected = fold_mutations_into_row_deltas(&[net], &p);
+
+        assert_eq!(
+            batched, expected,
+            "two writes to one slot in a batch must telescope to final - initial"
+        );
+
+        let p_bound = 1i64 << p.plaintext_bits;
+        for seg in &batched {
+            for (_row, cells) in seg {
+                for (_off, delta) in cells {
+                    assert!(
+                        delta.abs() < p_bound,
+                        "telescoped delta {delta} must satisfy |delta| < p ({p_bound})"
+                    );
+                }
+            }
+        }
+
+        // Second case: the second mutation exactly restores the slot's
+        // original (empty) contents, so the net delta is all-zero and the
+        // row must be dropped entirely, even though each individual
+        // mutation was itself a large, non-trivial write.
+        let m1b = SlotMutation {
+            bucket: 11,
+            slot: 1,
+            old_fingerprint: 0,
+            new_fingerprint: new1_fp,
+            old_value_cells: zero_value_cells(&p),
+            new_value_cells: new1_val.clone(),
+        };
+        let m2b = SlotMutation {
+            bucket: 11,
+            slot: 1,
+            old_fingerprint: new1_fp,
+            new_fingerprint: 0,
+            old_value_cells: new1_val,
+            new_value_cells: zero_value_cells(&p),
+        };
+        let restored = fold_mutations_into_row_deltas(&[m1b, m2b], &p);
+        assert!(
+            restored.iter().all(|seg| seg.is_empty()),
+            "a batch that restores a slot's original contents must emit nothing, \
+             even though it is two large individual writes, not a single no-op"
+        );
+    }
 }
