@@ -56,11 +56,10 @@
 use std::collections::HashMap;
 
 use ikpir_client::{
-    FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirClient, IkpirClientError,
-    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, ServerSetupBundle, SimpleConfig,
-    SimplePirBackend,
+    DeltaWireLayout, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirClient,
+    IkpirClientError, IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend,
+    SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend,
 };
-use ikpir_common::{wire::DeltaWireLayout, SegmentRowDeltas};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
     CuckooError, CuckooKVStore, CuckooParams, IndexScheme, SchemeMeta, Segmented2aryScheme,

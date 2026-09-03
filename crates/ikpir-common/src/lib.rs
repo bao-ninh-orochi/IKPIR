@@ -24,5 +24,6 @@ pub use backend::{
 };
 pub use error::IkpirError;
 pub use wire::{
-    HintDeltaBundle, PirQueryBundle, PirResponseBundle, SegmentRowDeltas, ServerSetupBundle,
+    DeltaWireLayout, DeltaWireStats, HintDeltaBundle, PirQueryBundle, PirResponseBundle,
+    SegmentRowDeltas, ServerSetupBundle, WireError,
 };

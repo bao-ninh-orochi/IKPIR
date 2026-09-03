@@ -131,7 +131,7 @@ the `Θ(τ·w)` quantity the paper's asymptotics count.
 Worked example, (2,4), ℓ = 256 B, pb = 9, an `update` of one slot whose 64-bit
 fingerprint occupies cells 0–7 and is unchanged, value bits change in cells
 7–234 (228 cells, all nonzero): one row, one run,
-`64 + 1 + 19 + 21 + 228·10 + 1 = 2 386` bits = **299 bytes**. The pre-v1
+`64 + 1 + 1·(1 + 18) + 1·(2·10 + 1) + 228·10 = 2 385` bits = **299 bytes**. The pre-v1
 accounting (`8 B/row + 10 B/cell + 12 + 4d`) reported 2 290 bytes for the same
 bundle.
 
