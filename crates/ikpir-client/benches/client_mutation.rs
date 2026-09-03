@@ -7,13 +7,29 @@
 //! paper — the quantity whose granularity the paper's two mutation-phase
 //! columns compare.
 //!
-//! **Method:** Populate to `--load-factor`, collect N deltas per kind from
-//! a fresh server clone (deltas are identical under either patch mode),
-//! then per patch mode build a fresh client with no precompute (empty
+//! **Method:** Populate to `--load-factor`, snapshot the cell array, and
+//! build **one** server per config with `IkpirServer::new_parallel`; its
+//! epoch-0 `setup()` bundle is both the client bootstrap and the hints
+//! every replay rewinds to. For each kind, rewind that server with
+//! `IkpirServer::reset_for_replay` (a fresh store from the snapshot cells
+//! plus a clone of the epoch-0 hints — the seed-derived `A` is kept, so the
+//! post-reset state *is* the epoch-0 state) and collect N deltas (deltas
+//! are identical under either patch mode). Then per patch mode build a
+//! fresh client from the epoch-0 bundle with no precompute (empty
 //! prepared-query queue), set the client's `HintPatchMode`, and time the
 //! full sequence of N apply_delta calls with wall-clock Instant. The timed
 //! loop runs exactly once per (kind, mode) (state advances with each
-//! mutation, so criterion cycling is not meaningful).
+//! mutation, so criterion cycling is not meaningful). Previously every kind
+//! built its own server, four `Θ(d · ρ · n · ω)` setups per config; the
+//! timed region — `apply_delta` only — is unchanged.
+//! `tests/replay_equivalence.rs` pins that a replay yields the same deltas
+//! as a fresh setup.
+//!
+//! **Update values:** salt 47 with offset 1, i.e. `(47k + i + 1) & 0xFF`
+//! against the seeded `(17k + i) & 0xFF`, so every byte differs by
+//! `30k + 1` — odd, never 0 mod 256. Before this change (offset 0) keys
+//! `k ≡ 0 (mod 128)` re-wrote their own value: wire-level no-ops that did no
+//! hint-patch work yet counted in `n_succeeded` (~0.8 % of updates).
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
 //! default frodo), `--patch-mode` (entry|row, comma-separated list,
@@ -49,6 +65,12 @@ const HEADER: &str =
     "backend,mutation_kind,patch_mode,arity,num_buckets,bucket_size,value_bits,plaintext_bits,\
     lwe_dim,n_mutations,load_factor,n_succeeded,total_ms,ops_per_s,\
     cells_per_slot,row_width,segment_rows,db_rows,db_cols";
+
+/// Cuckoo kick budget for every replayed store. `from_cells` resets
+/// `max_kicks` to `MAX_KICKS_DEFAULT` (500); the populate helper used 2_500,
+/// and the insert deltas must come from the same eviction regime that
+/// `server_mutation` times.
+const MAX_KICKS: u32 = 2_500;
 
 #[derive(Clone, Copy, Debug)]
 enum MutationKind {
@@ -107,26 +129,45 @@ fn effective_lwe_dim(cli: &Cli) -> u32 {
         .unwrap_or_else(|| helpers::backend_default_lwe_dim(cli.backend))
 }
 
-fn fill_value(value: &mut [u8], key: u32, salt: u32) {
+/// `value[i] = (key · salt + i + offset) & 0xFF`. The seed pattern written by
+/// `helpers::populate_to_load` is `salt = 17, offset = 0`.
+fn fill_value(value: &mut [u8], key: u32, salt: u32, offset: u32) {
     for (i, b) in value.iter_mut().enumerate() {
-        *b = (key.wrapping_mul(salt).wrapping_add(i as u32) & 0xFF) as u8;
+        *b = (key
+            .wrapping_mul(salt)
+            .wrapping_add(i as u32)
+            .wrapping_add(offset)
+            & 0xFF) as u8;
     }
 }
 
-fn collect_deltas_for_kind<S, B>(
-    cells: &[u32],
+/// The epoch-0 store, as `from_cells` needs it: every replay rebuilds a
+/// fresh store from these.
+struct Snapshot<'a> {
+    cells: &'a [u32],
     params: CuckooParams,
     n_seed: u64,
+}
+
+/// Rewind `server` to epoch 0 and collect the deltas of N mutations of
+/// `kind`. Stops at the first `TableFull` (inserts only).
+fn collect_deltas_for_kind<S, B>(
+    server: &mut IkpirServer<S, B>,
+    hints0: &[B::Hint],
+    snap: &Snapshot<'_>,
     cli: &Cli,
     kind: MutationKind,
-    make_config: &impl Fn() -> B::Config,
 ) -> (Vec<HintDeltaBundle<B>>, u32)
 where
     S: CloneStore,
-    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend,
+    B: IndexPirBackend + IncrementalPirBackend,
 {
-    let store = S::clone_from_cells(cells.to_vec(), params, n_seed).expect("from_cells");
-    let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store, make_config());
+    let mut store =
+        S::clone_from_cells(snap.cells.to_vec(), snap.params, snap.n_seed).expect("from_cells");
+    store.set_max_kicks(MAX_KICKS);
+    server.reset_for_replay(store, hints0.to_vec());
+
+    let n_seed = snap.n_seed;
     let vsize = (cli.value_bits as usize).div_ceil(8);
     let mut value = vec![0u8; vsize];
     let mut deltas = Vec::with_capacity(cli.n_mutations as usize);
@@ -136,12 +177,13 @@ where
         let res = match kind {
             MutationKind::Insert => {
                 let k = n_seed as u32 + i;
-                fill_value(&mut value, k, 31);
+                fill_value(&mut value, k, 31, 0);
                 server.insert(&k.to_le_bytes(), &value)
             }
             MutationKind::Update => {
                 let k = (n_seed as u32 - 1) - (i % n_seed as u32);
-                fill_value(&mut value, k, 47);
+                // Differs from the seeded value in every byte: 30k + 1 is odd.
+                fill_value(&mut value, k, 47, 1);
                 server.update(&k.to_le_bytes(), &value)
             }
             MutationKind::Delete => {
@@ -192,15 +234,25 @@ fn run_one<S, B>(
 
     let cells = seed_store.snapshot_cells();
     let params = seed_store.params();
+    let snap = Snapshot {
+        cells: &cells,
+        params,
+        n_seed,
+    };
 
-    let seed_store2 = S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
-    let seed_server: IkpirServer<S, B> = IkpirServer::new_parallel(seed_store2, make_config());
-    let bundle = seed_server.setup();
+    // The one setup per config. This first clone is never mutated: every
+    // kind's delta collection starts by swapping in a fresh clone through
+    // `reset_for_replay`, so its kick budget is irrelevant.
+    let store0 = S::clone_from_cells(cells.clone(), params, n_seed).expect("from_cells");
+    let mut server: IkpirServer<S, B> = IkpirServer::new_parallel(store0, make_config());
+    // Epoch 0: the client bootstrap bundle *and* the hints every replay
+    // rewinds to.
+    let bundle = server.setup();
+    let (db_rows, db_cols) = B::db_matrix_shape(&server.backend_params()[0]);
 
     let cps = params.cells_per_slot();
     let row_width = cli.bucket_size * cps;
     let segment_rows = params.segment_size();
-    let (db_rows, db_cols) = B::db_matrix_shape(&seed_server.backend_params()[0]);
     let store_state = helpers::StoreState {
         capacity: (num_buckets as u64) * (cli.bucket_size as u64),
         populated: n_seed,
@@ -210,7 +262,7 @@ fn run_one<S, B>(
         segment_rows,
     };
     let geom = helpers::Geometry {
-        hint_per_seg_bytes: 0,
+        hint_per_seg_bytes: bundle.hints.first().map_or(0, B::hint_byte_size),
         setup_bundle_bytes: bundle.wire_byte_size(),
         query_bytes: 0,
         response_bytes: 0,
@@ -274,7 +326,7 @@ fn run_one<S, B>(
     modes.dedup();
     for &kind in MutationKind::all() {
         let (deltas, n_succeeded) =
-            collect_deltas_for_kind::<S, B>(&cells, params, n_seed, cli, kind, &make_config);
+            collect_deltas_for_kind::<S, B>(&mut server, &bundle.hints, &snap, cli, kind);
         if deltas.is_empty() {
             eprintln!("  Skip kind={}: no deltas collected", kind.as_csv());
             continue;

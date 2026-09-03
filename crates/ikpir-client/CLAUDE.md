@@ -114,7 +114,7 @@ setup bundle.
 | Hint-patch realization knob | `client.rs::IkpirClient::{hint_patch_mode, set_hint_patch_mode}` + `ikpir-common::HintPatchMode` |
 | Recover from a gap | `client.rs::IkpirClient::reset_from` |
 | Debug a fingerprint mismatch | `client.rs::IkpirClient::decode` — check `candidate_buckets` + `unpack_slot_cells` |
-| Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`) |
+| Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`); `tests/replay_equivalence.rs` — the mutation benches' `reset_for_replay` harness measures what a fresh setup would (both backends, arities 2/3/4, plus a stale-hints negative control) |
 | Benches | `benches/client_query.rs`, `benches/client_decode.rs`, `benches/client_mutation.rs`, `benches/headtohead_query.rs`, `benches/headtohead_decode.rs`. All accept `--backend frodo\|simple`; run via `../../scripts/bench.sh <name>` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-server/benches/helpers.rs` |
 
@@ -126,7 +126,7 @@ Five focused benches covering classical and incremental client criteria for the 
 |---|---|---|---|
 | `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
 | `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
-| `client_mutation` | `--load-factor` (0.90) | `apply_delta` throughput per (kind, patch mode) pair (insert/update/delete × entry/row), wall-clock, empty queue (isolates hint-patch cost) | `ikpir_client_mutation.csv` |
+| `client_mutation` | `--load-factor` (0.90) | `apply_delta` throughput per (kind, patch mode) pair (insert/update/delete × entry/row), wall-clock, empty queue (isolates hint-patch cost); one setup per config, deltas collected from a server rewound per kind with `reset_for_replay` | `ikpir_client_mutation.csv` |
 | `headtohead_query` | fixed `--num-keys` | `build_query` rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `client_query` + `num_keys`/`db_size` columns | `ikpir_headtohead_client_query.csv` |
 | `headtohead_decode` | fixed `--num-keys` | `decode` rate at a fixed keyword count; mirrors `client_decode` + `num_keys`/`db_size` columns, with the once-per-config `verify_decode` sanity check | `ikpir_headtohead_client_decode.csv` |
 
@@ -162,7 +162,12 @@ in isolation, without warm-bc queue-maintenance overhead mixed in.
   `(patch mode, kind)` pair; the `patch_mode` column records which
   `HintPatchMode` realization the timed `apply_delta` loop used. Deltas
   are collected once per kind (identical under either mode) and replayed
-  per mode. `scripts/bench.sh` passes `entry,row` by default.
+  per mode — from **one** server per config, rewound before each kind with
+  `IkpirServer::reset_for_replay` (fresh store from the snapshot cells,
+  clone of the epoch-0 hints), whose epoch-0 `setup()` bundle also
+  bootstraps every timed client. `tests/replay_equivalence.rs` pins that a
+  replay yields the same deltas as a fresh setup. `scripts/bench.sh`
+  passes `entry,row` by default.
 - **Runner.** `scripts/bench.sh <bench> [flags]` maps the bench to its
   crate, auto-derives `--plaintext-bits` / `--lwe-dim`, and exports
   `IKPIR_RESULTS_DIR=results/ikpir-client` before `cargo bench`. One
@@ -181,8 +186,10 @@ in isolation, without warm-bc queue-maintenance overhead mixed in.
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard
       `=== <bench> ===` / Parameters / KV store / Geometry banner.
-    - `run_criterion_throughput_batched(label, elems, setup, routine)` —
-      criterion wrapper used by `client_query` and `client_decode`.
+    - `configured_criterion()` — the `Criterion` pinned to the shared
+      Table 3 contract (100 samples, 3 s warm-up, 5 s measurement), which
+      `client_query`, `client_decode`, `headtohead_query`, and
+      `headtohead_decode` drive directly through `iter_custom`.
 - `client_mutation` uses wall-clock `Instant` batch timing (not criterion)
   because apply_delta advances the client epoch with each call; criterion's
   cycling pattern is not meaningful when state changes between calls.

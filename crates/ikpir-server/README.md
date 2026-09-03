@@ -52,7 +52,7 @@ has the paper config matrix; there is no full-matrix sweep script.
 |---|---|---|---|
 | `server_setup` | `--load-factor` (0.90) | `IkpirServer::new` wall-clock (trials=3, warmup=1); setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR answer rate (queries/sec, criterion, batch=64); query_bytes, response_bytes | `ikpir_server_answer.csv` |
-| `server_mutation` | `--load-factor` (0.90) | Per-(patch mode, kind) ops/sec, wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
+| `server_mutation` | `--load-factor` (0.90) | Per-(patch mode, kind) ops/sec, per-op wall-clock, one setup per config; v1 delta transcript (delta_bytes_total, rows / runs / cells / nonzero cells) + setup_bundle_bytes / hint_bytes_total | `ikpir_server_mutation.csv` |
 | `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); +`num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
 
 `num_buckets` constraints differ per arity: 2-ary `2^t`, 3-ary `3·2^t`,
