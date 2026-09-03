@@ -7,7 +7,9 @@
 //! against `SimplePirBackend` so the reshape + sparse-patch math gets
 //! exercised end-to-end through the public client API.
 
-use ikpir_client::{IkpirClient, IkpirClientError, SimpleConfig, SimplePirBackend};
+use ikpir_client::{
+    ClientUpdateMode, IkpirClient, IkpirClientError, SimpleConfig, SimplePirBackend,
+};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
     IndexScheme, SchemeMeta, Segmented2aryCuckooKVStore, Segmented2aryScheme,
@@ -42,7 +44,9 @@ fn fresh_client<S>(server: &IkpirServer<S, SimplePirBackend>) -> Client
 where
     S: IndexScheme + SchemeMeta + 'static,
 {
-    IkpirClient::from_setup(server.setup())
+    let mut client = IkpirClient::from_setup(server.setup());
+    client.set_update_mode(ClientUpdateMode::HintPatch);
+    client
 }
 
 const fn pair(k: u32) -> ([u8; 4], [u8; 1]) {

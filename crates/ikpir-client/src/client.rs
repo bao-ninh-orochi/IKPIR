@@ -31,8 +31,9 @@
 //! - `ikpir-server::IkpirServer` — counterpart on the server side.
 
 use ikpir_common::{
-    HintDeltaBundle, HintPatchMode, IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend,
-    PirQueryBundle, PirResponseBundle, PrecomputingPirBackend, ServerSetupBundle,
+    ClientUpdateMode, HintDeltaBundle, HintPatchMode, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, PirQueryBundle, PirResponseBundle, PrecomputingPirBackend,
+    ResponseRewind, ServerSetupBundle,
 };
 use segmented_cuckoo::{unpack_slot_cells, CuckooParams};
 
@@ -52,6 +53,7 @@ type PerSegmentClientSetup<B> = fn(
 ) -> <B as IndexPirBackend>::ClientState;
 
 use crate::error::IkpirClientError;
+use crate::pending::PendingDelta;
 
 /// Client-side IKPIR engine, generic over the PIR backend `B`.
 ///
@@ -81,6 +83,21 @@ pub struct IkpirClient<B: IndexPirBackend> {
     /// and the resulting state are identical under either mode, so the
     /// client's mode never needs to match the server's.
     hint_patch_mode: HintPatchMode,
+    /// Update strategy — see [`ClientUpdateMode`]. Defaults to
+    /// [`ClientUpdateMode::Rewind`]; preserved across [`Self::reset_from`].
+    /// Selects between the hint-patch path ([`Self::apply_delta`] /
+    /// [`Self::decode`]) and the response-rewind path
+    /// ([`Self::accumulate_delta`] / [`Self::decode_rewind`] /
+    /// [`Self::collect_garbage`]); both return the same decoded value.
+    update_mode: ClientUpdateMode,
+    /// Rolling public `ΔD` accumulated in [`ClientUpdateMode::Rewind`]; empty
+    /// and unused in [`ClientUpdateMode::HintPatch`].
+    pending: PendingDelta,
+    /// Epoch the per-segment states (the pinned hint `H₀`) are at. Equals
+    /// [`Self::epoch`] in hint-patch mode; in rewind mode it trails `epoch` by
+    /// the accumulated deltas and advances only on [`Self::collect_garbage`] or
+    /// a resync ([`Self::reset_from`]).
+    pin_epoch: u64,
 }
 
 /// Outcome of [`IkpirClient::try_apply_delta_or_resync`].
@@ -155,6 +172,9 @@ impl<B: IndexPirBackend> IkpirClient<B> {
             states,
             epoch: bundle.epoch,
             hint_patch_mode: HintPatchMode::default(),
+            update_mode: ClientUpdateMode::default(),
+            pending: PendingDelta::new(arity),
+            pin_epoch: bundle.epoch,
         }
     }
 
@@ -179,9 +199,11 @@ impl<B: IndexPirBackend> IkpirClient<B> {
     /// configured [`HintPatchMode`] is a client preference, not server
     /// state, so it survives the reset.
     pub fn reset_from(&mut self, bundle: ServerSetupBundle<B>) {
-        let mode = self.hint_patch_mode;
+        let hint_patch_mode = self.hint_patch_mode;
+        let update_mode = self.update_mode;
         *self = Self::from_setup(bundle);
-        self.hint_patch_mode = mode;
+        self.hint_patch_mode = hint_patch_mode;
+        self.update_mode = update_mode;
     }
 
     /// Current client epoch. Strictly monotone across `apply_delta`
@@ -217,6 +239,55 @@ impl<B: IndexPirBackend> IkpirClient<B> {
     pub fn set_hint_patch_mode(&mut self, mode: HintPatchMode) {
         self.hint_patch_mode = mode;
     }
+
+    /// Current [`ClientUpdateMode`]. Defaults to [`ClientUpdateMode::Rewind`].
+    pub const fn update_mode(&self) -> ClientUpdateMode {
+        self.update_mode
+    }
+
+    /// Select the [`ClientUpdateMode`] for future delta / decode calls.
+    ///
+    /// # Rationale
+    ///
+    /// The mode is a **local** client choice — both realizations consume the
+    /// same [`HintDeltaBundle`] stream and return the same decoded value — so it
+    /// may be set at will and survives [`Self::reset_from`].
+    ///
+    /// # Constraints
+    ///
+    /// Switching does **not** migrate outstanding state, so switch only when the
+    /// pinned hint and the tracked epoch coincide and `ΔD` is empty
+    /// (`pin_epoch() == epoch()` and `pending_cells() == 0`) — the case on a
+    /// freshly bootstrapped, just-reset, or just-garbage-collected client.
+    /// In [`HintPatch`](ClientUpdateMode::HintPatch) mode that always holds, so
+    /// switching *to* [`Rewind`](ClientUpdateMode::Rewind) is always safe;
+    /// switching the other way with `ΔD` still pending is a logic error
+    /// (`collect_garbage` first). Debug builds assert this.
+    pub fn set_update_mode(&mut self, mode: ClientUpdateMode) {
+        debug_assert!(
+            mode == self.update_mode || (self.pin_epoch == self.epoch && self.pending.cells() == 0),
+            "set_update_mode with outstanding ΔD (pin_epoch {} vs epoch {}, {} pending cells); \
+             collect_garbage or reset_from first",
+            self.pin_epoch,
+            self.epoch,
+            self.pending.cells()
+        );
+        self.update_mode = mode;
+    }
+
+    /// Epoch the pinned hint `H₀` is at. Equals [`Self::epoch`] except while
+    /// rewind-mode deltas are outstanding, when it trails by the accumulated
+    /// span and advances only on [`Self::collect_garbage`] / [`Self::reset_from`].
+    pub const fn pin_epoch(&self) -> u64 {
+        self.pin_epoch
+    }
+
+    /// Number of nonzero `ΔD` cells currently accumulated (rewind mode) — the
+    /// staleness measure the per-query correction cost scales with. Always `0`
+    /// in hint-patch mode.
+    pub fn pending_cells(&self) -> usize {
+        self.pending.cells()
+    }
 }
 
 /// Optimized (multi-threaded) bootstrap, available for every backend
@@ -247,13 +318,15 @@ impl<B: ParallelSetupBackend> IkpirClient<B> {
         Self::assemble(bundle, B::client_setup_parallel)
     }
 
-    /// Multi-threaded twin of [`Self::reset_from`]. Like it, the
-    /// configured [`HintPatchMode`] is a client preference and survives
-    /// the reset.
+    /// Multi-threaded twin of [`Self::reset_from`]. Like it, the configured
+    /// [`HintPatchMode`] and [`ClientUpdateMode`] are client preferences and
+    /// survive the reset.
     pub fn reset_from_parallel(&mut self, bundle: ServerSetupBundle<B>) {
-        let mode = self.hint_patch_mode;
+        let hint_patch_mode = self.hint_patch_mode;
+        let update_mode = self.update_mode;
         *self = Self::from_setup_parallel(bundle);
-        self.hint_patch_mode = mode;
+        self.hint_patch_mode = hint_patch_mode;
+        self.update_mode = update_mode;
     }
 }
 
@@ -357,6 +430,10 @@ where
     /// - `Err(IkpirClientError::MalformedBundle)` if the response has
     ///   the wrong number of segments or an inner row of the wrong
     ///   width.
+    /// - `Err(IkpirClientError::WrongUpdateMode)` if the client is in
+    ///   [`ClientUpdateMode::Rewind`] — use [`Self::decode_rewind`] there.
+    ///   This is the hint-patch decode entry; its `&self` contract and
+    ///   arithmetic are unchanged from before the rewind mode existed.
     ///
     /// # Complexity
     ///
@@ -369,6 +446,12 @@ where
         key: &[u8],
         resp: &PirResponseBundle<B>,
     ) -> Result<Option<Vec<u8>>, IkpirClientError> {
+        if self.update_mode != ClientUpdateMode::HintPatch {
+            return Err(IkpirClientError::WrongUpdateMode {
+                expected: ClientUpdateMode::HintPatch,
+                actual: self.update_mode,
+            });
+        }
         if resp.epoch != self.epoch {
             return Err(IkpirClientError::EpochMismatch {
                 client: self.epoch,
@@ -495,6 +578,8 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     /// - `Err(IkpirClientError::MalformedBundle)` if `delta.params` differs
     ///   from the client's `params`, or `per_segment_row_deltas.len()`
     ///   doesn't match arity.
+    /// - `Err(IkpirClientError::WrongUpdateMode)` if the client is in
+    ///   [`ClientUpdateMode::Rewind`] — use [`Self::accumulate_delta`] there.
     ///
     /// # Complexity
     ///
@@ -502,6 +587,12 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     /// `IncrementalPirBackend::client_patch_state`. Empty segments
     /// short-circuit.
     pub fn apply_delta(&mut self, delta: HintDeltaBundle<B>) -> Result<(), IkpirClientError> {
+        if self.update_mode != ClientUpdateMode::HintPatch {
+            return Err(IkpirClientError::WrongUpdateMode {
+                expected: ClientUpdateMode::HintPatch,
+                actual: self.update_mode,
+            });
+        }
         let expected = self.epoch + 1;
         if delta.epoch < expected {
             return Err(IkpirClientError::StaleDelta {
@@ -528,6 +619,113 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
             }
         }
         self.epoch = delta.epoch;
+        // Hint-patch keeps the pinned hint in lock-step with the head.
+        self.pin_epoch = delta.epoch;
+        Ok(())
+    }
+
+    /// Accumulate a hint-delta bundle into the rolling `ΔD` (rewind mode).
+    ///
+    /// # Purpose
+    ///
+    /// The [`ClientUpdateMode::Rewind`] counterpart of [`Self::apply_delta`]:
+    /// instead of patching the hint, it folds `delta` into the client's running
+    /// `ΔD = D_head − D₀` (per-cell sum, dropping cells that net to zero),
+    /// leaving the pinned hint `H₀` untouched. The tracked head epoch advances;
+    /// the pin does not.
+    ///
+    /// # Constraints
+    ///
+    /// **Strict-monotone**, exactly like [`Self::apply_delta`]: only
+    /// `delta.epoch == self.epoch + 1` is accepted; older →
+    /// [`StaleDelta`](IkpirClientError::StaleDelta), gaps →
+    /// [`FutureDelta`](IkpirClientError::FutureDelta) (recover with
+    /// [`Self::reset_from`]). `delta.params` must equal the client's `params`,
+    /// and `per_segment_row_deltas.len()` the arity.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` and `self.epoch += 1` on success.
+    /// - `Err(StaleDelta)` / `Err(FutureDelta)` on an out-of-order epoch.
+    /// - `Err(MalformedBundle)` on a params / segment-count mismatch (or, never
+    ///   reachable with real cell deltas, an `i64` overflow while summing).
+    /// - `Err(WrongUpdateMode)` in [`ClientUpdateMode::HintPatch`] — use
+    ///   [`Self::apply_delta`] there.
+    ///
+    /// # Complexity
+    ///
+    /// `O(Σ |touched cells|)` `BTreeMap` work per segment — independent of the
+    /// LWE dimension `n`, the factor-`n` maintenance saving over `apply_delta`.
+    pub fn accumulate_delta(&mut self, delta: HintDeltaBundle<B>) -> Result<(), IkpirClientError> {
+        if self.update_mode != ClientUpdateMode::Rewind {
+            return Err(IkpirClientError::WrongUpdateMode {
+                expected: ClientUpdateMode::Rewind,
+                actual: self.update_mode,
+            });
+        }
+        let expected = self.epoch + 1;
+        if delta.epoch < expected {
+            return Err(IkpirClientError::StaleDelta {
+                expected,
+                got: delta.epoch,
+            });
+        }
+        if delta.epoch > expected {
+            return Err(IkpirClientError::FutureDelta {
+                expected,
+                got: delta.epoch,
+            });
+        }
+        if delta.params != self.params {
+            return Err(IkpirClientError::MalformedBundle);
+        }
+        if delta.per_segment_row_deltas.len() != self.params.arity() {
+            return Err(IkpirClientError::MalformedBundle);
+        }
+        // Never false with real cell deltas (the running sum stays in (−p, p)).
+        if !self.pending.merge(&delta.per_segment_row_deltas) {
+            return Err(IkpirClientError::MalformedBundle);
+        }
+        self.epoch = delta.epoch;
+        Ok(())
+    }
+
+    /// Fold the accumulated `ΔD` into the pinned hint and re-pin at the head
+    /// (rewind mode) — the client's garbage collection.
+    ///
+    /// # Purpose
+    ///
+    /// Reclaims the per-query rewind correction: patches each segment's hint by
+    /// the whole accumulated `ΔD` via
+    /// [`client_patch_state`](IncrementalPirBackend::client_patch_state)
+    /// (entry-level), advancing the pinned hint `H₀` to the current head and
+    /// clearing `ΔD`. **Never required for correctness** — a rewind client stays
+    /// correct indefinitely without it (the correction merely grows with
+    /// staleness); GC trades a one-off `Θ(|ΔD|·n)` patch for a cheaper
+    /// steady-state decode. A no-op when nothing is pending.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())` after folding (or immediately, if nothing was pending).
+    /// - `Err(WrongUpdateMode)` in [`ClientUpdateMode::HintPatch`].
+    pub fn collect_garbage(&mut self) -> Result<(), IkpirClientError> {
+        if self.update_mode != ClientUpdateMode::Rewind {
+            return Err(IkpirClientError::WrongUpdateMode {
+                expected: ClientUpdateMode::Rewind,
+                actual: self.update_mode,
+            });
+        }
+        if self.pin_epoch == self.epoch {
+            return Ok(()); // nothing pending
+        }
+        for (j, state) in self.states.iter_mut().enumerate() {
+            let row_deltas = self.pending.as_row_deltas(j);
+            if !row_deltas.is_empty() {
+                B::client_patch_state(state, &row_deltas, HintPatchMode::EntryLevel);
+            }
+        }
+        self.pin_epoch = self.epoch;
+        self.pending.clear();
         Ok(())
     }
 
@@ -538,6 +736,9 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     ///
     /// Sugar for the common gap-handling pattern: try the incremental
     /// patch, fall back to a full resync only when the gap is too big.
+    /// Hint-patch mode only — it wraps [`Self::apply_delta`], so in
+    /// [`ClientUpdateMode::Rewind`] it returns
+    /// [`WrongUpdateMode`](IkpirClientError::WrongUpdateMode).
     ///
     /// # Arguments
     ///
@@ -600,5 +801,139 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Response-rewind read path — available for every backend that implements
+/// [`ResponseRewind`] (both shipped LWE backends do).
+impl<B: IncrementalPirBackend + ResponseRewind> IkpirClient<B>
+where
+    B::Query: Clone,
+    B::Response: Clone,
+{
+    /// Decode a response answered at the server head against the client's
+    /// *pinned* hint `H₀`, correcting for the accumulated `ΔD` — the
+    /// [`ClientUpdateMode::Rewind`] read path.
+    ///
+    /// # Purpose
+    ///
+    /// The rewind counterpart of [`Self::decode`]. Where `decode` reads directly
+    /// against a hint patched up to the head, this pins `H₀` and bridges the gap
+    /// with the running `ΔD` accumulated by [`Self::accumulate_delta`]. For each
+    /// segment it: (1) subtracts `qᵀ·ΔD` from the response
+    /// ([`ResponseRewind::rewind_response`]) — exact in `Z_2³²`, no added noise —
+    /// so it decodes as of the pin; (2) runs
+    /// [`client_decode`](IndexPirBackend::client_decode) against `H₀`, recovering
+    /// the *stale* row; (3) adds `ΔD[row]` to reach the current row; then (4)
+    /// runs the same branchless fingerprint scan as [`Self::decode`]. The
+    /// decoded value is identical to a hint-patch decode and to a fresh setup at
+    /// the head.
+    ///
+    /// Works in either mode: in [`ClientUpdateMode::HintPatch`] the pinned hint
+    /// *is* the head and `ΔD` is empty, so steps 1 and 3 are no-ops and this
+    /// reduces to [`Self::decode`] — a safe universal decode for the shipped
+    /// backends.
+    ///
+    /// # Arguments
+    ///
+    /// - `key`   — the same key passed to the matching [`Self::build_query`].
+    /// - `query` — the bundle `build_query` returned for `key`, whose secret is
+    ///   still in flight; its marker-bearing `b` vectors (the exact ones the
+    ///   server answered) drive the correction.
+    /// - `resp`  — the response bundle, answered at the current tracked head.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(value))` / `Ok(None)` — as [`Self::decode`].
+    /// - `Err(EpochMismatch)` if `resp.epoch != self.epoch`.
+    /// - `Err(MalformedBundle)` on a wrong segment count or row width.
+    /// - `Err(CellOutOfRange)` if a corrected cell escapes
+    ///   `[0, 2^plaintext_bits)` — a corrupt or inconsistent delta/response,
+    ///   never a returned wrong value.
+    ///
+    /// # Complexity
+    ///
+    /// `O(arity)` calls to `client_decode` (as [`Self::decode`]) plus
+    /// `O(Σ |ΔD|)` per-segment correction work — the staleness-growing cost.
+    pub fn decode_rewind(
+        &self,
+        key: &[u8],
+        query: &PirQueryBundle<B>,
+        resp: &PirResponseBundle<B>,
+    ) -> Result<Option<Vec<u8>>, IkpirClientError> {
+        if resp.epoch != self.epoch {
+            return Err(IkpirClientError::EpochMismatch {
+                client: self.epoch,
+                response: resp.epoch,
+            });
+        }
+        let arity = self.params.arity();
+        if resp.responses.len() != arity || query.queries.len() != arity {
+            return Err(IkpirClientError::MalformedBundle);
+        }
+        let (fp, indices) = self.params.candidate_buckets(key);
+        let segment_size = self.params.segment_size();
+        let bucket_size = self.params.bucket_size as usize;
+        let cps = self.params.cells_per_slot() as usize;
+        let value_size = self.params.value_size_in_bytes();
+        let plaintext_bound: i64 = 1i64 << self.params.plaintext_bits;
+
+        let mut acc = vec![0u8; value_size];
+        let mut found_mask: u64 = 0;
+
+        // `j` addresses several parallel per-segment structures (states,
+        // queries, responses, the pending ΔD, and `indices`); the indexed form
+        // keeps them visibly in lockstep.
+        #[allow(clippy::needless_range_loop)]
+        for j in 0..arity {
+            // Step 1: resp -= qᵀ·ΔD over the whole segment (on a local copy).
+            let mut corrected = resp.responses[j].clone();
+            B::rewind_response(
+                &self.states[j],
+                &query.queries[j],
+                &mut corrected,
+                self.pending.segment(j),
+            );
+            // Step 2: decode against the stale, pinned hint H₀ — the row as of
+            // the pin.
+            let mut cells: Vec<u32> = B::client_decode(&self.states[j], &corrected);
+            if cells.len() != bucket_size * cps {
+                return Err(IkpirClientError::MalformedBundle);
+            }
+            // Step 3: cells += ΔD[queried row] — the row as of the head. Must
+            // precede the scan.
+            let queried_row = indices[j] % segment_size;
+            for (off, d) in self.pending.row(j, queried_row) {
+                let idx = off as usize;
+                if idx >= cells.len() {
+                    return Err(IkpirClientError::CellOutOfRange {
+                        segment: j,
+                        row: queried_row,
+                        offset: off,
+                    });
+                }
+                let corrected_cell = i64::from(cells[idx]) + d;
+                if corrected_cell < 0 || corrected_cell >= plaintext_bound {
+                    return Err(IkpirClientError::CellOutOfRange {
+                        segment: j,
+                        row: queried_row,
+                        offset: off,
+                    });
+                }
+                cells[idx] = corrected_cell as u32;
+            }
+            // Step 4: the same branchless fp scan as `decode`.
+            for s in 0..bucket_size {
+                let slot = &cells[s * cps..(s + 1) * cps];
+                let (decoded_fp, value_bytes) = unpack_slot_cells(&self.params, slot);
+                let mask64 = ct_eq_u64_mask(decoded_fp, fp);
+                let mask8 = (mask64 & 0xFF) as u8;
+                for (a, v) in acc.iter_mut().zip(value_bytes.iter()) {
+                    *a |= mask8 & *v;
+                }
+                found_mask |= mask64;
+            }
+        }
+        Ok(if found_mask != 0 { Some(acc) } else { None })
     }
 }

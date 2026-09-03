@@ -38,8 +38,8 @@
 use std::collections::BTreeMap;
 
 use ikpir_client::{
-    FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, SimpleConfig, SimplePirBackend,
+    ClientUpdateMode, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient,
+    IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
 use segmented_cuckoo::{
@@ -380,12 +380,14 @@ where
     // epoch-0 bundle fed the deltas of B's current (second) replay.
     let absent = absent_keys(&snap.model, &model_a);
     let mut c_a = IkpirClient::<B>::from_setup(bundle_a0);
+    c_a.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas_a {
         c_a.apply_delta(d).expect("apply_delta A");
     }
     assert_client_tracks_model(&mut c_a, &a, &model_a, &absent, "client A");
 
     let mut c_b = IkpirClient::<B>::from_setup(bundle_b0);
+    c_b.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas_b2 {
         c_b.apply_delta(d).expect("apply_delta B");
     }
@@ -395,6 +397,7 @@ where
     // bootstraps from the rewound server's *post-replay* bundle is right
     // too, because the replayed hints track the replayed cells.
     let mut c_b_fresh = IkpirClient::<B>::from_setup(b.setup());
+    c_b_fresh.set_update_mode(ClientUpdateMode::HintPatch);
     assert_client_tracks_model(
         &mut c_b_fresh,
         &b,
@@ -438,12 +441,14 @@ where
 
     let absent = NEVER_PRESENT.to_vec();
     let mut c_a = IkpirClient::<B>::from_setup(bundle_a0);
+    c_a.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas_a {
         c_a.apply_delta(d).expect("apply_delta A");
     }
     assert_client_tracks_model(&mut c_a, &a, &model_a, &absent, "client A");
 
     let mut c_b = IkpirClient::<B>::from_setup(bundle_b0);
+    c_b.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas_b {
         c_b.apply_delta(d).expect("apply_delta B");
     }
@@ -499,6 +504,7 @@ where
     // fingerprint cells still match, and the value cells decode as noise —
     // so the stale key comes back wrong (or not at all).
     let mut poisoned = IkpirClient::<B>::from_setup(s.setup());
+    poisoned.set_update_mode(ClientUpdateMode::HintPatch);
     assert_ne!(
         lookup(&mut poisoned, &s, STALE_KEY).as_deref(),
         Some(stale_old.as_slice()),
@@ -512,6 +518,7 @@ where
     // invisible to the delta-fed clients the benches time and visible only
     // through `setup()` — the bundle `setup_bundle_bytes` measures.
     let mut synced = IkpirClient::<B>::from_setup(bundle0);
+    synced.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas {
         synced.apply_delta(d).expect("apply_delta");
     }

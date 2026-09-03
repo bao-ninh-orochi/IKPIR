@@ -56,9 +56,9 @@
 use std::collections::HashMap;
 
 use ikpir_client::{
-    DeltaWireLayout, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirClient,
-    IkpirClientError, IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend,
-    SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend,
+    ClientUpdateMode, DeltaWireLayout, FrodoConfig, FrodoPirBackend, HintDeltaBundle,
+    HintPatchMode, IkpirClient, IkpirClientError, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
@@ -350,7 +350,9 @@ fn run_t1<S, B>(
     let setup = server.setup();
     let params = setup.params;
     let mut c1: IkpirClient<B> = IkpirClient::from_setup(setup.clone());
+    c1.set_update_mode(ClientUpdateMode::HintPatch);
     let mut c2: IkpirClient<B> = IkpirClient::from_setup(setup);
+    c2.set_update_mode(ClientUpdateMode::HintPatch);
 
     let ops = build_trace(seed_count, N_OPS);
     let first_new_key = ops
@@ -843,6 +845,7 @@ fn run_t4<S, B>(
 
     // (b) apply_delta rejects the client's own deltas under foreign params.
     let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
+    client.set_update_mode(ClientUpdateMode::HintPatch);
     let forged: HintDeltaBundle<B> = HintDeltaBundle::new(
         client.epoch() + 1,
         delta.per_segment_row_deltas.clone(),
@@ -1016,6 +1019,7 @@ fn run_t5<S, B>(
         // this test dominate the file's runtime for no additional
         // coverage.
         let mut client: IkpirClient<B> = IkpirClient::from_setup(pre_setup.clone());
+        client.set_update_mode(ClientUpdateMode::HintPatch);
 
         for cbytes in variants {
             match HintDeltaBundle::<B>::decode(&cbytes, params) {

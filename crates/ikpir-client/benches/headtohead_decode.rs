@@ -22,8 +22,9 @@ mod helpers;
 use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    BackendWireSize, ClientUpdateMode, FrodoConfig, FrodoPirBackend, IkpirClient,
+    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend,
+    SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -206,6 +207,7 @@ fn run_one<S, B>(
         .map(|i| (i % n).to_le_bytes().to_vec())
         .collect();
     let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle);
+    client.set_update_mode(ClientUpdateMode::HintPatch);
 
     // Once-per-config decode sanity check — catches silent decode regressions
     // (wrong cells_per_slot, packing bug, hint mismatch, bad plaintext_bits

@@ -13,9 +13,10 @@ setup bundle.
 
 | File | Role |
 |---|---|
-| `src/lib.rs` | Declares `mod client; mod error;` and re-exports `IkpirClient`, `DeltaApplyOutcome`, `IkpirClientError`, plus the shared protocol surface (`IndexPirBackend`, `FrodoConfig`, `SimpleConfig`, wire bundles, `IkpirError`) from `ikpir-common` |
-| `src/client.rs` | `IkpirClient<B>` generic + 7 public methods |
-| `src/error.rs` | `IkpirClientError` enum (4 protocol variants + `Server(IkpirError)` forward; `IkpirError` is re-exported from `ikpir-common`) |
+| `src/lib.rs` | Declares `mod client; mod error; mod pending;` and re-exports `IkpirClient`, `DeltaApplyOutcome`, `IkpirClientError`, plus the shared protocol surface (`IndexPirBackend`, `ClientUpdateMode`, `ResponseRewind`, `FrodoConfig`, `SimpleConfig`, wire bundles, `IkpirError`) from `ikpir-common` |
+| `src/client.rs` | `IkpirClient<B>` generic + its public methods, in two update modes (hint-patch and response-rewind — see §3, §7) |
+| `src/error.rs` | `IkpirClientError` enum (6 protocol variants + `Server(IkpirError)` forward; `IkpirError` is re-exported from `ikpir-common`) |
+| `src/pending.rs` | `PendingDelta` — the rewind mode's rolling per-segment `ΔD` accumulator (crate-private) |
 
 > Production code in this crate depends only on `ikpir-common` and
 > `segmented-cuckoo`. `ikpir-server` is carried as a `[dev-dependency]`
@@ -75,6 +76,21 @@ setup bundle.
   stream. The preference is client-side state, so it survives
   `reset_from`.
 
+- **Selectable update strategy (rewind vs hint-patch)** — the
+  `ClientUpdateMode` (`set_update_mode`; **default `Rewind`**) selects how
+  the client tracks mutations. Hint-patch (`apply_delta` patches `H`;
+  `decode` reads it directly) is the classical path; rewind pins the
+  bootstrap hint `H₀`, accumulates the published `ΔD` (`accumulate_delta`,
+  `Θ(τ·ω)` — a factor-`n` cheaper maintenance), corrects a head-answered
+  response back to `H₀`'s epoch on decode (`decode_rewind`), and reclaims
+  the staleness-growing correction by folding `ΔD` into the hint
+  (`collect_garbage`). Both modes return the same decoded value (pinned by
+  `tests/rewind_equivalence.rs`); the mode is a local choice preserved
+  across `reset_from`, no Cargo feature (runtime enum, backend
+  monomorphised on `B`). The correction is per-backend via the
+  `ResponseRewind` trait (`ikpir-common`). Full mechanism and correctness:
+  `docs/rewind-client-mode.md`.
+
 ## 4. Epoch state machine
 
 ```
@@ -96,10 +112,12 @@ setup bundle.
 
 | Variant | Source | Meaning |
 |---|---|---|
-| `StaleDelta` | `apply_delta` | `delta.epoch ≤ self.epoch` |
-| `FutureDelta` | `apply_delta` | `delta.epoch > self.epoch + 1` (gap) |
-| `EpochMismatch` | `decode` | server moved between query and answer |
-| `MalformedBundle` | `apply_delta` / `decode` | params mismatch, or wrong segment count / row width |
+| `StaleDelta` | `apply_delta` / `accumulate_delta` | `delta.epoch ≤ self.epoch` |
+| `FutureDelta` | `apply_delta` / `accumulate_delta` | `delta.epoch > self.epoch + 1` (gap) |
+| `EpochMismatch` | `decode` / `decode_rewind` | server moved between query and answer |
+| `MalformedBundle` | `apply_delta` / `accumulate_delta` / `decode` / `decode_rewind` | params mismatch, or wrong segment count / row width |
+| `WrongUpdateMode` | mode-gated methods | hint-patch method in rewind mode (or vice versa) — switch entry point or mode |
+| `CellOutOfRange` | `decode_rewind` | a corrected cell escaped `[0, 2^plaintext_bits)` — corrupt/inconsistent delta or response, never a wrong value |
 | `Server(IkpirError)` | forward | for synchronous in-process composition |
 
 ## 6. Entry points and test taxonomy
@@ -109,12 +127,16 @@ setup bundle.
 | Build a fresh client | `client.rs::IkpirClient::from_setup` |
 | Bootstrap a client fast (untimed preamble) | `client.rs::IkpirClient::{from_setup_parallel, reset_from_parallel}` — identical client, all cores; contract in `ikpir-common::ParallelSetupBackend` |
 | Issue a query | `client.rs::IkpirClient::build_query` |
-| Decode a response | `client.rs::IkpirClient::decode` |
-| Apply an incremental delta | `client.rs::IkpirClient::apply_delta` |
+| Decode a response (hint-patch) | `client.rs::IkpirClient::decode` |
+| Decode a response (rewind) | `client.rs::IkpirClient::decode_rewind` |
+| Apply an incremental delta (hint-patch) | `client.rs::IkpirClient::apply_delta` |
+| Accumulate a delta (rewind) | `client.rs::IkpirClient::accumulate_delta` |
+| Reclaim rewind staleness | `client.rs::IkpirClient::collect_garbage` |
+| Update-strategy knob | `client.rs::IkpirClient::{update_mode, set_update_mode}` + `ikpir-common::ClientUpdateMode` (default `Rewind`) |
 | Hint-patch realization knob | `client.rs::IkpirClient::{hint_patch_mode, set_hint_patch_mode}` + `ikpir-common::HintPatchMode` |
 | Recover from a gap | `client.rs::IkpirClient::reset_from` |
 | Debug a fingerprint mismatch | `client.rs::IkpirClient::decode` — check `candidate_buckets` + `unpack_slot_cells` |
-| Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`); `tests/replay_equivalence.rs` — the mutation benches' `reset_for_replay` harness measures what a fresh setup would (both backends, arities 2/3/4, plus a stale-hints negative control) |
+| Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`); `tests/replay_equivalence.rs` — the mutation benches' `reset_for_replay` harness measures what a fresh setup would (both backends, arities 2/3/4, plus a stale-hints negative control); `tests/rewind_equivalence.rs` — rewind == hint-patch == fresh decode (both backends × arities 2/3/4), GC-then-query, post-pin insert, mode/epoch guards |
 | Benches | `benches/client_query.rs`, `benches/client_decode.rs`, `benches/client_mutation.rs`, `benches/headtohead_query.rs`, `benches/headtohead_decode.rs`. All accept `--backend frodo\|simple`; run via `../../scripts/bench.sh <name>` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-server/benches/helpers.rs` |
 

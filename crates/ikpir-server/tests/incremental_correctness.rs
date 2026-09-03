@@ -20,6 +20,7 @@
 //! Each test is parameterised by arity (2 / 3 / 4) so the diagnostic on
 //! failure pins which arity broke.
 
+use ikpir_client::ClientUpdateMode;
 use ikpir_client::IkpirClient;
 use ikpir_server::{
     FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError, IkpirServer,
@@ -284,6 +285,7 @@ where
         server.insert(&k.to_le_bytes(), &[k as u8 ^ 0x33]).unwrap();
     }
     let mut client: IkpirClient<FrodoPirBackend> = IkpirClient::from_setup(server.setup());
+    client.set_update_mode(ClientUpdateMode::HintPatch);
     client.precompute_queries(60); // > number of probes below to keep cheap path active
     client.precompute_decodes();
 
@@ -305,6 +307,7 @@ where
     // After 50 patches, the warm queue is still consistent with the patched
     // hint. Probe a mix of present/absent keys against an oracle.
     let mut oracle: IkpirClient<FrodoPirBackend> = IkpirClient::from_setup(server.setup());
+    oracle.set_update_mode(ClientUpdateMode::HintPatch);
     let probes: &[u32] = &[0, 5, 12, 19, 25, 30, 35, 40, 45, 999];
     for &k in probes {
         let key = k.to_le_bytes();
@@ -359,6 +362,7 @@ where
     // Server realizes patches row-level; client entry-level (its default).
     server.set_hint_patch_mode(HintPatchMode::RowLevel);
     let mut client: IkpirClient<FrodoPirBackend> = IkpirClient::from_setup(server.setup());
+    client.set_update_mode(ClientUpdateMode::HintPatch);
     assert_eq!(
         client.hint_patch_mode(),
         HintPatchMode::EntryLevel,

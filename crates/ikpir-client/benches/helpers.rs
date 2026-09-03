@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use criterion::{Criterion, Throughput};
-use ikpir_client::{IkpirClient, IndexPirBackend};
+use ikpir_client::{ClientUpdateMode, IkpirClient, IndexPirBackend};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{IndexScheme, SchemeMeta};
 
@@ -457,6 +457,7 @@ pub fn verify_decode<B, S>(
     B::Response: Clone,
 {
     assert!(n_keys > 0, "verify_decode: n_keys must be positive");
+    client.set_update_mode(ClientUpdateMode::HintPatch);
     let mut vsize = 0usize;
     for test_key in first_key..first_key + n_keys {
         let key_bytes = test_key.to_le_bytes();

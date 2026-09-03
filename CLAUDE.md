@@ -85,8 +85,12 @@ per-segment architecture, protocol invariants, and backend-author checklist.
 ### `ikpir-client`
 
 Holds `CuckooParams` and per-segment `ClientState`; translates keyword
-lookups into PIR query/response bundles and applies incremental hint deltas.
-See [`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) for the epoch
+lookups into PIR query/response bundles and stays consistent with server
+mutations in one of two selectable `ClientUpdateMode`s — entry-level
+hint-patching, or (default) **response-rewind**, which pins the bootstrap hint
+and accumulates the published `ΔD` for a factor-`n` cheaper client maintenance
+(`docs/rewind-client-mode.md`). See
+[`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) for the epoch
 state machine, failure-mode table, and entry-point map.
 
 ## Benches
