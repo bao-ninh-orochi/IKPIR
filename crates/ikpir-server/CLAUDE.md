@@ -109,7 +109,12 @@ without a full rebuild.
   frodo|simple` CLI flag (default `frodo`).
 
 - **Sparse row-delta encoding** — `HintDeltaBundle` carries
-  `Vec<(row, Vec<(cell_offset, Δ)>)>` per segment. Wire cost is
+  `Vec<(row, Vec<(cell_offset, Δ)>)>` per segment, plus the `CuckooParams`
+  it was folded under. This is the in-memory shape only; the bundle also
+  has a normative, run-length bit-packed on-wire encoding
+  (`docs/hint-delta-wire-format.md`, implemented by
+  `HintDeltaBundle::encode` / `decode` in `ikpir-common`) — the only one
+  of the four wire bundles with a specified byte format. Wire cost is
   proportional to touched cells, not total DB size.
 
 - **`IndexPirBackend` vs `IncrementalPirBackend` split** — a backend

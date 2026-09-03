@@ -27,7 +27,8 @@ RisePIR/                          ← workspace root
 │   ├── ikpir-common/             ← shared: backend traits, FrodoPIR, wire bundles, IkpirError
 │   ├── ikpir-server/             ← server-side IKPIR logic
 │   └── ikpir-client/             ← client-side IKPIR logic
-├── docs/                         ← benchmark-machine spec (server-specs.txt)
+├── docs/                         ← benchmark-machine spec (server-specs.txt) and the
+│                                    HintDeltaBundle wire-format spec (hint-delta-wire-format.md)
 └── scripts/                      ← bench runner (bench.sh), smoke.sh, shared lib.sh
 ```
 

@@ -645,7 +645,7 @@ where
             }
         }
         self.epoch += 1;
-        HintDeltaBundle::new(self.epoch, row_deltas)
+        HintDeltaBundle::new(self.epoch, row_deltas, self.params)
     }
 }
 

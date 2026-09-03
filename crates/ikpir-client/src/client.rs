@@ -482,8 +482,8 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     /// [`IkpirClientError::StaleDelta`]; gaps are
     /// [`IkpirClientError::FutureDelta`] — the caller must recover by
     /// calling [`IkpirClient::reset_from`] with a fresh server bundle.
-    /// `delta.per_segment_row_deltas.len()` must equal
-    /// `params.arity()`.
+    /// `delta.params` must equal the client's cached `params`, and
+    /// `delta.per_segment_row_deltas.len()` must equal `params.arity()`.
     ///
     /// # Returns
     ///
@@ -492,8 +492,9 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     ///   `delta.epoch ≤ self.epoch`.
     /// - `Err(IkpirClientError::FutureDelta { expected, got })` when
     ///   `delta.epoch > self.epoch + 1`.
-    /// - `Err(IkpirClientError::MalformedBundle)` if
-    ///   `per_segment_row_deltas.len()` doesn't match arity.
+    /// - `Err(IkpirClientError::MalformedBundle)` if `delta.params` differs
+    ///   from the client's `params`, or `per_segment_row_deltas.len()`
+    ///   doesn't match arity.
     ///
     /// # Complexity
     ///
@@ -513,6 +514,9 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
                 expected,
                 got: delta.epoch,
             });
+        }
+        if delta.params != self.params {
+            return Err(IkpirClientError::MalformedBundle);
         }
         let arity = self.params.arity();
         if delta.per_segment_row_deltas.len() != arity {
