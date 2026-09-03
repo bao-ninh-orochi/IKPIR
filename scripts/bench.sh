@@ -9,7 +9,8 @@
 #
 # PIR benches (one config per run; all flags optional, defaults shown):
 #   server_setup  server_answer  server_mutation  headtohead_answer
-#   client_query  client_decode  client_mutation  headtohead_query  headtohead_decode
+#   client_query  client_decode  client_mutation  client_rewind_staleness
+#   headtohead_query  headtohead_decode
 #
 #     --arity N            2 | 3 | 4                         (default 2)
 #     --num-buckets N                             (default: per-arity, dev scale)
@@ -21,8 +22,10 @@
 #     --fingerprint-bits N (default 64; the paper's width)
 #     --plaintext-bits N                    (default: max the backend admits)
 #     --lwe-dim N                           (default: 1566 frodo / 1275 simple)
-#   server_setup and the mutation benches also take:
+#   server_setup, the mutation benches, and client_rewind_staleness also take:
 #     --load-factor F      (default 0.90)
+#   client_rewind_staleness also takes:
+#     --batch-size N  --staleness-steps N  --queries N   (staleness sweep knobs)
 #   server_setup also takes:
 #     --setup-impl I       reference | parallel              (default reference)
 #                          `reference` is the single-threaded, non-SIMD path the

@@ -54,10 +54,11 @@ crate_for_bench() {
 is_pir_bench()        { _contains "$1" "${PIR_SERVER_BENCHES[@]}" "${PIR_CLIENT_BENCHES[@]}"; }
 is_mutation_bench()   { [[ "$1" == server_mutation || "$1" == client_mutation ]]; }
 is_headtohead_bench() { [[ "$1" == headtohead_* ]]; }
-# Benches that seed their store to a target fill. The rest populate to TableFull
-# (server_answer, client_query, client_decode) or to an exact key count (the
-# headtohead_* trio) and reject --load-factor.
-takes_load_factor()   { is_mutation_bench "$1" || [[ "$1" == server_setup ]]; }
+# Benches that seed their store to a target fill (--load-factor): the mutation
+# benches, server_setup, and client_rewind_staleness. The rest populate to
+# TableFull (server_answer, client_query, client_decode) or to an exact key
+# count (the headtohead_* trio) and reject --load-factor.
+takes_load_factor()   { is_mutation_bench "$1" || [[ "$1" == server_setup || "$1" == client_rewind_staleness ]]; }
 all_benches()         { printf '%s\n' "${PIR_SERVER_BENCHES[@]}" "${PIR_CLIENT_BENCHES[@]}" "${CUCKOO_BENCHES[@]}"; }
 
 # ── Backend parameters ────────────────────────────────────────────────────────

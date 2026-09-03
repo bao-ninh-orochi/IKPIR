@@ -262,9 +262,18 @@ impl<B: IndexPirBackend> IkpirClient<B> {
     /// In [`HintPatch`](ClientUpdateMode::HintPatch) mode that always holds, so
     /// switching *to* [`Rewind`](ClientUpdateMode::Rewind) is always safe;
     /// switching the other way with `ΔD` still pending is a logic error
-    /// (`collect_garbage` first). Debug builds assert this.
+    /// (`collect_garbage` first).
+    ///
+    /// # Panics
+    ///
+    /// Panics (in release builds too) if asked to switch mode while `ΔD` is
+    /// outstanding (`pin_epoch() != epoch()` or `pending_cells() != 0`). Folding
+    /// that pending `ΔD` into the pinned hint on a mode flip would otherwise be
+    /// skipped silently and later decodes would be wrong with no epoch mismatch
+    /// to catch it, so — like [`HintDeltaBundle`]'s fold validation — the misuse
+    /// is loud rather than silent.
     pub fn set_update_mode(&mut self, mode: ClientUpdateMode) {
-        debug_assert!(
+        assert!(
             mode == self.update_mode || (self.pin_epoch == self.epoch && self.pending.cells() == 0),
             "set_update_mode with outstanding ΔD (pin_epoch {} vs epoch {}, {} pending cells); \
              collect_garbage or reset_from first",
@@ -846,10 +855,25 @@ where
     ///
     /// - `Ok(Some(value))` / `Ok(None)` — as [`Self::decode`].
     /// - `Err(EpochMismatch)` if `resp.epoch != self.epoch`.
-    /// - `Err(MalformedBundle)` on a wrong segment count or row width.
+    /// - `Err(MalformedBundle)` on a wrong segment count or row width, or if
+    ///   `query.epoch != resp.epoch` (mismatched `(query, resp)` pair).
     /// - `Err(CellOutOfRange)` if a corrected cell escapes
     ///   `[0, 2^plaintext_bits)` — a corrupt or inconsistent delta/response,
     ///   never a returned wrong value.
+    ///
+    /// # Side channels
+    ///
+    /// Steps 1 and 2 are key-independent (step 1 walks the whole segment map;
+    /// step 2 is `client_decode`), and the step-4 fingerprint scan keeps the
+    /// same branchless, slot-independent hardening as [`Self::decode`]. **Step
+    /// 3 is not constant-time in the query, though:** it iterates
+    /// `pending.row(seg, queried_row)`, a `BTreeMap` range keyed on the queried
+    /// row, so both the traversal and the iteration count depend on which row
+    /// the key hashed to. The leak is **client-local** — it concerns the row
+    /// the client itself chose and never reaches the server or the response —
+    /// and a fully constant-time decode is out of scope for this prototype
+    /// (`ikpir-common/CLAUDE.md` §3), but since rewind is the default mode this
+    /// is the default decode path; see `docs/rewind-client-mode.md` §3.
     ///
     /// # Complexity
     ///
@@ -866,6 +890,12 @@ where
                 client: self.epoch,
                 response: resp.epoch,
             });
+        }
+        // The `(query, resp)` pair must be from the same round; a mismatched
+        // pairing would rewind with the wrong `qᵀ`, silently corrupting the
+        // correction rather than erroring.
+        if query.epoch != resp.epoch {
+            return Err(IkpirClientError::MalformedBundle);
         }
         let arity = self.params.arity();
         if resp.responses.len() != arity || query.queries.len() != arity {

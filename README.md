@@ -91,7 +91,7 @@ RisePIR-S.
 | Segmented Cuckoo Filter + KV store | Shipped (`segmented-cuckoo`) |
 | Backend trait family + wire bundles + shared error | Shipped (`ikpir-common`) |
 | Server protocol (setup / answer / insert / update / delete / full_rebuild) | Shipped (`ikpir-server`) |
-| Client protocol (from_setup / build_query / decode / apply_delta / reset_from) | Shipped (`ikpir-client`) |
+| Client protocol (from_setup / build_query / decode / apply_delta / reset_from; default **rewind** mode: accumulate_delta / decode_rewind / collect_garbage) | Shipped (`ikpir-client`) |
 | FrodoPIR backend | Shipped (`ikpir-common`) — ternary errors, tall-skinny matrix, default `lwe_dim = 1566` |
 | SimplePIR backend | Shipped (`ikpir-common`) — discrete-Gaussian errors (σ = 6.4), √N×√N reshape, default `lwe_dim = 1275` |
 | Hint-patch realizations (`HintPatchMode`) | Shipped (`ikpir-common`) — entry-level (iSimplePIR, default) and row-level (SimplePIR baseline); identical state + wire bytes, selectable per side |
@@ -137,7 +137,7 @@ The paper's notation maps onto the code as follows.
 |---|---|---|
 | `UIPIR.Setup` | preprocess one segment | `IndexPirBackend::server_setup` |
 | `UIPIR.Query / Answer / Recover` | online phase | `client_query` / `server_answer` / `client_decode` |
-| `UIPIR.DBMutation + HintUpdate` | mutation phase | server `insert/update/delete` → `IncrementalPirBackend::server_patch_hint`; client `IkpirClient::apply_delta` → `client_patch_state` |
+| `UIPIR.DBMutation + HintUpdate` | mutation phase | server `insert/update/delete` → `IncrementalPirBackend::server_patch_hint`; client `IkpirClient::apply_delta` → `client_patch_state`, or (default) rewind mode `accumulate_delta` + `decode_rewind` (`docs/rewind-client-mode.md`) |
 | `IKPIR.Setup(DB)` | offline phase, all `d` segments | `IkpirServer::new` + `IkpirServer::setup` → `ServerSetupBundle` |
 | (same, computed across cores) | identical output, untimed preamble | `IkpirServer::new_parallel` / `IkpirClient::from_setup_parallel` — see `ParallelSetupBackend` |
 | `IKPIR.Query / Answer / Recover` | keyword online phase | `IkpirClient::build_query` / `IkpirServer::answer` / `IkpirClient::decode` |
@@ -159,15 +159,15 @@ table above is the disambiguation.
 
 ## Benches
 
-The PIR evaluation is nine focused, `clap`-parsed, CSV-emitting benches — four
-in `ikpir-server`, five in `ikpir-client` — each measuring one criterion at one
-config and appending one row (the per-`(patch mode, kind)` mutation benches
-append one row per pair):
+The PIR evaluation is ten focused, `clap`-parsed, CSV-emitting benches — four
+in `ikpir-server`, six in `ikpir-client` — each measuring one criterion at one
+config and appending one row (`client_mutation` appends one row per
+`(update mode, patch mode, kind)`):
 
 | Crate | Benches |
 |---|---|
 | `ikpir-server` | `server_setup`, `server_answer`, `server_mutation`, `headtohead_answer` |
-| `ikpir-client` | `client_query`, `client_decode`, `client_mutation`, `headtohead_query`, `headtohead_decode` |
+| `ikpir-client` | `client_query`, `client_decode`, `client_mutation`, `client_rewind_staleness`, `headtohead_query`, `headtohead_decode` |
 
 The `headtohead_*` benches fix the **keyword count** (`--num-keys`) and report
 the DB size each scheme needed — the fair-comparison setting vs ChalametPIR /

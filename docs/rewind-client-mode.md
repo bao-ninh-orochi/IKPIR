@@ -121,3 +121,11 @@ enum. Both modes are preserved across `reset_from`.
 - No value codec — the existing fingerprint scan and `Option<Vec<u8>>` output
   are reused; only the correction and the step-3 add are new before the scan.
 - The timed benchmark path stays single-threaded and non-SIMD.
+- **Side channel (client-local).** `decode_rewind`'s step 3 (the per-row `ΔD`
+  add) iterates a `BTreeMap` range keyed on the queried row, so its timing
+  depends on that row — a client-local leak of a row index the client itself
+  chose, never reaching the server or the response. Steps 1–2 and the
+  fingerprint scan retain `decode`'s slot-independent hardening; a fully
+  constant-time decode is out of scope for this prototype
+  (`ikpir-common/CLAUDE.md` §3). Since rewind is the default mode, this is the
+  default decode path.

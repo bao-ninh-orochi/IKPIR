@@ -137,12 +137,12 @@ setup bundle.
 | Recover from a gap | `client.rs::IkpirClient::reset_from` |
 | Debug a fingerprint mismatch | `client.rs::IkpirClient::decode` — check `candidate_buckets` + `unpack_slot_cells` |
 | Integration tests | `tests/client_e2e.rs` + `tests/simple_client_e2e.rs` (mirror of `client_e2e.rs` for `SimplePirBackend`); `tests/replay_equivalence.rs` — the mutation benches' `reset_for_replay` harness measures what a fresh setup would (both backends, arities 2/3/4, plus a stale-hints negative control); `tests/rewind_equivalence.rs` — rewind == hint-patch == fresh decode (both backends × arities 2/3/4), GC-then-query, post-pin insert, mode/epoch guards |
-| Benches | `benches/client_query.rs`, `benches/client_decode.rs`, `benches/client_mutation.rs`, `benches/headtohead_query.rs`, `benches/headtohead_decode.rs`. All accept `--backend frodo\|simple`; run via `../../scripts/bench.sh <name>` |
+| Benches | `benches/client_query.rs`, `benches/client_decode.rs`, `benches/client_mutation.rs`, `benches/client_rewind_staleness.rs`, `benches/headtohead_query.rs`, `benches/headtohead_decode.rs`. All accept `--backend frodo\|simple`; run via `../../scripts/bench.sh <name>` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-server/benches/helpers.rs` |
 
 ### Bench layer (under `benches/`)
 
-Five focused benches covering classical and incremental client criteria for the paper:
+Six focused benches covering classical and incremental client criteria for the paper:
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
