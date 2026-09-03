@@ -588,67 +588,6 @@ where
     }
 }
 
-/// Like `run_criterion_throughput`, but the body receives a freshly-prepared
-/// input per call. Mirrors `criterion::Bencher::iter_batched_ref` but uses
-/// `iter_custom` under the hood so setup time is excluded from the timing
-/// bracket (the per-call `Instant` brackets only `routine`).
-///
-/// `setup` runs once per `routine` call; both are reused across criterion's
-/// sampling loop. `elements_per_iter` only labels criterion's
-/// `Throughput::Elements` for its HTML/JSON report; it does **not** scale the
-/// returned `CriterionThroughputStats` (always `1e9 / mean_ns_per_routine_call`).
-/// Pass `1` when each `routine` call executes one operation.
-#[allow(dead_code)]
-pub fn run_criterion_throughput_batched<S, I, R>(
-    bench_label: &str,
-    elements_per_iter: u64,
-    mut setup: S,
-    mut routine: R,
-) -> CriterionThroughputStats
-where
-    S: FnMut() -> I,
-    R: FnMut(&mut I),
-{
-    let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
-    {
-        let mut c = configured_criterion();
-        let mut group = c.benchmark_group(bench_label);
-        group.throughput(Throughput::Elements(elements_per_iter));
-        group.bench_function(bench_label, |b| {
-            b.iter_custom(|iters| {
-                let mut total = std::time::Duration::ZERO;
-                for _ in 0..iters {
-                    let mut input = setup();
-                    let t = Instant::now();
-                    routine(&mut input);
-                    total += t.elapsed();
-                }
-                let ns_per_iter = total.as_nanos() as f64 / iters as f64;
-                samples.lock().unwrap().push(ns_per_iter);
-                total
-            });
-        });
-        group.finish();
-    }
-    let raw: Vec<f64> = std::mem::take(&mut *samples.lock().unwrap());
-    if raw.is_empty() {
-        return CriterionThroughputStats {
-            mean_ops_per_s: 0.0,
-            min_ops_per_s: 0.0,
-            max_ops_per_s: 0.0,
-            stddev_ops_per_s: 0.0,
-        };
-    }
-    let ops: Vec<f64> = raw.iter().map(|&ns| 1e9 / ns).collect();
-    let s = compute_stats(&ops);
-    CriterionThroughputStats {
-        mean_ops_per_s: s.mean,
-        min_ops_per_s: s.min,
-        max_ops_per_s: s.max,
-        stddev_ops_per_s: s.stddev,
-    }
-}
-
 // ── Generic store construction ────────────────────────────────────────────────
 
 #[allow(dead_code)]

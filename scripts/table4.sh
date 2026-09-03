@@ -7,7 +7,10 @@
 # source of truth:
 #
 #   client_mutation   HintUpdate throughput — the number the table reports
-#   server_mutation   DBMutation throughput + delta wire bytes
+#   server_mutation   DBMutation throughput + the v1 delta transcript (bytes,
+#                     rows, runs, cells, nonzero cells) next to the fresh-hint
+#                     download it competes with (setup_bundle_bytes,
+#                     hint_bytes_total)
 #
 # Five (arity, bucket_size) cells × 2 value widths × 2 backends = 20 configs, 2
 # benches each. Every cell's n_b comes from `paper_num_buckets`; the arity-2/4
@@ -19,7 +22,9 @@
 # slots per (kind, patch mode) pair, and divides the batch by the measured time.
 # bench.sh derives τ from the geometry (10 485 at N = 2^20) and sweeps both
 # patch modes, so this script passes geometry only — the batch rule lives in one
-# place.
+# place. Each bench builds one server per config and rewinds it between
+# (kind, patch mode) sequences with `IkpirServer::reset_for_replay`, so the
+# setup is paid once per config, not once per sequence.
 #
 # Flags narrow the sweep; anything else is forwarded to every bench:
 #   --arity N          2 | 3 | 4

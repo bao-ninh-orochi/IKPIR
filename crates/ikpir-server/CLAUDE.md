@@ -157,6 +157,7 @@ without a full rebuild.
 | Real per-segment matrix shape (`db_rows`/`db_cols`) | `server.rs::IkpirServer::backend_params` → `ikpir-common::IndexPirBackend::db_matrix_shape` — the backend reports what it chose; benches never re-derive it |
 | Optimized (multi-threaded) setup | `server.rs::IkpirServer::{new_parallel, full_rebuild_parallel}` — byte-identical state, all cores; contract in `ikpir-common::ParallelSetupBackend` |
 | Cross-path interop test | `tests/parallel_setup_equivalence.rs` — every `{reference, parallel}` server × `{reference, parallel}` client combination, both backends |
+| Replay harness for the mutation benches | `server.rs::IkpirServer::reset_for_replay` — rewinds to epoch 0 (fresh store, epoch-0 hints) without recomputing `A` or `H`; `ikpir-client/tests/replay_equivalence.rs` pins that a replay yields the same deltas and bit-identical hints as a fresh setup, and that stale hints are detected |
 | Mutation + incremental hint | `server.rs::commit_mutations` → `hint_patch.rs::fold_mutations_into_row_deltas` |
 | Hint-patch realization knob | `server.rs::IkpirServer::{hint_patch_mode, set_hint_patch_mode}` + `ikpir-common::HintPatchMode` |
 | Backend trait contract | `ikpir-common/src/backend/mod.rs::IndexPirBackend` + `IncrementalPirBackend` + `PrecomputingPirBackend` + `ParallelSetupBackend` + `BackendWireSize` |
@@ -209,7 +210,7 @@ Four focused benches covering classical and incremental server criteria for the 
 |---|---|---|---|
 | `server_setup` | `--load-factor` (0.90) | setup wall-clock (default trials=3, warmup=1): the full `IkpirServer::new`; setup_bundle_bytes, hint_bytes/seg | `ikpir_server_setup.csv` |
 | `server_answer` | `TableFull` | PIR matvec answer rate (queries/sec, criterion); query_bytes, response_bytes | `ikpir_server_answer.csv` |
-| `server_mutation` | `--load-factor` (0.90) | Per-(kind, patch-mode) throughput (insert/update/delete × entry/row), wall-clock batch; delta_bytes_total | `ikpir_server_mutation.csv` |
+| `server_mutation` | `--load-factor` (0.90) | Per-(kind, patch-mode) throughput (insert/update/delete × entry/row), per-op wall-clock brackets, one setup per config (`reset_for_replay`); the v1 delta transcript (`delta_bytes_total`, rows / runs / cells / nonzero cells) next to `setup_bundle_bytes` / `hint_bytes_total` | `ikpir_server_mutation.csv` |
 | `headtohead_answer` | fixed `--num-keys` | answer rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `server_answer` + `num_keys`/`db_size` columns | `ikpir_headtohead_server_answer.csv` |
 
 > **`server_setup` is the only bench that runs the reference setup.** It is
@@ -270,11 +271,17 @@ Four focused benches covering classical and incremental server criteria for the 
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard
       `=== <bench> ===` / Parameters / KV store / Geometry banner.
-    - `run_criterion_throughput_batched(label, elems, setup, routine)` —
-      criterion wrapper used by `server_answer`.
-- `server_mutation` uses wall-clock `Instant` batch timing (not criterion)
-  because store state changes between mutations; criterion cycling is not
-  meaningful here.
+    - `run_criterion_throughput(label, elems, body)` — criterion wrapper
+      used by `server_answer` and `headtohead_answer`.
+- `server_mutation` uses wall-clock `Instant` timing (not criterion) because
+  store state changes between mutations; criterion cycling is not meaningful
+  here. Each `insert` / `update` / `delete` call is bracketed on its own and
+  `total_ms` is the sum — the per-op accounting (`encode()` / `wire_stats()`,
+  `O(cells)` real work) runs outside the bracket. One `new_parallel` per
+  config: every `(patch mode, kind)` sequence starts from
+  `IkpirServer::reset_for_replay` (fresh store from the snapshot cells, clone
+  of the epoch-0 hints), which `ikpir-client/tests/replay_equivalence.rs`
+  pins as equivalent to a fresh setup.
 
 **Per-segment data flow:**
 

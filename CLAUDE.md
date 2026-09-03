@@ -159,7 +159,20 @@ The mutation benches (`server_mutation`, `client_mutation`) sweep the
 hint-patch realization via `--patch-mode entry|row` (bench CLI default `entry`;
 `bench.sh` passes `entry,row`), emitting one CSV row per `(patch mode, kind)`
 pair with a `patch_mode` column — the empirical counterpart of the paper's
-row-level vs entry-level mutation columns.
+row-level vs entry-level mutation columns. Both build **one** server per
+config and rewind it between `(patch mode, kind)` sequences with
+`IkpirServer::reset_for_replay` (fresh store from the snapshot cells, clone of
+the epoch-0 hints; the seed-derived `A` is kept), so a config pays the
+`Θ(d·ρ·n·ω)` setup once rather than once per sequence;
+`ikpir-client/tests/replay_equivalence.rs` pins that a replay yields the same
+deltas and hints as a fresh setup. `server_mutation` brackets only the
+`insert` / `update` / `delete` call per op and reports the v1 delta transcript
+next to the fresh-hint download it competes with: `delta_bytes_total` (exact
+`encode()` bytes), `delta_rows_total`, `delta_runs_total`, `delta_cells_total`
+(delta literals incl. bridged zeros), `delta_nonzero_cells_total` (the sparse
+set `S`, the Θ(τ·w) quantity), `setup_bundle_bytes`
+(`ServerSetupBundle::wire_byte_size`), `hint_bytes_total` (Σ per-segment hint
+bytes), and `delta_encoding` (`v1`) — `docs/hint-delta-wire-format.md` §6 / §9.
 
 ### Setup in the benches: reference vs optimized
 
