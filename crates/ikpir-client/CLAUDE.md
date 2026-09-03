@@ -99,7 +99,7 @@ setup bundle.
 | `StaleDelta` | `apply_delta` | `delta.epoch ≤ self.epoch` |
 | `FutureDelta` | `apply_delta` | `delta.epoch > self.epoch + 1` (gap) |
 | `EpochMismatch` | `decode` | server moved between query and answer |
-| `MalformedBundle` | `apply_delta` / `decode` | wrong segment count or row width |
+| `MalformedBundle` | `apply_delta` / `decode` | params mismatch, or wrong segment count / row width |
 | `Server(IkpirError)` | forward | for synchronous in-process composition |
 
 ## 6. Entry points and test taxonomy

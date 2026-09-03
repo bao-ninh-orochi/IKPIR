@@ -70,8 +70,11 @@ pub enum IkpirClientError {
         /// Epoch the response carried.
         response: u64,
     },
-    /// Either `apply_delta` or `decode` was given a bundle whose segment count
-    /// or row width does not match the cached `params.arity()` /
+    /// Returned by [`IkpirClient::apply_delta`](crate::IkpirClient::apply_delta)
+    /// when `delta.params` does not equal the client's cached `params`, or
+    /// `delta.per_segment_row_deltas.len()` does not match `params.arity()`.
+    /// Also returned by `decode` when a bundle's segment count or row width
+    /// does not match the cached `params.arity()` /
     /// `bucket_size × cells_per_slot`.
     MalformedBundle,
     /// Forwarded [`IkpirError`] from a server call. Present for ergonomic
@@ -107,7 +110,7 @@ impl fmt::Display for IkpirClientError {
             Self::MalformedBundle => {
                 write!(
                     f,
-                    "malformed bundle: segment count or row width does not match client parameters"
+                    "malformed bundle: params, segment count, or row width does not match client parameters"
                 )
             }
             Self::Server(e) => write!(f, "server error: {e}"),

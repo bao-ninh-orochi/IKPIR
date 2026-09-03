@@ -19,7 +19,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 |---|---|
 | `src/lib.rs` | Top-level re-exports of `backend`, `wire`, and `error` |
 | `src/error.rs` | `IkpirError` enum (5 variants) — returned by server methods, wrapped by `IkpirClientError::Server` on the client side |
-| `src/wire.rs` | Wire-format bundles `ServerSetupBundle / PirQueryBundle / PirResponseBundle / HintDeltaBundle`, the `SegmentRowDeltas` type alias, and per-bundle `wire_byte_size` helpers |
+| `src/wire.rs` | Wire-format bundles `ServerSetupBundle / PirQueryBundle / PirResponseBundle / HintDeltaBundle`, the `SegmentRowDeltas` type alias, per-bundle `wire_byte_size` helpers, and `HintDeltaBundle`'s specified bit-packed encoding (`DeltaWireLayout`, `DeltaWireStats`, `WireError`, `encode` / `decode` — `docs/hint-delta-wire-format.md`) |
 | `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 7 methods), `IncrementalPirBackend` (+2 methods, both taking a `HintPatchMode`), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods); `HintPatchMode` enum (`RowLevel` / `EntryLevel`, default `EntryLevel`) |
 | `src/backend/frodo/mod.rs` | Re-exports the FrodoPIR backend's public surface |
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
@@ -121,19 +121,27 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
   cells_per_slot + c`, and SimplePIR's reshape translation is affine in
   the offset), which is what makes the runs long enough to matter.
 
-- **No I/O, no serialisation in the wire types** — bundles are plain
-  data crossing process boundaries by value within tests and examples.
-  Production deployments layer their own serialiser on top;
-  `wire_byte_size()` reports the *minimum* on-wire footprint under
+- **No I/O, no serialisation in three of the four wire types** —
+  `ServerSetupBundle`, `PirQueryBundle`, and `PirResponseBundle` are
+  plain data crossing process boundaries by value within tests and
+  examples. Production deployments layer their own serialiser on top;
+  their `wire_byte_size()` reports the *minimum* on-wire footprint under
   fixed-width little-endian encoding so configs can be compared without
-  committing to a specific format.
+  committing to a specific format. **`HintDeltaBundle` is the exception**:
+  it has a normative, bit-packed on-wire encoding
+  (`docs/hint-delta-wire-format.md`, `wire.rs::{encode, decode}`), and its
+  `wire_byte_size()` equals `encode().len()` exactly, by construction and
+  by test — not a minimum-footprint estimate.
 
 - **`HintDeltaBundle::new` is `#[doc(hidden)] pub`** — the constructor
   must be reachable from `ikpir-server` (sibling crate) but is hidden
-  from the public API. It skips the invariant checks that
-  `IkpirClient::apply_delta` then trusts (epoch monotonicity,
+  from the public API. It takes `(epoch, per_segment_row_deltas, params)`
+  and skips the invariant checks that `IkpirClient::apply_delta` then
+  trusts (epoch monotonicity, `delta.params == self.params`,
   `per_segment_row_deltas.len() == arity`); only
-  `IkpirServer::commit_mutations` is permitted to call it.
+  `IkpirServer::commit_mutations` is permitted to call it, passing its
+  own `self.params` — the geometry the deltas were folded under, never
+  itself on the wire (`docs/hint-delta-wire-format.md` §2).
 
 - **`SegmentRowDeltas` is `pub`** (was `pub(crate)` before the split) —
   the type appears in the public `HintDeltaBundle` field, and
@@ -215,7 +223,7 @@ SimplePIR).
 | `ServerSetupBundle<B>` | server → client | preprocessing material (`Hint`, `ServerParams`, `CuckooParams`, epoch). **Not** `HintMaterial` — the client re-expands `A` from the seed inside `ServerParams` via `expand_hint_material`. |
 | `PirQueryBundle<B>` | client → server | one `B::Query` per segment + epoch |
 | `PirResponseBundle<B>` | server → client | one `B::Response` per segment + epoch |
-| `HintDeltaBundle<B>` | server → client | sparse per-segment row deltas + epoch (after one mutation) |
+| `HintDeltaBundle<B>` | server → client | sparse per-segment row deltas + epoch + `CuckooParams` (after one mutation). The only bundle with a specified on-wire byte encoding. |
 
 The exclusion of `HintMaterial` from `ServerSetupBundle` is what makes
 the bundle small at paper scale. `setup_bundle_bytes` in the bench
@@ -224,7 +232,11 @@ setup) after this refactor.
 
 `SegmentRowDeltas = Vec<(u32, Vec<(u16, i64)>)>` — per-segment list of
 `(row_in_segment, [(cell_offset, signed_delta), …])`. Backend-agnostic:
-contents are plain integers, no backend ciphertext.
+contents are plain integers, no backend ciphertext. This is
+`HintDeltaBundle`'s in-memory shape; its on-wire shape is the
+run-length, bit-packed encoding in `docs/hint-delta-wire-format.md`
+(`wire.rs::{encode, decode, wire_stats}` / `DeltaWireLayout` /
+`WireError`), which `wire_byte_size()` reports exactly.
 
 ## 6. Failure-mode table (`IkpirError`)
 
@@ -250,6 +262,7 @@ composition.
 | SimplePIR config knobs | `backend/simple/params.rs::SimpleConfig` (`lwe_dim`, `sigma`) |
 | Implement a new backend | mirror `backend/frodo/backend.rs` (tall-skinny) or `backend/simple/backend.rs` (square reshape); see backend-author checklist below |
 | Wire-bundle layout | `wire.rs` module docs + each bundle's labelled-section block |
+| `HintDeltaBundle`'s on-wire byte encoding | `docs/hint-delta-wire-format.md` (normative spec) → `wire.rs::{DeltaWireLayout, DeltaWireStats, WireError, HintDeltaBundle::{encode, decode, wire_stats}}` |
 | Shared error variants | `error.rs::IkpirError` |
 | Round-trip cell-modulus conversion | `backend/frodo/arith.rs` (also duplicated in `backend/simple/arith.rs`) |
 | Online matvec hot loop (`acc += qᵀ·D`) | `backend/matvec.rs::matvec_accumulate` — shared by both backends (unlike `arith.rs`, deliberately *not* duplicated: it is backend-agnostic linear algebra whose blocking tunables must never diverge) |

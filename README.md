@@ -141,7 +141,7 @@ The paper's notation maps onto the code as follows.
 | `IKPIR.Setup(DB)` | offline phase, all `d` segments | `IkpirServer::new` + `IkpirServer::setup` → `ServerSetupBundle` |
 | (same, computed across cores) | identical output, untimed preamble | `IkpirServer::new_parallel` / `IkpirClient::from_setup_parallel` — see `ParallelSetupBackend` |
 | `IKPIR.Query / Answer / Recover` | keyword online phase | `IkpirClient::build_query` / `IkpirServer::answer` / `IkpirClient::decode` |
-| transcript `trans = (S_j)` | sparse per-segment overwrites | `HintDeltaBundle`, `SegmentRowDeltas` |
+| transcript `trans = (S_j)` | sparse per-segment overwrites; specified byte encoding | `HintDeltaBundle`, `SegmentRowDeltas`, `docs/hint-delta-wire-format.md` |
 | hint `H = A·D` | client preprocessing material | `B::Hint` (`FrodoHint` / `SimpleHint`) |
 | `A` (expanded from seed `β`) | public LWE matrix, never on the wire | `B::HintMaterial`, `expand_hint_material` |
 | `n` | LWE dimension | `lwe_dim` (1566 FrodoPIR / 1275 SimplePIR) |

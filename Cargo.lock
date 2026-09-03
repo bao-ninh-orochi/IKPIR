@@ -350,6 +350,7 @@ dependencies = [
 name = "ikpir-common"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rand",
  "rand_chacha",
  "segmented-cuckoo",
