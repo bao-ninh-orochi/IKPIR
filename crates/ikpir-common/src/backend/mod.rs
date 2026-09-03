@@ -239,6 +239,42 @@ pub enum HintPatchMode {
     EntryLevel,
 }
 
+/// Strategy the IKPIR client uses to stay consistent with server mutations.
+///
+/// Both strategies consume the same `HintDeltaBundle` stream and return the
+/// **same** decoded value for every query — only *when* and *where* the
+/// published `ΔD` is spent differs, so the mode is a purely local client choice
+/// the server never sees, exactly like [`HintPatchMode`]. Where `HintPatchMode`
+/// selects the arithmetic schedule of a *single* hint patch, this selects the
+/// whole maintenance-and-decode realization one level up.
+///
+/// With `n` the LWE dimension, `τ` the per-batch mutation count and `ω` the
+/// (possibly reshaped) database row width:
+///
+/// - [`HintPatch`](Self::HintPatch) — the client folds each delta into its own
+///   hint immediately (`apply_delta`): `H ← H + Σ A[:,col]·δ`, cost `Θ(n·τ·ω)`
+///   per batch. Decode is a direct `client_decode` against the patched hint.
+/// - [`Rewind`](Self::Rewind) — the client pins its bootstrap hint `H₀` and
+///   *accumulates* the published `ΔD` (`accumulate_delta`), cost `Θ(τ·ω)` per
+///   batch — a factor-`n` cheaper client maintenance — paying a per-query
+///   correction that grows with the staleness `|ΔD|`: it rewinds a
+///   head-answered response back to `H₀`'s epoch (`decode_rewind`), decodes
+///   against the stale `H₀`, and adds `ΔD[row]` to the recovered row before the
+///   fingerprint scan. The correction is reclaimed by folding `ΔD` into the
+///   hint on demand (`collect_garbage`).
+///
+/// The default is [`Rewind`](Self::Rewind).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ClientUpdateMode {
+    /// Fold each delta into the hint immediately — `Θ(n·τ·ω)` per batch, no
+    /// per-query correction.
+    HintPatch,
+    /// Pin the bootstrap hint and accumulate `ΔD` — `Θ(τ·ω)` per batch, plus a
+    /// staleness-growing per-query correction reclaimable by garbage collection.
+    #[default]
+    Rewind,
+}
+
 /// Extension of [`IndexPirBackend`] for backends that support sparse
 /// hint updates without a full recompute.
 ///
@@ -466,4 +502,50 @@ pub trait PrecomputingPirBackend: IndexPirBackend {
     /// Number of slots currently in flight (consumed by `client_query`,
     /// awaiting `client_decode`).
     fn in_flight_slot_count(state: &Self::ClientState) -> usize;
+}
+
+/// Extension of [`IndexPirBackend`] for the client's response-rewind decode
+/// path: subtract the accumulated public `qᵀ·ΔD` from a response answered at
+/// the server head, so it can be decoded against a *stale*, pinned hint.
+///
+/// # Purpose
+///
+/// A [`ClientUpdateMode::Rewind`] client never patches its hint; it pins
+/// `H₀ = Aᵀ·D₀` and rolls a running `ΔD = D_head − D₀`. For a response
+/// `a = qᵀ·D_head` — with `q` the query vector *including* its row marker, the
+/// exact vector the server multiplied — [`rewind_response`](Self::rewind_response)
+/// computes `a ← a − qᵀ·ΔD = qᵀ·D₀` in place, exactly in `Z_2³²`. The client
+/// then decodes `a` against `H₀` (recovering `D₀[row]`) and adds `ΔD[row]` to
+/// reach the current `D_head[row]`.
+///
+/// # Why per-backend
+///
+/// The map from a segment cell `(row, cell_offset)` to the response index it
+/// contributes to is backend-specific: FrodoPIR keeps the tall-skinny layout
+/// (`resp.a[off] -= q.b[row]·δ`), SimplePIR folds through its near-square
+/// reshape. Both read only public fields (`q.b`, `resp.a`, and SimplePIR's
+/// reshape parameters off the client state), so the impls need no private
+/// access.
+///
+/// # Determinism / modulus
+///
+/// Both shipped backends carry cell modulus `q = 2³²`; `δ as u32` truncating the
+/// two's-complement `i64` to its low 32 bits **is** the reduction mod `2³²`
+/// (negatives included). A backend on a different modulus must reduce
+/// accordingly.
+pub trait ResponseRewind: IndexPirBackend {
+    /// Subtract `qᵀ·Δ` (mod the cell modulus) from `resp` in place, for one
+    /// segment, where `Δ` is that segment's accumulated
+    /// `(row, cell_offset) → signed delta` map.
+    ///
+    /// `query` must be the exact per-segment [`Query`](IndexPirBackend::Query)
+    /// the server answered (row marker included). `state` is threaded so a
+    /// reshaping backend can read its layout parameters off the client state;
+    /// backends that need none ignore it. An empty `deltas` is a no-op.
+    fn rewind_response(
+        state: &Self::ClientState,
+        query: &Self::Query,
+        resp: &mut Self::Response,
+        deltas: &std::collections::BTreeMap<(u32, u16), i64>,
+    );
 }

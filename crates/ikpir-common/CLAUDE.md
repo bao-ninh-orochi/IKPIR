@@ -20,7 +20,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/lib.rs` | Top-level re-exports of `backend`, `wire`, and `error` |
 | `src/error.rs` | `IkpirError` enum (5 variants) — returned by server methods, wrapped by `IkpirClientError::Server` on the client side |
 | `src/wire.rs` | Wire-format bundles `ServerSetupBundle / PirQueryBundle / PirResponseBundle / HintDeltaBundle`, the `SegmentRowDeltas` type alias, per-bundle `wire_byte_size` helpers, and `HintDeltaBundle`'s specified bit-packed encoding (`DeltaWireLayout`, `DeltaWireStats`, `WireError`, `encode` / `decode` — `docs/hint-delta-wire-format.md`) |
-| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 7 methods), `IncrementalPirBackend` (+2 methods, both taking a `HintPatchMode`), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods); `HintPatchMode` enum (`RowLevel` / `EntryLevel`, default `EntryLevel`) |
+| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 7 methods), `IncrementalPirBackend` (+2 methods, both taking a `HintPatchMode`), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods), `ResponseRewind` (+1 method, the client's response-rewind correction — impl'd in `backend/{frodo,simple}/backend.rs`); `HintPatchMode` enum (`RowLevel` / `EntryLevel`, default `EntryLevel`) and `ClientUpdateMode` enum (`HintPatch` / `Rewind`, default `Rewind` — the client's update strategy, `docs/rewind-client-mode.md`) |
 | `src/backend/frodo/mod.rs` | Re-exports the FrodoPIR backend's public surface |
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
@@ -188,8 +188,13 @@ IndexPirBackend (mandatory)
 │   expand_hint_material_parallel(params) -> HintMaterial
 │   client_setup_parallel(params, hint) -> ClientState
 │
-└── BackendWireSize
-    query_byte_size(q) / response_byte_size(r) / hint_byte_size(h) / server_params_byte_size(p)
+├── BackendWireSize
+│   query_byte_size(q) / response_byte_size(r) / hint_byte_size(h) / server_params_byte_size(p)
+│
+└── ResponseRewind        — the client's rewind update mode (docs/rewind-client-mode.md)
+    rewind_response(state, query, resp, deltas)   — resp -= qᵀ·ΔD for one segment,
+        query is the marker-bearing vector the server answered; reads only public
+        fields, so both shipped backends impl it in backend/{frodo,simple}/backend.rs
 ```
 
 `HintMaterial` is server-local working state (e.g. the LWE public matrix
