@@ -26,7 +26,7 @@ die()  { echo "${C_YELLOW}error:${C_RESET} $*" >&2; exit 1; }
 # their own flags (see crates/segmented-cuckoo/benches/configs.rs) and default to
 # the paper's Table 2 matrix, so bench.sh forwards their flags unchanged.
 PIR_SERVER_BENCHES=(server_setup server_answer server_mutation headtohead_answer)
-PIR_CLIENT_BENCHES=(client_query client_decode client_mutation headtohead_query headtohead_decode)
+PIR_CLIENT_BENCHES=(client_query client_decode client_mutation client_rewind_staleness headtohead_query headtohead_decode)
 # The four that populate Table 2, in the order the table's columns read.
 CUCKOO_TABLE2_BENCHES=(cuckoo_filter_load_factor cuckoo_filter_insert_throughput
                        cuckoo_filter_lookup_throughput cuckoo_filter_delete_throughput)

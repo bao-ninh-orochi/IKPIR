@@ -41,6 +41,10 @@ name    = "client_mutation"
 harness = false
 
 [[bench]]
+name    = "client_rewind_staleness"
+harness = false
+
+[[bench]]
 name    = "headtohead_query"
 harness = false
 

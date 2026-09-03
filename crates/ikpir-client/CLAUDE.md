@@ -148,7 +148,8 @@ Five focused benches covering classical and incremental client criteria for the 
 |---|---|---|---|
 | `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
 | `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
-| `client_mutation` | `--load-factor` (0.90) | `apply_delta` throughput per (kind, patch mode) pair (insert/update/delete × entry/row), wall-clock, empty queue (isolates hint-patch cost); one setup per config, deltas collected from a server rewound per kind with `reset_for_replay` | `ikpir_client_mutation.csv` |
+| `client_mutation` | `--load-factor` (0.90) | per-batch **maintenance** throughput per (kind, `--update-mode` patch\|rewind [, `--patch-mode` entry\|row]): `patch` times `apply_delta`, `rewind` times `accumulate_delta` (the factor-`n` client-maintenance gap); wall-clock, empty queue; `pending_cells` = final \|ΔD\|; one setup per config, deltas collected from a server rewound per kind with `reset_for_replay` | `ikpir_client_mutation.csv` |
+| `client_rewind_staleness` | `--load-factor` (0.90) | rewind `decode_rewind` per-query latency vs staleness \|ΔD\| (one client accumulates over `--staleness-steps` × `--batch-size` updates, never GC'd, then a `collect_garbage` returns it to baseline); times only `decode_rewind` | `ikpir_client_rewind_staleness.csv` |
 | `headtohead_query` | fixed `--num-keys` | `build_query` rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `client_query` + `num_keys`/`db_size` columns | `ikpir_headtohead_client_query.csv` |
 | `headtohead_decode` | fixed `--num-keys` | `decode` rate at a fixed keyword count; mirrors `client_decode` + `num_keys`/`db_size` columns, with the once-per-config `verify_decode` sanity check | `ikpir_headtohead_client_decode.csv` |
 
