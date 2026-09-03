@@ -85,19 +85,23 @@ per-segment architecture, protocol invariants, and backend-author checklist.
 ### `ikpir-client`
 
 Holds `CuckooParams` and per-segment `ClientState`; translates keyword
-lookups into PIR query/response bundles and applies incremental hint deltas.
-See [`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) for the epoch
+lookups into PIR query/response bundles and stays consistent with server
+mutations in one of two selectable `ClientUpdateMode`s — entry-level
+hint-patching, or (default) **response-rewind**, which pins the bootstrap hint
+and accumulates the published `ΔD` for a factor-`n` cheaper client maintenance
+(`docs/rewind-client-mode.md`). See
+[`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) for the epoch
 state machine, failure-mode table, and entry-point map.
 
 ## Benches
 
-Nine focused `clap`-parsed PIR benches — four server (`server_setup`,
-`server_answer`, `server_mutation`, `headtohead_answer`) and five client
-(`client_query`, `client_decode`, `client_mutation`, `headtohead_query`,
-`headtohead_decode`) — emit CSV under `results/<crate>/`. Each invocation =
-one config = one CSV row (the mutation benches emit one row per
-`(patch mode, kind)` pair; the `headtohead_*` benches fix `--num-keys` and add
-`num_keys`/`db_size` columns for the fixed-N comparison vs ChalametPIR /
+Ten focused `clap`-parsed PIR benches — four server (`server_setup`,
+`server_answer`, `server_mutation`, `headtohead_answer`) and six client
+(`client_query`, `client_decode`, `client_mutation`, `client_rewind_staleness`,
+`headtohead_query`, `headtohead_decode`) — emit CSV under `results/<crate>/`.
+Each invocation = one config = one CSV row (`client_mutation` emits one row per
+`(update mode, patch mode, kind)`; the `headtohead_*` benches fix `--num-keys`
+and add `num_keys`/`db_size` columns for the fixed-N comparison vs ChalametPIR /
 Hao 2025).
 
 `segmented-cuckoo` adds eight filter/KV-store benches: five `cuckoo_filter_*`

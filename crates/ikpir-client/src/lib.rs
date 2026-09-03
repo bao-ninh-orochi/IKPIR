@@ -26,6 +26,13 @@
 //!         reset_from(new_bundle)  — replace all internal state
 //! ```
 //!
+//! The lifecycle above is the **hint-patch** update mode. The **default** mode
+//! is **rewind** ([`ClientUpdateMode::Rewind`]): `accumulate_delta` in place of
+//! `apply_delta` (a factor-`n` cheaper client maintenance), `decode_rewind` in
+//! place of `decode`, and `collect_garbage` to reclaim the per-query staleness
+//! cost. Both modes return the same decoded value; select with
+//! [`set_update_mode`](IkpirClient::set_update_mode).
+//!
 //! - [`apply_delta`](IkpirClient::apply_delta) is **strict-monotone**: only
 //!   `delta.epoch == self.epoch + 1` is accepted; older deltas are
 //!   [`StaleDelta`](IkpirClientError::StaleDelta), gaps are
@@ -50,7 +57,10 @@
 //!
 //! let q = client.build_query(b"alice");
 //! let r = server.answer(&q).unwrap();
-//! let v = client.decode(b"alice", &r).unwrap().expect("found");
+//! // Rewind is the default update mode; `decode_rewind` threads the query
+//! // back so the response can be rewound to the pinned hint. (In hint-patch
+//! // mode — `set_update_mode(ClientUpdateMode::HintPatch)` — use `decode`.)
+//! let v = client.decode_rewind(b"alice", &q, &r).unwrap().expect("found");
 //! assert_eq!(v, vec![0xAB]);
 //! ```
 //!
@@ -61,13 +71,15 @@
 
 mod client;
 mod error;
+mod pending;
 
 pub use client::{DeltaApplyOutcome, IkpirClient};
 pub use error::IkpirClientError;
 
 pub use ikpir_common::{
-    BackendWireSize, DeltaWireLayout, DeltaWireStats, FrodoConfig, FrodoPirBackend,
-    HintDeltaBundle, HintPatchMode, IkpirError, IncrementalPirBackend, IndexPirBackend,
-    ParallelSetupBackend, PirQueryBundle, PirResponseBundle, PrecomputingPirBackend,
-    SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend, WireError,
+    BackendWireSize, ClientUpdateMode, DeltaWireLayout, DeltaWireStats, FrodoConfig,
+    FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError, IncrementalPirBackend,
+    IndexPirBackend, ParallelSetupBackend, PirQueryBundle, PirResponseBundle,
+    PrecomputingPirBackend, ResponseRewind, SegmentRowDeltas, ServerSetupBundle, SimpleConfig,
+    SimplePirBackend, WireError,
 };

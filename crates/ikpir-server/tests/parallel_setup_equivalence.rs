@@ -25,6 +25,7 @@ use ikpir_server::{
 };
 use segmented_cuckoo::{Segmented2aryCuckooKVStore, Segmented2aryScheme};
 
+use ikpir_client::ClientUpdateMode;
 use ikpir_client::IkpirClient;
 
 /// Buckets in the fixture store. Sized so that **both** backends clear
@@ -118,7 +119,9 @@ where
     server.insert(b"beta", b"B").unwrap();
 
     let mut reference_client = IkpirClient::<B>::from_setup(server.setup());
+    reference_client.set_update_mode(ClientUpdateMode::HintPatch);
     let mut parallel_client = IkpirClient::<B>::from_setup_parallel(server.setup());
+    parallel_client.set_update_mode(ClientUpdateMode::HintPatch);
     assert_lookup(&server, &mut reference_client, b"alpha", b"A");
     assert_lookup(&server, &mut parallel_client, b"alpha", b"A");
 
@@ -147,6 +150,7 @@ where
         IkpirServer::new(store(), config);
     reference_server.insert(b"delta", b"D").unwrap();
     let mut client = IkpirClient::<B>::from_setup_parallel(reference_server.setup());
+    client.set_update_mode(ClientUpdateMode::HintPatch);
     assert_lookup(&reference_server, &mut client, b"delta", b"D");
 }
 

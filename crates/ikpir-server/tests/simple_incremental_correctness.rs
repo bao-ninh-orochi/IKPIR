@@ -10,6 +10,7 @@
 //! `dot` shortcut is subtly off, `many_mutations_with_warm_queue` will
 //! surface it as a decode divergence.
 
+use ikpir_client::ClientUpdateMode;
 use ikpir_client::IkpirClient;
 use ikpir_server::{
     HintDeltaBundle, HintPatchMode, IkpirError, IkpirServer, SimpleConfig, SimplePirBackend,
@@ -273,6 +274,7 @@ where
         server.insert(&k.to_le_bytes(), &[k as u8 ^ 0x33]).unwrap();
     }
     let mut client: IkpirClient<SimplePirBackend> = IkpirClient::from_setup(server.setup());
+    client.set_update_mode(ClientUpdateMode::HintPatch);
     client.precompute_queries(60);
     client.precompute_decodes();
 
@@ -291,6 +293,7 @@ where
     }
 
     let mut oracle: IkpirClient<SimplePirBackend> = IkpirClient::from_setup(server.setup());
+    oracle.set_update_mode(ClientUpdateMode::HintPatch);
     let probes: &[u32] = &[0, 5, 12, 19, 25, 30, 35, 40, 45, 999];
     for &k in probes {
         let key = k.to_le_bytes();
@@ -342,6 +345,7 @@ where
     // Server realizes patches row-level; client entry-level (its default).
     server.set_hint_patch_mode(HintPatchMode::RowLevel);
     let mut client: IkpirClient<SimplePirBackend> = IkpirClient::from_setup(server.setup());
+    client.set_update_mode(ClientUpdateMode::HintPatch);
     assert_eq!(
         client.hint_patch_mode(),
         HintPatchMode::EntryLevel,

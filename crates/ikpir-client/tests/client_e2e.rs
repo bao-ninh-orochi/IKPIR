@@ -25,7 +25,9 @@
 //! single-arity tests pin the wire-byte accounting helpers
 //! (`wire_byte_size`) and the constant-time-decode last-slot probe.
 
-use ikpir_client::{FrodoConfig, FrodoPirBackend, HintPatchMode, IkpirClient, IkpirClientError};
+use ikpir_client::{
+    ClientUpdateMode, FrodoConfig, FrodoPirBackend, HintPatchMode, IkpirClient, IkpirClientError,
+};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
     IndexScheme, SchemeMeta, Segmented2aryCuckooKVStore, Segmented2aryScheme,
@@ -58,7 +60,9 @@ fn fresh_client<S>(server: &IkpirServer<S, FrodoPirBackend>) -> Client
 where
     S: IndexScheme + SchemeMeta + 'static,
 {
-    IkpirClient::from_setup(server.setup())
+    let mut client = IkpirClient::from_setup(server.setup());
+    client.set_update_mode(ClientUpdateMode::HintPatch);
+    client
 }
 
 /// `(key_bytes, value_bytes)` pair derived from `k` — keeps the test

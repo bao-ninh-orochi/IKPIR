@@ -26,7 +26,7 @@ die()  { echo "${C_YELLOW}error:${C_RESET} $*" >&2; exit 1; }
 # their own flags (see crates/segmented-cuckoo/benches/configs.rs) and default to
 # the paper's Table 2 matrix, so bench.sh forwards their flags unchanged.
 PIR_SERVER_BENCHES=(server_setup server_answer server_mutation headtohead_answer)
-PIR_CLIENT_BENCHES=(client_query client_decode client_mutation headtohead_query headtohead_decode)
+PIR_CLIENT_BENCHES=(client_query client_decode client_mutation client_rewind_staleness headtohead_query headtohead_decode)
 # The four that populate Table 2, in the order the table's columns read.
 CUCKOO_TABLE2_BENCHES=(cuckoo_filter_load_factor cuckoo_filter_insert_throughput
                        cuckoo_filter_lookup_throughput cuckoo_filter_delete_throughput)
@@ -54,10 +54,11 @@ crate_for_bench() {
 is_pir_bench()        { _contains "$1" "${PIR_SERVER_BENCHES[@]}" "${PIR_CLIENT_BENCHES[@]}"; }
 is_mutation_bench()   { [[ "$1" == server_mutation || "$1" == client_mutation ]]; }
 is_headtohead_bench() { [[ "$1" == headtohead_* ]]; }
-# Benches that seed their store to a target fill. The rest populate to TableFull
-# (server_answer, client_query, client_decode) or to an exact key count (the
-# headtohead_* trio) and reject --load-factor.
-takes_load_factor()   { is_mutation_bench "$1" || [[ "$1" == server_setup ]]; }
+# Benches that seed their store to a target fill (--load-factor): the mutation
+# benches, server_setup, and client_rewind_staleness. The rest populate to
+# TableFull (server_answer, client_query, client_decode) or to an exact key
+# count (the headtohead_* trio) and reject --load-factor.
+takes_load_factor()   { is_mutation_bench "$1" || [[ "$1" == server_setup || "$1" == client_rewind_staleness ]]; }
 all_benches()         { printf '%s\n' "${PIR_SERVER_BENCHES[@]}" "${PIR_CLIENT_BENCHES[@]}" "${CUCKOO_BENCHES[@]}"; }
 
 # ── Backend parameters ────────────────────────────────────────────────────────

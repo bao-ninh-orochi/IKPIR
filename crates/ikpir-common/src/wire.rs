@@ -577,7 +577,7 @@ fn row_runs(cells: &[(u16, i64)], max_gap: u32) -> impl Iterator<Item = (u16, u1
 /// `docs/hint-delta-wire-format.md` — via [`Self::encode`] / [`Self::decode`].
 /// [`Self::wire_byte_size`] equals `self.encode().len()` by construction:
 /// both are computed from the same [`DeltaWireLayout`] and the same
-/// [`row_runs`] splitting rule.
+/// `row_runs` splitting rule.
 ///
 /// # Rationale
 ///
@@ -720,7 +720,7 @@ impl<B: IndexPirBackend> HintDeltaBundle<B> {
     /// # Purpose
     ///
     /// Walks the bundle with the same run-splitting rule [`Self::encode`]
-    /// uses ([`row_runs`], `docs/hint-delta-wire-format.md` §5 rule 2) and
+    /// uses (`row_runs`, `docs/hint-delta-wire-format.md` §5 rule 2) and
     /// reports the resulting counts plus the closed-form bit/byte length
     /// from §6.
     ///
@@ -730,7 +730,7 @@ impl<B: IndexPirBackend> HintDeltaBundle<B> {
     ///
     /// # Panics
     ///
-    /// See [`Self::validate`].
+    /// See `Self::validate`.
     pub fn wire_stats(&self) -> DeltaWireStats {
         let layout = self.layout();
         self.validate(&layout);
@@ -768,7 +768,7 @@ impl<B: IndexPirBackend> HintDeltaBundle<B> {
     ///
     /// # Panics
     ///
-    /// See [`Self::validate`].
+    /// See `Self::validate`.
     pub fn wire_byte_size(&self) -> usize {
         self.wire_stats().bytes
     }
@@ -782,7 +782,7 @@ impl<B: IndexPirBackend> HintDeltaBundle<B> {
     ///
     /// # Panics
     ///
-    /// See [`Self::validate`] (`docs/hint-delta-wire-format.md` §8): a
+    /// See `Self::validate` (`docs/hint-delta-wire-format.md` §8): a
     /// violation is a bug in the caller (the fold) and must be loud, never
     /// silently truncated or wrapped.
     pub fn encode(&self) -> Vec<u8> {

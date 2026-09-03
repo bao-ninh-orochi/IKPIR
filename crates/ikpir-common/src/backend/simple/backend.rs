@@ -56,8 +56,9 @@ use super::{
 use crate::backend::matvec::matvec_accumulate;
 use crate::backend::{
     parallel, patch::TouchedRuns, BackendWireSize, HintPatchMode, IncrementalPirBackend,
-    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, ResponseRewind,
 };
+use std::collections::BTreeMap;
 
 /// Zero-sized witness type that carries the [`IndexPirBackend`] /
 /// [`IncrementalPirBackend`] / [`PrecomputingPirBackend`] /
@@ -1167,6 +1168,30 @@ fn apply_patch_row_level(
             for (orig_off, _) in cells {
                 dense[(off_within + u32::from(*orig_off)) as usize] = 0;
             }
+        }
+    }
+}
+
+impl ResponseRewind for SimplePirBackend {
+    /// SimplePIR folds the segment into a near-square matrix, so a segment cell
+    /// `(row, off)` maps to reshape coordinates `big_r = row/k`,
+    /// `big_c = (row%k)·row_width + off`, and `resp.a[big_c] -= q.b[big_r]·δ`.
+    /// The reshape parameters `k` / `row_width` are read off the client state's
+    /// public `params` (the original, pre-reshape row width).
+    fn rewind_response(
+        state: &SimpleClientState,
+        query: &SimpleQuery,
+        resp: &mut SimpleResponse,
+        deltas: &BTreeMap<(u32, u16), i64>,
+    ) {
+        let k = state.params.k;
+        let row_width = state.params.row_width;
+        for (&(row, off), &d) in deltas {
+            let big_r = (row / k) as usize;
+            let big_c = ((row % k) * row_width + u32::from(off)) as usize;
+            // `d as u32` keeps the low 32 bits — exactly reduction mod 2³².
+            let term = query.b[big_r].wrapping_mul(d as u32);
+            resp.a[big_c] = resp.a[big_c].wrapping_sub(term);
         }
     }
 }
