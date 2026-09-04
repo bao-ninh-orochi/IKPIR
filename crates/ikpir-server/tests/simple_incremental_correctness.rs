@@ -10,7 +10,6 @@
 //! `dot` shortcut is subtly off, `many_mutations_with_warm_queue` will
 //! surface it as a decode divergence.
 
-use ikpir_client::ClientUpdateMode;
 use ikpir_client::IkpirClient;
 use ikpir_server::{
     HintDeltaBundle, HintPatchMode, IkpirError, IkpirServer, SimpleConfig, SimplePirBackend,
@@ -274,36 +273,34 @@ where
         server.insert(&k.to_le_bytes(), &[k as u8 ^ 0x33]).unwrap();
     }
     let mut client: IkpirClient<SimplePirBackend> = IkpirClient::from_setup(server.setup());
-    client.set_update_mode(ClientUpdateMode::HintPatch);
     client.precompute_queries(60);
     client.precompute_decodes();
 
     for k in 20u32..50 {
         let delta: HintDeltaBundle<SimplePirBackend> =
             server.insert(&k.to_le_bytes(), &[k as u8 ^ 0x33]).unwrap();
-        client.apply_delta(delta).unwrap();
+        client.accumulate_delta(delta).unwrap();
     }
     for k in 0u32..10 {
         let delta = server.update(&k.to_le_bytes(), &[k as u8 ^ 0x77]).unwrap();
-        client.apply_delta(delta).unwrap();
+        client.accumulate_delta(delta).unwrap();
     }
     for k in 30u32..40 {
         let delta = server.delete(&k.to_le_bytes()).unwrap();
-        client.apply_delta(delta).unwrap();
+        client.accumulate_delta(delta).unwrap();
     }
 
     let mut oracle: IkpirClient<SimplePirBackend> = IkpirClient::from_setup(server.setup());
-    oracle.set_update_mode(ClientUpdateMode::HintPatch);
     let probes: &[u32] = &[0, 5, 12, 19, 25, 30, 35, 40, 45, 999];
     for &k in probes {
         let key = k.to_le_bytes();
         let q_w = client.build_query(&key);
         let r_w = server.answer(&q_w).unwrap();
-        let v_w = client.decode(&key, &r_w).unwrap();
+        let v_w = client.decode(&key, &q_w, &r_w).unwrap();
 
         let q_o = oracle.build_query(&key);
         let r_o = server.answer(&q_o).unwrap();
-        let v_o = oracle.decode(&key, &r_o).unwrap();
+        let v_o = oracle.decode(&key, &q_o, &r_o).unwrap();
         assert_eq!(v_w, v_o, "warm queue diverged from oracle on key {k}");
     }
 }
@@ -321,14 +318,14 @@ fn many_mutations_with_warm_queue_4ary() {
     many_mutations_with_warm_queue_inner(build_empty_4());
 }
 
-/// Cross-mode lock-step under the SimplePIR reshape: a server realizing
-/// its hint patches with one [`HintPatchMode`] stays consistent with a
-/// client realizing them with the other — including a mid-stream swap of
-/// both sides. This is the backend where the two realizations differ
-/// most (the row-level pass spans the whole `reshape_row_width`), so a
-/// grouping or translation bug in the row-level path surfaces here as a
-/// decode divergence.
-fn cross_mode_lock_step_inner<S>(mut server: IkpirServer<S, SimplePirBackend>)
+/// Server-side hint-patch mode switch under the SimplePIR reshape: the
+/// server switches `HintPatchMode` mid-stream while a rewind client, which
+/// never selects a realization of its own, stays consistent throughout.
+/// This is the backend where the two realizations differ most (the
+/// row-level pass spans the whole `reshape_row_width`), so a grouping or
+/// translation bug in the row-level path surfaces here as a decode
+/// divergence.
+fn server_patch_mode_switch_inner<S>(mut server: IkpirServer<S, SimplePirBackend>)
 where
     S: IndexScheme + SchemeMeta + 'static,
 {
@@ -342,31 +339,24 @@ where
         server.insert(&k.to_le_bytes(), &[k as u8]).unwrap();
     }
 
-    // Server realizes patches row-level; client entry-level (its default).
+    // Server realizes patches row-level from here on.
     server.set_hint_patch_mode(HintPatchMode::RowLevel);
     let mut client: IkpirClient<SimplePirBackend> = IkpirClient::from_setup(server.setup());
-    client.set_update_mode(ClientUpdateMode::HintPatch);
-    assert_eq!(
-        client.hint_patch_mode(),
-        HintPatchMode::EntryLevel,
-        "client default mode must be entry-level"
-    );
 
     for k in 20u32..25 {
         let d = server.insert(&k.to_le_bytes(), &[k as u8]).unwrap();
-        client.apply_delta(d).unwrap();
+        client.accumulate_delta(d).unwrap();
     }
 
-    // Swap both sides mid-stream: server entry-level, client row-level.
+    // Swap back mid-stream.
     server.set_hint_patch_mode(HintPatchMode::EntryLevel);
-    client.set_hint_patch_mode(HintPatchMode::RowLevel);
     for k in 0u32..10 {
         let d = server.update(&k.to_le_bytes(), &[k as u8 ^ 0x5A]).unwrap();
-        client.apply_delta(d).unwrap();
+        client.accumulate_delta(d).unwrap();
     }
     for k in 15u32..20 {
         let d = server.delete(&k.to_le_bytes()).unwrap();
-        client.apply_delta(d).unwrap();
+        client.accumulate_delta(d).unwrap();
     }
 
     // Behavioural check across every mutation class the stream produced.
@@ -383,24 +373,28 @@ where
         let key = k.to_le_bytes();
         let q = client.build_query(&key);
         let r = server.answer(&q).unwrap();
-        let v = client.decode(&key, &r).unwrap();
-        assert_eq!(v, expect(k), "cross-mode decode mismatch on key {k}");
+        let v = client.decode(&key, &q, &r).unwrap();
+        assert_eq!(
+            v,
+            expect(k),
+            "server-patch-mode-switch decode mismatch on key {k}"
+        );
     }
 }
 
-/// Server and client in opposite patch modes (with a mid-stream swap)
-/// stay in lock-step on a 2-ary server.
+/// A server that switches `HintPatchMode` mid-stream stays consistent with
+/// a rewind client on a 2-ary server.
 #[test]
-fn cross_mode_lock_step() {
-    cross_mode_lock_step_inner(build_empty_2());
+fn server_patch_mode_switch() {
+    server_patch_mode_switch_inner(build_empty_2());
 }
 /// Same as 2-ary, on the 3-ary server.
 #[test]
-fn cross_mode_lock_step_3ary() {
-    cross_mode_lock_step_inner(build_empty_3());
+fn server_patch_mode_switch_3ary() {
+    server_patch_mode_switch_inner(build_empty_3());
 }
 /// Same as 2-ary, on the 4-ary server.
 #[test]
-fn cross_mode_lock_step_4ary() {
-    cross_mode_lock_step_inner(build_empty_4());
+fn server_patch_mode_switch_4ary() {
+    server_patch_mode_switch_inner(build_empty_4());
 }

@@ -18,6 +18,13 @@ autobenches = false
 [lints]
 workspace = true
 
+[features]
+default = []
+# Client-side hint-patching, kept only as a benchmark comparator against the
+# production response-rewind client (see `src/bench_comparator/`). Disabled
+# by default: a production `cargo build --release` never links it in.
+hint-patch-bench = []
+
 [dependencies]
 segmented-cuckoo = { workspace = true }
 ikpir-common     = { workspace = true }
@@ -37,12 +44,17 @@ name    = "client_decode"
 harness = false
 
 [[bench]]
-name    = "client_mutation"
-harness = false
+name               = "client_mutation"
+harness            = false
+required-features  = ["hint-patch-bench"]
 
 [[bench]]
 name    = "client_rewind_staleness"
 harness = false
+
+[[test]]
+name               = "rewind_equivalence"
+required-features  = ["hint-patch-bench"]
 
 [[bench]]
 name    = "headtohead_query"

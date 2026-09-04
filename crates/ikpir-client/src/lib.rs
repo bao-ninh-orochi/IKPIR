@@ -12,33 +12,38 @@
 //!
 //! # Lifecycle
 //!
+//! The client's sole update strategy is **response-rewind**: it pins its
+//! bootstrap hint `H₀` and never patches it, rolling the server's published
+//! deltas forward as a `ΔD` correction instead — a factor-`n` cheaper
+//! maintenance than patching the hint on every mutation
+//! (`docs/rewind-client-mode.md`).
+//!
 //! ```text
 //! from_setup(bundle)          — initialise from server's setup bundle
-//!   └── (optional) precompute_queries(N) — Phase B: amortise b = A·s + e
-//!   └── (optional) precompute_decodes()  — Phase C: amortise c = sᵀ·H
+//!   └── (optional) precompute_queries(N)   — Phase B: amortise b = A·s + e
+//!   └── (optional) precompute_decodes()    — Phase C: amortise c = sᵀ·H
 //!   └── loop:
-//!         build_query(key)    — one B::Query per segment (cheap if Phase B warm)
-//!         server.answer(&q)   — server returns PirResponseBundle
-//!         decode(key, &resp)  — fp match (cheap if Phase C warm)
-//!         apply_delta(delta)  — fold incremental hint update (epoch+1)
-//!                                also patches Phase-C material in place
+//!         build_query(key)       — one B::Query per segment (cheap if Phase B warm)
+//!         server.answer(&q)      — server returns PirResponseBundle
+//!         decode(key, &q, &resp) — rewind the response to H₀, decode, fp match
+//!         accumulate_delta(delta) — roll the published ΔD forward (epoch+1)
+//!   └── (optional) collect_garbage() — fold ΔD into H₀, reclaim the
+//!         per-query correction cost
 //!   └── on FutureDelta / after server full_rebuild:
 //!         reset_from(new_bundle)  — replace all internal state
 //! ```
 //!
-//! The lifecycle above is the **hint-patch** update mode. The **default** mode
-//! is **rewind** ([`ClientUpdateMode::Rewind`]): `accumulate_delta` in place of
-//! `apply_delta` (a factor-`n` cheaper client maintenance), `decode_rewind` in
-//! place of `decode`, and `collect_garbage` to reclaim the per-query staleness
-//! cost. Both modes return the same decoded value; select with
-//! [`set_update_mode`](IkpirClient::set_update_mode).
-//!
-//! - [`apply_delta`](IkpirClient::apply_delta) is **strict-monotone**: only
-//!   `delta.epoch == self.epoch + 1` is accepted; older deltas are
-//!   [`StaleDelta`](IkpirClientError::StaleDelta), gaps are
+//! - [`accumulate_delta`](IkpirClient::accumulate_delta) is
+//!   **strict-monotone**: only `delta.epoch == self.epoch + 1` is accepted;
+//!   older deltas are [`StaleDelta`](IkpirClientError::StaleDelta), gaps are
 //!   [`FutureDelta`](IkpirClientError::FutureDelta).
 //! - [`decode`](IkpirClient::decode) requires `resp.epoch == self.epoch`;
 //!   any mismatch is [`EpochMismatch`](IkpirClientError::EpochMismatch).
+//!
+//! The classical alternative — patching the hint on every delta — survives
+//! only as a benchmark comparator behind the `hint-patch-bench` Cargo
+//! feature ([`HintPatchClient`], disabled by default); see
+//! `bench_comparator` and `docs/rewind-client-mode.md`.
 //!
 //! # Quick start
 //!
@@ -57,29 +62,33 @@
 //!
 //! let q = client.build_query(b"alice");
 //! let r = server.answer(&q).unwrap();
-//! // Rewind is the default update mode; `decode_rewind` threads the query
-//! // back so the response can be rewound to the pinned hint. (In hint-patch
-//! // mode — `set_update_mode(ClientUpdateMode::HintPatch)` — use `decode`.)
-//! let v = client.decode_rewind(b"alice", &q, &r).unwrap().expect("found");
+//! // `decode` threads the query back so the response can be rewound to the
+//! // client's pinned hint before decoding.
+//! let v = client.decode(b"alice", &q, &r).unwrap().expect("found");
 //! assert_eq!(v, vec![0xAB]);
 //! ```
 //!
-//! For systematic measurement of build_query / decode / apply_delta
+//! For systematic measurement of build_query / decode / accumulate_delta
 //! across parameter ranges, see
-//! `benches/{client_query,client_decode,client_mutation,headtohead_query,headtohead_decode}.rs`,
+//! `benches/{client_query,client_decode,client_mutation,client_rewind_staleness,headtohead_query,headtohead_decode}.rs`,
 //! run via the `scripts/bench.sh <name>` runner at the workspace root.
 
 mod client;
 mod error;
 mod pending;
 
+#[cfg(feature = "hint-patch-bench")]
+pub mod bench_comparator;
+
 pub use client::{DeltaApplyOutcome, IkpirClient};
 pub use error::IkpirClientError;
 
+#[cfg(feature = "hint-patch-bench")]
+pub use bench_comparator::HintPatchClient;
+
 pub use ikpir_common::{
-    BackendWireSize, ClientUpdateMode, DeltaWireLayout, DeltaWireStats, FrodoConfig,
-    FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError, IncrementalPirBackend,
-    IndexPirBackend, ParallelSetupBackend, PirQueryBundle, PirResponseBundle,
-    PrecomputingPirBackend, ResponseRewind, SegmentRowDeltas, ServerSetupBundle, SimpleConfig,
-    SimplePirBackend, WireError,
+    BackendWireSize, DeltaWireLayout, DeltaWireStats, FrodoConfig, FrodoPirBackend,
+    HintDeltaBundle, HintPatchMode, IkpirError, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, PirQueryBundle, PirResponseBundle, PrecomputingPirBackend,
+    ResponseRewind, SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend, WireError,
 };

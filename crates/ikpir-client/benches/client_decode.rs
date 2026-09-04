@@ -32,9 +32,9 @@ mod helpers;
 use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
-    BackendWireSize, ClientUpdateMode, FrodoConfig, FrodoPirBackend, IkpirClient,
-    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend,
-    SimpleConfig, SimplePirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, ResponseRewind, SimpleConfig,
+    SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -90,6 +90,7 @@ fn run_one<S, B>(
     B: IndexPirBackend
         + ParallelSetupBackend
         + IncrementalPirBackend
+        + ResponseRewind
         + PrecomputingPirBackend
         + BackendWireSize
         + Clone,
@@ -199,7 +200,6 @@ fn run_one<S, B>(
         .collect();
 
     let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(server.setup());
-    client.set_update_mode(ClientUpdateMode::HintPatch);
     // No upfront precompute — refill per criterion sample (see iter_custom below).
 
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -224,7 +224,7 @@ fn run_one<S, B>(
                     let q = client.build_query(&k);
                     let r = server.answer(&q).expect("answer ok");
                     let t = Instant::now();
-                    let _ = client.decode(&k, &r).expect("decode");
+                    let _ = client.decode(&k, &q, &r).expect("decode");
                     total += t.elapsed();
                 }
                 let ns_per_iter = total.as_nanos() as f64 / iters as f64;

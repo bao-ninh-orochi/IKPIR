@@ -1,6 +1,9 @@
-//! Response-rewind equivalence: the [`ClientUpdateMode::Rewind`] client decodes
-//! **bit-identically** to the hint-patch client and to a fresh setup, for both
-//! shipped backends and every arity.
+//! Response-rewind equivalence: the production `IkpirClient` (response-rewind,
+//! the client's sole update strategy) decodes **bit-identically** to the
+//! bench-only `HintPatchClient` comparator and to a fresh setup, for both
+//! shipped backends and every arity. Feature-gated behind `hint-patch-bench`
+//! (disabled by default) since it is the regression net the paper's §6.2
+//! comparison relies on, not a production-path test.
 //!
 //! # What is pinned
 //!
@@ -9,19 +12,20 @@
 //! Then three clients, all bootstrapped from the same epoch-0 bundle unless
 //! noted, are brought to the server's head and queried for every key:
 //!
-//! - **R (rewind, the default mode)** — `accumulate_delta` each delta, then
-//!   `decode_rewind`. Its hint is never patched (`pin_epoch()` stays 0), yet it
+//! - **R (rewind, the production client)** — `accumulate_delta` each delta,
+//!   then `decode`. Its hint is never patched (`pin_epoch()` stays 0), yet it
 //!   decodes the current database.
-//! - **P (hint-patch)** — `apply_delta` each delta, then `decode`.
-//! - **F (fresh)** — bootstrapped from the server's *post-M* `setup()` bundle.
+//! - **P (hint-patch, the bench comparator)** — `HintPatchClient::apply_delta`
+//!   each delta, then `HintPatchClient::decode`.
+//! - **F (fresh)** — a `HintPatchClient` bootstrapped from the server's
+//!   *post-M* `setup()` bundle.
 //!
 //! Every present key must decode to its model value under all three; every
 //! absent key to `None`. Then R garbage-collects and must still agree — proving
-//! the fold-into-hint path (`collect_garbage`) matches. Finally the mode-gate
-//! and epoch guards are exercised as negative controls.
+//! the fold-into-hint path (`collect_garbage`) matches.
 
 use ikpir_client::{
-    ClientUpdateMode, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient, IkpirClientError,
+    FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchClient, IkpirClient,
     IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend, ResponseRewind, SimpleConfig,
     SimplePirBackend,
 };
@@ -195,7 +199,7 @@ where
     deltas
 }
 
-/// Rewind-mode lookup: `build_query` → `answer` → `decode_rewind(key, &q, &r)`.
+/// Rewind-mode lookup: `build_query` → `answer` → `decode(key, &q, &r)`.
 fn lookup_rewind<S, B>(
     client: &mut IkpirClient<B>,
     server: &IkpirServer<S, B>,
@@ -210,12 +214,13 @@ where
     let kb = key.to_le_bytes();
     let q = client.build_query(&kb);
     let r = server.answer(&q).expect("answer");
-    client.decode_rewind(&kb, &q, &r).expect("decode_rewind")
+    client.decode(&kb, &q, &r).expect("decode")
 }
 
-/// Hint-patch (or fresh) lookup: `build_query` → `answer` → `decode(key, &r)`.
+/// Hint-patch (bench comparator) lookup: `build_query` → `answer` →
+/// `decode(key, &r)`.
 fn lookup_patch<S, B>(
-    client: &mut IkpirClient<B>,
+    client: &mut HintPatchClient<B>,
     server: &IkpirServer<S, B>,
     key: u32,
 ) -> Option<Vec<u8>>
@@ -261,13 +266,8 @@ where
     let head = server.epoch();
     let absent = absent_keys(&snap.model, &model);
 
-    // R — rewind (default mode). Never patched; pin stays at 0.
+    // R — rewind (the production client). Never patched; pin stays at 0.
     let mut r = IkpirClient::<B>::from_setup(bundle0.clone());
-    assert_eq!(
-        r.update_mode(),
-        ClientUpdateMode::Rewind,
-        "rewind is the default"
-    );
     for d in &deltas {
         r.accumulate_delta(d.clone()).expect("accumulate_delta");
     }
@@ -275,18 +275,15 @@ where
     assert_eq!(r.pin_epoch(), 0, "R hint never re-pinned");
     assert!(r.pending_cells() > 0, "R accumulated a nonempty ΔD");
 
-    // P — hint-patch.
-    let mut p = IkpirClient::<B>::from_setup(bundle0.clone());
-    p.set_update_mode(ClientUpdateMode::HintPatch);
+    // P — hint-patch (bench comparator).
+    let mut p = HintPatchClient::<B>::from_setup(bundle0.clone());
     for d in &deltas {
         p.apply_delta(d.clone()).expect("apply_delta");
     }
     assert_eq!(p.epoch(), head);
-    assert_eq!(p.pin_epoch(), head, "P pin tracks the head");
 
     // F — fresh from the post-M bundle (hint-patch, no deltas to apply).
-    let mut f = IkpirClient::<B>::from_setup(server.setup());
-    f.set_update_mode(ClientUpdateMode::HintPatch);
+    let mut f = HintPatchClient::<B>::from_setup(server.setup());
     assert_eq!(f.epoch(), head);
 
     // Every key agrees across R, P, F and equals the model.
@@ -328,90 +325,6 @@ where
     assert_eq!(r.pending_cells(), 0);
 }
 
-/// Mode gates and epoch guards — the negative controls.
-fn mode_and_epoch_guards<S, B>(config: B::Config)
-where
-    S: Scheme,
-    B: IncrementalPirBackend + ResponseRewind + Clone,
-    B::Query: Clone,
-    B::Response: Clone,
-{
-    let snap = populate::<S>();
-    let n = snap.num_items as u32;
-    let mut server: IkpirServer<S, B> = IkpirServer::new(snap.restore(), config);
-    let bundle0 = server.setup();
-
-    // Rewind client at epoch 0; grab a valid response *before* any mutation
-    // (a stale query would be rejected by `answer` on epoch grounds).
-    let mut r = IkpirClient::<B>::from_setup(bundle0.clone());
-    let kb = 0u32.to_le_bytes();
-    let q = r.build_query(&kb);
-    let resp = server.answer(&q).unwrap();
-    // decode is wrong-mode — the mode gate fires before the epoch check.
-    assert!(
-        matches!(
-            r.decode(&kb, &resp),
-            Err(IkpirClientError::WrongUpdateMode {
-                expected: ClientUpdateMode::HintPatch,
-                ..
-            })
-        ),
-        "decode in rewind mode must be WrongUpdateMode"
-    );
-
-    // Mutate to collect deltas.
-    let mut model = snap.model.clone();
-    let deltas = apply(&mut server, &sequence_mixed(n), &mut model);
-    let d0 = deltas[0].clone();
-
-    // apply_delta is wrong-mode on the rewind client (gate before epoch check).
-    assert!(
-        matches!(
-            r.apply_delta(d0.clone()),
-            Err(IkpirClientError::WrongUpdateMode {
-                expected: ClientUpdateMode::HintPatch,
-                ..
-            })
-        ),
-        "apply_delta in rewind mode must be WrongUpdateMode"
-    );
-
-    // Hint-patch client: accumulate_delta and collect_garbage are wrong-mode.
-    let mut p = IkpirClient::<B>::from_setup(bundle0);
-    p.set_update_mode(ClientUpdateMode::HintPatch);
-    assert!(
-        matches!(
-            p.accumulate_delta(d0.clone()),
-            Err(IkpirClientError::WrongUpdateMode {
-                expected: ClientUpdateMode::Rewind,
-                ..
-            })
-        ),
-        "accumulate_delta in hint-patch mode must be WrongUpdateMode"
-    );
-    assert!(
-        matches!(
-            p.collect_garbage(),
-            Err(IkpirClientError::WrongUpdateMode {
-                expected: ClientUpdateMode::Rewind,
-                ..
-            })
-        ),
-        "collect_garbage in hint-patch mode must be WrongUpdateMode"
-    );
-
-    // Strict-monotone accumulate: a future-epoch delta gaps.
-    let mut r2 = IkpirClient::<B>::from_setup(server.setup());
-    // r2 is fresh at head; feeding an old delta is stale.
-    assert!(
-        matches!(
-            r2.accumulate_delta(d0),
-            Err(IkpirClientError::StaleDelta { .. })
-        ),
-        "a delta at/behind the head is StaleDelta"
-    );
-}
-
 /// Explicit control for the step-3-before-scan ordering. Key 0 is updated after
 /// the pin; the `ΔD` add (step 3) is what turns the stale pinned value into the
 /// current one, and it must precede the fingerprint scan. Without it — or if it
@@ -446,9 +359,7 @@ where
     let q = r.build_query(&kb);
     let resp = server.answer(&q).expect("answer");
     assert_eq!(
-        r.decode_rewind(&kb, &q, &resp)
-            .expect("decode_rewind")
-            .as_deref(),
+        r.decode(&kb, &q, &resp).expect("decode").as_deref(),
         Some(new.as_slice()),
         "rewind must recover the post-pin-updated value (step-3 before the scan)"
     );
@@ -528,9 +439,6 @@ instantiate! {
     rewind_matches_simple_2ary: rewind_matches_patch_and_fresh<Segmented2aryScheme, SimplePirBackend>(simple_config());
     rewind_matches_simple_3ary: rewind_matches_patch_and_fresh<Segmented3aryScheme, SimplePirBackend>(simple_config());
     rewind_matches_simple_4ary: rewind_matches_patch_and_fresh<Segmented4aryScheme, SimplePirBackend>(simple_config());
-
-    guards_frodo_2ary: mode_and_epoch_guards<Segmented2aryScheme, FrodoPirBackend>(frodo_config());
-    guards_simple_2ary: mode_and_epoch_guards<Segmented2aryScheme, SimplePirBackend>(simple_config());
 
     step3_ordering_frodo_2ary: step3_ordering_control<Segmented2aryScheme, FrodoPirBackend>(frodo_config());
     step3_ordering_simple_2ary: step3_ordering_control<Segmented2aryScheme, SimplePirBackend>(simple_config());

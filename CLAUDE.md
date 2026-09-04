@@ -86,10 +86,13 @@ per-segment architecture, protocol invariants, and backend-author checklist.
 
 Holds `CuckooParams` and per-segment `ClientState`; translates keyword
 lookups into PIR query/response bundles and stays consistent with server
-mutations in one of two selectable `ClientUpdateMode`s — entry-level
-hint-patching, or (default) **response-rewind**, which pins the bootstrap hint
-and accumulates the published `ΔD` for a factor-`n` cheaper client maintenance
-(`docs/rewind-client-mode.md`). See
+mutations via **response-rewind** — the client's sole update strategy — which
+pins the bootstrap hint and accumulates the published `ΔD` for a factor-`n`
+cheaper client maintenance than patching the hint directly
+(`docs/rewind-client-mode.md`). Client-side hint-patching survives only as a
+benchmark comparator (`HintPatchClient`, gated behind the `hint-patch-bench`
+Cargo feature, disabled by default) so `client_mutation` can measure the two
+head-to-head for the paper's §6.2 evaluation. See
 [`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) for the epoch
 state machine, failure-mode table, and entry-point map.
 
@@ -102,7 +105,11 @@ Ten focused `clap`-parsed PIR benches — four server (`server_setup`,
 Each invocation = one config = one CSV row (`client_mutation` emits one row per
 `(update mode, patch mode, kind)`; the `headtohead_*` benches fix `--num-keys`
 and add `num_keys`/`db_size` columns for the fixed-N comparison vs ChalametPIR /
-Hao 2025).
+Hao 2025). `client_mutation`'s `--update-mode patch` sweep needs the
+`hint-patch-bench` Cargo feature (`cargo bench --features hint-patch-bench`;
+`scripts/bench.sh` passes it automatically) — it is the only bench that does,
+since it is the one comparing the production rewind client against the
+bench-only hint-patch comparator.
 
 `segmented-cuckoo` adds eight filter/KV-store benches: five `cuckoo_filter_*`
 (`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,

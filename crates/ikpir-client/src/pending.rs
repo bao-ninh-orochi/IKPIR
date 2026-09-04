@@ -1,5 +1,5 @@
-//! [`PendingDelta`] — the client's rolling public `ΔD`, accumulated while in
-//! [`ClientUpdateMode::Rewind`](ikpir_common::ClientUpdateMode::Rewind).
+//! [`PendingDelta`] — the client's rolling public `ΔD`, accumulated since its
+//! pinned hint `H₀` (the response-rewind update strategy).
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -11,9 +11,8 @@ use ikpir_common::SegmentRowDeltas;
 ///
 /// # Purpose
 ///
-/// A [`ClientUpdateMode::Rewind`](ikpir_common::ClientUpdateMode::Rewind) client
-/// never patches its hint; it pins `H₀` at its bootstrap epoch and rolls this
-/// sparse per-cell sum forward. Three consumers read it: the response-rewind
+/// The client never patches its hint; it pins `H₀` at its bootstrap epoch and
+/// rolls this sparse per-cell sum forward. Three consumers read it: the response-rewind
 /// correction (a whole segment's map — [`Self::segment`]), the post-decode row
 /// fix-up (one row — [`Self::row`]), and garbage collection, which materialises
 /// each segment back into [`SegmentRowDeltas`] ([`Self::as_row_deltas`]) to fold

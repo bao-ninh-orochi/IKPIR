@@ -147,7 +147,7 @@ Bounds are checked before any index is used. The decoder drops literal zero
 deltas, so the result is the sparse in-memory form.
 
 The result carries the `CuckooParams` it was decoded under, and
-`IkpirClient::apply_delta` rejects a bundle whose params differ from the
+`IkpirClient::accumulate_delta` rejects a bundle whose params differ from the
 client's.
 
 ## 8. Encoding preconditions

@@ -239,42 +239,6 @@ pub enum HintPatchMode {
     EntryLevel,
 }
 
-/// Strategy the IKPIR client uses to stay consistent with server mutations.
-///
-/// Both strategies consume the same `HintDeltaBundle` stream and return the
-/// **same** decoded value for every query — only *when* and *where* the
-/// published `ΔD` is spent differs, so the mode is a purely local client choice
-/// the server never sees, exactly like [`HintPatchMode`]. Where `HintPatchMode`
-/// selects the arithmetic schedule of a *single* hint patch, this selects the
-/// whole maintenance-and-decode realization one level up.
-///
-/// With `n` the LWE dimension, `τ` the per-batch mutation count and `ω` the
-/// (possibly reshaped) database row width:
-///
-/// - [`HintPatch`](Self::HintPatch) — the client folds each delta into its own
-///   hint immediately (`apply_delta`): `H ← H + Σ A[:,col]·δ`, cost `Θ(n·τ·ω)`
-///   per batch. Decode is a direct `client_decode` against the patched hint.
-/// - [`Rewind`](Self::Rewind) — the client pins its bootstrap hint `H₀` and
-///   *accumulates* the published `ΔD` (`accumulate_delta`), cost `Θ(τ·ω)` per
-///   batch — a factor-`n` cheaper client maintenance — paying a per-query
-///   correction that grows with the staleness `|ΔD|`: it rewinds a
-///   head-answered response back to `H₀`'s epoch (`decode_rewind`), decodes
-///   against the stale `H₀`, and adds `ΔD[row]` to the recovered row before the
-///   fingerprint scan. The correction is reclaimed by folding `ΔD` into the
-///   hint on demand (`collect_garbage`).
-///
-/// The default is [`Rewind`](Self::Rewind).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ClientUpdateMode {
-    /// Fold each delta into the hint immediately — `Θ(n·τ·ω)` per batch, no
-    /// per-query correction.
-    HintPatch,
-    /// Pin the bootstrap hint and accumulate `ΔD` — `Θ(τ·ω)` per batch, plus a
-    /// staleness-growing per-query correction reclaimable by garbage collection.
-    #[default]
-    Rewind,
-}
-
 /// Extension of [`IndexPirBackend`] for backends that support sparse
 /// hint updates without a full recompute.
 ///
@@ -510,13 +474,28 @@ pub trait PrecomputingPirBackend: IndexPirBackend {
 ///
 /// # Purpose
 ///
-/// A [`ClientUpdateMode::Rewind`] client never patches its hint; it pins
-/// `H₀ = Aᵀ·D₀` and rolls a running `ΔD = D_head − D₀`. For a response
-/// `a = qᵀ·D_head` — with `q` the query vector *including* its row marker, the
-/// exact vector the server multiplied — [`rewind_response`](Self::rewind_response)
-/// computes `a ← a − qᵀ·ΔD = qᵀ·D₀` in place, exactly in `Z_2³²`. The client
-/// then decodes `a` against `H₀` (recovering `D₀[row]`) and adds `ΔD[row]` to
-/// reach the current `D_head[row]`.
+/// Response-rewind is the IKPIR client's **sole production update
+/// strategy** (`IkpirClient::{accumulate_delta, decode, collect_garbage}` in
+/// `ikpir-client`). The client never patches its hint; it pins
+/// `H₀ = Aᵀ·D₀` and rolls a running `ΔD = D_head − D₀`, cost `Θ(τ·ω)` per
+/// batch of `τ` mutations over row width `ω` — independent of the LWE
+/// dimension `n`. For a response `a = qᵀ·D_head` — with `q` the query vector
+/// *including* its row marker, the exact vector the server multiplied —
+/// [`rewind_response`](Self::rewind_response) computes
+/// `a ← a − qᵀ·ΔD = qᵀ·D₀` in place, exactly in `Z_2³²`. The client then
+/// decodes `a` against `H₀` (recovering `D₀[row]`) and adds `ΔD[row]` to
+/// reach the current `D_head[row]`. The price is a per-query correction that
+/// grows with the staleness `|ΔD|`, reclaimable by folding `ΔD` into the
+/// hint on demand (`collect_garbage`).
+///
+/// The classical alternative — folding each delta into the hint immediately
+/// (`H ← H + Σ A[:,col]·δ`, `Θ(n·τ·ω)` per batch, a factor-`n` more
+/// expensive client maintenance) — survives only as a benchmark comparator
+/// behind the `hint-patch-bench` Cargo feature
+/// (`ikpir_client::HintPatchClient`), so `client_mutation` and the paper's
+/// §6.2 evaluation can still measure the two head-to-head; see
+/// `crates/ikpir-client/src/bench_comparator/`. It is not part of the
+/// production client.
 ///
 /// # Why per-backend
 ///

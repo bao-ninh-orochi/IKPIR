@@ -20,13 +20,12 @@
 
 use ikpir_common::backend::parallel::PAR_MIN_HINT_MACS;
 use ikpir_server::{
-    FrodoConfig, FrodoPirBackend, IkpirServer, IncrementalPirBackend, IndexPirBackend,
-    ParallelSetupBackend, SimpleConfig, SimplePirBackend,
+    FrodoConfig, FrodoPirBackend, IkpirServer, IncrementalPirBackend, ParallelSetupBackend,
+    SimpleConfig, SimplePirBackend,
 };
 use segmented_cuckoo::{Segmented2aryCuckooKVStore, Segmented2aryScheme};
 
-use ikpir_client::ClientUpdateMode;
-use ikpir_client::IkpirClient;
+use ikpir_client::{IkpirClient, ResponseRewind};
 
 /// Buckets in the fixture store. Sized so that **both** backends clear
 /// [`PAR_MIN_HINT_MACS`] and genuinely fan the hint precompute out —
@@ -86,13 +85,13 @@ fn assert_lookup<B>(
     key: &[u8],
     expected: &[u8],
 ) where
-    B: IndexPirBackend,
+    B: IncrementalPirBackend + ResponseRewind,
     B::Query: Clone,
     B::Response: Clone,
 {
     let q = client.build_query(key);
     let r = server.answer(&q).expect("answer");
-    let got = client.decode(key, &r).expect("decode");
+    let got = client.decode(key, &q, &r).expect("decode");
     assert_eq!(
         got.as_deref(),
         Some(expected),
@@ -108,7 +107,7 @@ fn paths_interoperate<B>(config: B::Config)
 where
     // `B: Clone` is what makes the wire bundles cloneable, so the same
     // delta / setup snapshot can be handed to both clients.
-    B: ParallelSetupBackend + IncrementalPirBackend + Clone,
+    B: ParallelSetupBackend + IncrementalPirBackend + ResponseRewind + Clone,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -119,9 +118,7 @@ where
     server.insert(b"beta", b"B").unwrap();
 
     let mut reference_client = IkpirClient::<B>::from_setup(server.setup());
-    reference_client.set_update_mode(ClientUpdateMode::HintPatch);
     let mut parallel_client = IkpirClient::<B>::from_setup_parallel(server.setup());
-    parallel_client.set_update_mode(ClientUpdateMode::HintPatch);
     assert_lookup(&server, &mut reference_client, b"alpha", b"A");
     assert_lookup(&server, &mut parallel_client, b"alpha", b"A");
 
@@ -132,8 +129,8 @@ where
         server.delete(b"beta").unwrap(),
     ];
     for delta in deltas {
-        reference_client.apply_delta(delta.clone()).unwrap();
-        parallel_client.apply_delta(delta).unwrap();
+        reference_client.accumulate_delta(delta.clone()).unwrap();
+        parallel_client.accumulate_delta(delta).unwrap();
     }
     assert_lookup(&server, &mut reference_client, b"alpha", b"X");
     assert_lookup(&server, &mut parallel_client, b"gamma", b"C");
@@ -150,7 +147,6 @@ where
         IkpirServer::new(store(), config);
     reference_server.insert(b"delta", b"D").unwrap();
     let mut client = IkpirClient::<B>::from_setup_parallel(reference_server.setup());
-    client.set_update_mode(ClientUpdateMode::HintPatch);
     assert_lookup(&reference_server, &mut client, b"delta", b"D");
 }
 
