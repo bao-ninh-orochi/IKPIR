@@ -42,7 +42,7 @@
 //!
 //! The classical alternative — patching the hint on every delta — survives
 //! only as a benchmark comparator behind the `hint-patch-bench` Cargo
-//! feature ([`HintPatchClient`], disabled by default); see
+//! feature (`HintPatchClient`, disabled by default); see
 //! `bench_comparator` and `docs/rewind-client-mode.md`.
 //!
 //! # Quick start

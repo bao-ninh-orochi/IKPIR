@@ -2,7 +2,10 @@
 
 Client-side crate for [Incremental Keyword PIR](../../README.md). Holds
 per-segment `ClientState` and translates `(key, value)` lookups into
-wire-level Index-PIR query/response exchanges with `ikpir-server`.
+wire-level Index-PIR query/response exchanges with `ikpir-server`. The
+client's sole update strategy is **response-rewind**: it pins its bootstrap
+hint and accumulates the server's published deltas instead of patching the
+hint directly.
 
 ## Quick start
 
@@ -22,16 +25,17 @@ let bundle = server.setup();
 // Initialise client from the setup bundle.
 let mut client: IkpirClient<FrodoPirBackend> = IkpirClient::from_setup(bundle);
 
-// Round-trip a key.
+// Round-trip a key. `decode` threads the query back so the response can be
+// rewound to the client's pinned hint before decoding.
 let q = client.build_query(b"alice");
 let r = server.answer(&q).unwrap();
-let v = client.decode(b"alice", &r).unwrap().expect("key present");
+let v = client.decode(b"alice", &q, &r).unwrap().expect("key present");
 assert_eq!(v, &[0x01u8]);
 ```
 
 ## Benches
 
-Five focused `clap`-parsed CSV-emitting benches under `benches/`. The
+Six focused `clap`-parsed CSV-emitting benches under `benches/`. The
 recommended way to run one is the workspace runner
 [`../../scripts/bench.sh`](../../scripts/bench.sh), which auto-derives the largest
 correct `--plaintext-bits` and the backend `--lwe-dim`, and routes output to
@@ -44,10 +48,14 @@ correct `--plaintext-bits` and the backend `--lwe-dim`, and routes output to
 ```
 
 Each invocation is one config = one appended CSV row (`client_mutation` emits
-one row per `(patch mode, kind)` pair). `client_query` / `client_decode` run in
-**warm-bc** mode (precompute before the timed loop); `client_mutation` runs in
-**empty-queue** mode so `apply_delta` reports the hint-patch cost in isolation.
-The root [README](../../README.md#benches) has the paper config matrix.
+one row per `(update mode, patch mode, kind)` combination). `client_query` /
+`client_decode` run in **warm-bc** mode (precompute before the timed loop);
+`client_mutation` runs in **empty-queue** mode so its production leg times
+`accumulate_delta` (response-rewind's `ΔD` roll-forward) in isolation. Its
+`--update-mode patch` leg instead times the bench-only `HintPatchClient`
+comparator's `apply_delta`, and needs the `hint-patch-bench` Cargo feature
+(`scripts/bench.sh` passes it automatically). The root
+[README](../../README.md#benches) has the paper config matrix.
 
 ### Bench overview
 
@@ -55,7 +63,8 @@ The root [README](../../README.md#benches) has the paper config matrix.
 |---|---|---|---|
 | `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
 | `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
-| `client_mutation` | `--load-factor` (0.90) | `apply_delta` throughput per (patch mode, kind), wall-clock, empty-queue | `ikpir_client_mutation.csv` |
+| `client_mutation` | `--load-factor` (0.90) | per-batch maintenance throughput per (kind, `--update-mode` patch\|rewind [, `--patch-mode` entry\|row]); `patch` needs `hint-patch-bench` | `ikpir_client_mutation.csv` |
+| `client_rewind_staleness` | `--load-factor` (0.90) | `decode` per-query latency vs staleness \|ΔD\|, then post-`collect_garbage` | `ikpir_client_rewind_staleness.csv` |
 | `headtohead_query` | fixed `--num-keys` | `build_query` rate at a fixed keyword count; +`num_keys`/`db_size` cols | `ikpir_headtohead_client_query.csv` |
 | `headtohead_decode` | fixed `--num-keys` | `decode` rate at a fixed keyword count; +`num_keys`/`db_size` cols | `ikpir_headtohead_client_decode.csv` |
 
@@ -74,9 +83,11 @@ The root [README](../../README.md#benches) has the paper config matrix.
 | `--lwe-dim <N>` | 1566 (frodo) / 1275 (simple) | LWE dimension |
 
 Bench-specific: `client_query` / `client_decode` / `headtohead_*` take `--batch`
-(key-pool size); `client_mutation` takes `--patch-mode entry\|row` (comma list,
-default `entry`), `--n-mutations`, `--load-factor`; `headtohead_query` /
-`headtohead_decode` require `--num-keys`.
+(key-pool size); `client_mutation` takes `--update-mode patch\|rewind` (comma
+list, default `patch,rewind`), `--patch-mode entry\|row` (comma list, default
+`entry`, applies only to `patch`), `--n-mutations`, `--load-factor`;
+`client_rewind_staleness` takes `--batch-size`, `--staleness-steps`,
+`--queries`; `headtohead_query` / `headtohead_decode` require `--num-keys`.
 
 ### Low-level: `cargo bench`
 
@@ -86,7 +97,7 @@ default `entry`), `--n-mutations`, `--load-factor`; `headtohead_query` /
 
 ```bash
 cargo bench -p ikpir-client --bench client_decode -- --backend simple --plaintext-bits 10
-cargo bench -p ikpir-client --bench client_mutation -- --patch-mode entry,row --n-mutations 64
+cargo bench -p ikpir-client --bench client_mutation --features hint-patch-bench -- --patch-mode entry,row --n-mutations 64
 cargo bench -p ikpir-client --bench <name> -- --help
 ```
 
@@ -99,8 +110,11 @@ from_setup(bundle)                  — initialise from server's setup bundle
         build_query(key)            — one B::Query per segment
         [send queries to server]
         server.answer(&q)           — server returns PirResponseBundle
-        decode(key, &resp)          — fp match → Option<Vec<u8>>
-        apply_delta(delta)          — fold incremental hint update (epoch+1)
+        decode(key, &q, &resp)      — rewind the response, fp match → Option<Vec<u8>>
+        accumulate_delta(delta)     — roll the published ΔD forward (epoch+1)
+  │
+  └── (optional) collect_garbage()  — fold ΔD into the hint, reclaim the
+        per-query correction cost
   │
   └── on FutureDelta / after server full_rebuild:
         reset_from(new_bundle)      — replace all internal state
@@ -119,8 +133,13 @@ let client = IkpirClient::<FrodoPirBackend>::from_setup_parallel(bundle);
 ```
 
 Worker count comes from `IKPIR_SETUP_THREADS`, else the machine's available
-parallelism. All five benches use the parallel path — none of them reports
+parallelism. All six benches use the parallel path — none of them reports
 client-bootstrap cost.
+
+The classical alternative to response-rewind — patching the hint on every
+delta — survives only as a benchmark comparator (`HintPatchClient`, behind
+the `hint-patch-bench` Cargo feature, disabled by default); see
+[`../../docs/rewind-client-mode.md`](../../docs/rewind-client-mode.md).
 
 ## Status and wire-format stability
 

@@ -1024,6 +1024,12 @@ fn run_t5<S, B>(
                 Ok(b2) => {
                     if b2 != *real {
                         let _ = client.accumulate_delta(b2);
+                        // Fold immediately so the fuzzed row/offset data also
+                        // reaches `client_patch_state` (still production code,
+                        // exercised via `collect_garbage`) — not just the
+                        // `PendingDelta` BTreeMap `accumulate_delta` alone
+                        // touches.
+                        let _ = client.collect_garbage();
                     }
                 }
             }

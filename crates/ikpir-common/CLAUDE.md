@@ -136,7 +136,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 - **`HintDeltaBundle::new` is `#[doc(hidden)] pub`** — the constructor
   must be reachable from `ikpir-server` (sibling crate) but is hidden
   from the public API. It takes `(epoch, per_segment_row_deltas, params)`
-  and skips the invariant checks that `IkpirClient::apply_delta` then
+  and skips the invariant checks that `IkpirClient::accumulate_delta` then
   trusts (epoch monotonicity, `delta.params == self.params`,
   `per_segment_row_deltas.len() == arity`); only
   `IkpirServer::commit_mutations` is permitted to call it, passing its
