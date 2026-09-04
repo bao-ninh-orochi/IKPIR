@@ -56,9 +56,9 @@
 use std::collections::HashMap;
 
 use ikpir_client::{
-    ClientUpdateMode, DeltaWireLayout, FrodoConfig, FrodoPirBackend, HintDeltaBundle,
-    HintPatchMode, IkpirClient, IkpirClientError, IncrementalPirBackend, IndexPirBackend,
-    ParallelSetupBackend, SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend,
+    DeltaWireLayout, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirClient,
+    IkpirClientError, IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, ResponseRewind,
+    SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
@@ -335,7 +335,7 @@ fn run_t1<S, B>(
     config: B::Config,
 ) where
     S: MakeStore,
-    B: IncrementalPirBackend + ParallelSetupBackend + Clone,
+    B: IncrementalPirBackend + ParallelSetupBackend + ResponseRewind + Clone,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -350,9 +350,7 @@ fn run_t1<S, B>(
     let setup = server.setup();
     let params = setup.params;
     let mut c1: IkpirClient<B> = IkpirClient::from_setup(setup.clone());
-    c1.set_update_mode(ClientUpdateMode::HintPatch);
     let mut c2: IkpirClient<B> = IkpirClient::from_setup(setup);
-    c2.set_update_mode(ClientUpdateMode::HintPatch);
 
     let ops = build_trace(seed_count, N_OPS);
     let first_new_key = ops
@@ -396,10 +394,11 @@ fn run_t1<S, B>(
             "{label} step {i}: wire_stats().nonzero_cells != |(offset, delta)| in b"
         );
 
-        c1.apply_delta(delta)
-            .unwrap_or_else(|e| panic!("{label} step {i}: c1.apply_delta(real) failed: {e}"));
-        c2.apply_delta(decoded)
-            .unwrap_or_else(|e| panic!("{label} step {i}: c2.apply_delta(decoded) failed: {e}"));
+        c1.accumulate_delta(delta)
+            .unwrap_or_else(|e| panic!("{label} step {i}: c1.accumulate_delta(real) failed: {e}"));
+        c2.accumulate_delta(decoded).unwrap_or_else(|e| {
+            panic!("{label} step {i}: c2.accumulate_delta(decoded) failed: {e}")
+        });
 
         for &k in &probes {
             let key = k.to_le_bytes();
@@ -409,7 +408,7 @@ fn run_t1<S, B>(
                 panic!("{label} step {i} key {k}: server.answer(c1's query) failed: {e}")
             });
             let v1 = c1
-                .decode(&key, &r1)
+                .decode(&key, &q1, &r1)
                 .unwrap_or_else(|e| panic!("{label} step {i} key {k}: c1.decode failed: {e}"));
 
             let q2 = c2.build_query(&key);
@@ -417,7 +416,7 @@ fn run_t1<S, B>(
                 panic!("{label} step {i} key {k}: server.answer(c2's query) failed: {e}")
             });
             let v2 = c2
-                .decode(&key, &r2)
+                .decode(&key, &q2, &r2)
                 .unwrap_or_else(|e| panic!("{label} step {i} key {k}: c2.decode failed: {e}"));
 
             assert_eq!(
@@ -798,11 +797,11 @@ fn p_equals_256_cells_use_nine_bit_deltas() {
 /// panic — `Ok` under the foreign geometry or a `WireError` are both
 /// acceptable branches, since the input crosses a trust boundary
 /// (`docs/hint-delta-wire-format.md` §7). Separately,
-/// `IkpirClient::apply_delta` must reject a bundle carrying the client's
-/// own real deltas but a different `params` with `MalformedBundle` —
-/// catching a version where `apply_delta` forgot the `delta.params !=
-/// self.params` check (or checked it after already mutating state,
-/// rather than before).
+/// `IkpirClient::accumulate_delta` must reject a bundle carrying the
+/// client's own real deltas but a different `params` with
+/// `MalformedBundle` — catching a version where `accumulate_delta`
+/// forgot the `delta.params != self.params` check (or checked it after
+/// already mutating state, rather than before).
 #[allow(clippy::too_many_arguments)]
 fn run_t4<S, B>(
     shape_label: &str,
@@ -843,21 +842,20 @@ fn run_t4<S, B>(
     let bytes = delta.encode();
     let _ = HintDeltaBundle::<B>::decode(&bytes, foreign);
 
-    // (b) apply_delta rejects the client's own deltas under foreign params.
+    // (b) accumulate_delta rejects the client's own deltas under foreign params.
     let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
-    client.set_update_mode(ClientUpdateMode::HintPatch);
     let forged: HintDeltaBundle<B> = HintDeltaBundle::new(
         client.epoch() + 1,
         delta.per_segment_row_deltas.clone(),
         foreign,
     );
-    let err = match client.apply_delta(forged) {
-        Ok(()) => panic!("{label}: apply_delta accepted a bundle with foreign params"),
+    let err = match client.accumulate_delta(forged) {
+        Ok(()) => panic!("{label}: accumulate_delta accepted a bundle with foreign params"),
         Err(e) => e,
     };
     assert!(
         matches!(err, IkpirClientError::MalformedBundle),
-        "{label}: apply_delta with foreign params must return MalformedBundle, got {err:?}"
+        "{label}: accumulate_delta with foreign params must return MalformedBundle, got {err:?}"
     );
 }
 
@@ -945,12 +943,12 @@ fn client_rejects_bundle_with_foreign_params() {
 /// never used to index out of bounds or to build an inconsistent `Vec`
 /// length. And whenever a corrupted stream happens to decode to a
 /// well-formed but *different* bundle (`Ok(b2)` with `b2 != b`), applying
-/// `b2` to a client must not panic either — a wrong resulting hint is the
-/// caller's epoch/params problem (rejected by `apply_delta`'s own checks,
-/// or simply a hint that no longer matches the server), not the
-/// decoder's, but `client_patch_state` must still process whatever
-/// legal-per-`decode` row/offset data it was handed without an internal
-/// bounds violation.
+/// `b2` to a client must not panic either — a wrong resulting `ΔD` is the
+/// caller's epoch/params problem (rejected by `accumulate_delta`'s own
+/// checks, or simply a client that no longer tracks the server), not the
+/// decoder's, but `accumulate_delta` must still fold whatever
+/// legal-per-`decode` row/offset data it was handed into `ΔD` without an
+/// internal bounds violation.
 #[allow(clippy::too_many_arguments)]
 fn run_t5<S, B>(
     shape_label: &str,
@@ -1019,14 +1017,19 @@ fn run_t5<S, B>(
         // this test dominate the file's runtime for no additional
         // coverage.
         let mut client: IkpirClient<B> = IkpirClient::from_setup(pre_setup.clone());
-        client.set_update_mode(ClientUpdateMode::HintPatch);
 
         for cbytes in variants {
             match HintDeltaBundle::<B>::decode(&cbytes, params) {
                 Err(_) => {} // rejected -- fine, this is the expected common case
                 Ok(b2) => {
                     if b2 != *real {
-                        let _ = client.apply_delta(b2);
+                        let _ = client.accumulate_delta(b2);
+                        // Fold immediately so the fuzzed row/offset data also
+                        // reaches `client_patch_state` (still production code,
+                        // exercised via `collect_garbage`) — not just the
+                        // `PendingDelta` BTreeMap `accumulate_delta` alone
+                        // touches.
+                        let _ = client.collect_garbage();
                     }
                 }
             }

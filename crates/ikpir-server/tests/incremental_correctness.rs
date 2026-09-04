@@ -10,17 +10,16 @@
 //!    successful mutation emits a `HintDeltaBundle` containing only its
 //!    own deltas, not the leaked rolled-back ones.
 //! 2. **`sparse_delta_correct`** — the bundle of deltas a single
-//!    mutation emits must, when applied via `client.apply_delta`,
-//!    advance the client's hint to match a freshly-rebuilt client.
+//!    mutation emits must, when accumulated via `client.accumulate_delta`,
+//!    advance the client's tracked epoch to match a freshly-rebuilt client.
 //! 3. **`many_mutations_with_warm_queue`** — a long stream of
 //!    mutations against a client that has Phase-B/Phase-C warm queues
 //!    keeps every prepared slot's decode material consistent with the
-//!    patched hint.
+//!    accumulated `ΔD`.
 //!
 //! Each test is parameterised by arity (2 / 3 / 4) so the diagnostic on
 //! failure pins which arity broke.
 
-use ikpir_client::ClientUpdateMode;
 use ikpir_client::IkpirClient;
 use ikpir_server::{
     FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirError, IkpirServer,
@@ -285,39 +284,38 @@ where
         server.insert(&k.to_le_bytes(), &[k as u8 ^ 0x33]).unwrap();
     }
     let mut client: IkpirClient<FrodoPirBackend> = IkpirClient::from_setup(server.setup());
-    client.set_update_mode(ClientUpdateMode::HintPatch);
     client.precompute_queries(60); // > number of probes below to keep cheap path active
     client.precompute_decodes();
 
-    // Apply 30 mutations, never re-warming.
+    // Accumulate 30 mutations, never re-warming, never garbage-collecting.
     for k in 20u32..50 {
         let delta: HintDeltaBundle<FrodoPirBackend> =
             server.insert(&k.to_le_bytes(), &[k as u8 ^ 0x33]).unwrap();
-        client.apply_delta(delta).unwrap();
+        client.accumulate_delta(delta).unwrap();
     }
     for k in 0u32..10 {
         let delta = server.update(&k.to_le_bytes(), &[k as u8 ^ 0x77]).unwrap();
-        client.apply_delta(delta).unwrap();
+        client.accumulate_delta(delta).unwrap();
     }
     for k in 30u32..40 {
         let delta = server.delete(&k.to_le_bytes()).unwrap();
-        client.apply_delta(delta).unwrap();
+        client.accumulate_delta(delta).unwrap();
     }
 
-    // After 50 patches, the warm queue is still consistent with the patched
-    // hint. Probe a mix of present/absent keys against an oracle.
+    // After 50 accumulated deltas, the warm queue is still consistent with
+    // the correction. Probe a mix of present/absent keys against a
+    // freshly-rebuilt oracle at the same (unchanging) server epoch.
     let mut oracle: IkpirClient<FrodoPirBackend> = IkpirClient::from_setup(server.setup());
-    oracle.set_update_mode(ClientUpdateMode::HintPatch);
     let probes: &[u32] = &[0, 5, 12, 19, 25, 30, 35, 40, 45, 999];
     for &k in probes {
         let key = k.to_le_bytes();
         let q_w = client.build_query(&key);
         let r_w = server.answer(&q_w).unwrap();
-        let v_w = client.decode(&key, &r_w).unwrap();
+        let v_w = client.decode(&key, &q_w, &r_w).unwrap();
 
         let q_o = oracle.build_query(&key);
         let r_o = server.answer(&q_o).unwrap();
-        let v_o = oracle.decode(&key, &r_o).unwrap();
+        let v_o = oracle.decode(&key, &q_o, &r_o).unwrap();
         assert_eq!(v_w, v_o, "warm queue diverged from oracle on key {k}");
     }
 }
@@ -339,13 +337,14 @@ fn many_mutations_with_warm_queue_4ary() {
     many_mutations_with_warm_queue_inner(build_empty_4());
 }
 
-/// Cross-mode lock-step: a server realizing its hint patches with one
-/// [`HintPatchMode`] stays consistent with a client realizing them with
-/// the other — including a mid-stream swap of both sides. Either
+/// Server-side hint-patch realization can switch mid-stream (row-level vs
+/// entry-level) without the client — which never selects a realization of
+/// its own; it only accumulates the published `ΔD` — ever diverging. Either
 /// realization leaves the hint equal to `A·D` for the post-mutation
-/// database, so the mode is a purely local choice and every
-/// insert / update / delete class must decode correctly afterwards.
-fn cross_mode_lock_step_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
+/// database, so the mode is a purely server-local choice and every
+/// insert / update / delete class must decode correctly afterwards
+/// regardless of which realization produced its delta.
+fn server_patch_mode_switch_inner<S>(mut server: IkpirServer<S, FrodoPirBackend>)
 where
     S: IndexScheme + SchemeMeta + 'static,
 {
@@ -359,31 +358,24 @@ where
         server.insert(&k.to_le_bytes(), &[k as u8]).unwrap();
     }
 
-    // Server realizes patches row-level; client entry-level (its default).
+    // Server realizes patches row-level from here on.
     server.set_hint_patch_mode(HintPatchMode::RowLevel);
     let mut client: IkpirClient<FrodoPirBackend> = IkpirClient::from_setup(server.setup());
-    client.set_update_mode(ClientUpdateMode::HintPatch);
-    assert_eq!(
-        client.hint_patch_mode(),
-        HintPatchMode::EntryLevel,
-        "client default mode must be entry-level"
-    );
 
     for k in 20u32..25 {
         let d = server.insert(&k.to_le_bytes(), &[k as u8]).unwrap();
-        client.apply_delta(d).unwrap();
+        client.accumulate_delta(d).unwrap();
     }
 
-    // Swap both sides mid-stream: server entry-level, client row-level.
+    // Swap back mid-stream.
     server.set_hint_patch_mode(HintPatchMode::EntryLevel);
-    client.set_hint_patch_mode(HintPatchMode::RowLevel);
     for k in 0u32..10 {
         let d = server.update(&k.to_le_bytes(), &[k as u8 ^ 0x5A]).unwrap();
-        client.apply_delta(d).unwrap();
+        client.accumulate_delta(d).unwrap();
     }
     for k in 15u32..20 {
         let d = server.delete(&k.to_le_bytes()).unwrap();
-        client.apply_delta(d).unwrap();
+        client.accumulate_delta(d).unwrap();
     }
 
     // Behavioural check across every mutation class the stream produced.
@@ -400,24 +392,28 @@ where
         let key = k.to_le_bytes();
         let q = client.build_query(&key);
         let r = server.answer(&q).unwrap();
-        let v = client.decode(&key, &r).unwrap();
-        assert_eq!(v, expect(k), "cross-mode decode mismatch on key {k}");
+        let v = client.decode(&key, &q, &r).unwrap();
+        assert_eq!(
+            v,
+            expect(k),
+            "server-patch-mode-switch decode mismatch on key {k}"
+        );
     }
 }
 
-/// Server and client in opposite patch modes (with a mid-stream swap)
-/// stay in lock-step on a 2-ary server.
+/// A server that switches `HintPatchMode` mid-stream stays consistent with
+/// a rewind client on a 2-ary server.
 #[test]
-fn cross_mode_lock_step() {
-    cross_mode_lock_step_inner(build_empty_2());
+fn server_patch_mode_switch() {
+    server_patch_mode_switch_inner(build_empty_2());
 }
 /// Same as 2-ary, on the 3-ary server.
 #[test]
-fn cross_mode_lock_step_3ary() {
-    cross_mode_lock_step_inner(build_empty_3());
+fn server_patch_mode_switch_3ary() {
+    server_patch_mode_switch_inner(build_empty_3());
 }
 /// Same as 2-ary, on the 4-ary server.
 #[test]
-fn cross_mode_lock_step_4ary() {
-    cross_mode_lock_step_inner(build_empty_4());
+fn server_patch_mode_switch_4ary() {
+    server_patch_mode_switch_inner(build_empty_4());
 }

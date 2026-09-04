@@ -568,7 +568,7 @@ fn row_runs(cells: &[(u16, i64)], max_gap: u32) -> impl Iterator<Item = (u16, u1
 /// Lets the IKPIR server propagate the effect of one
 /// `insert` / `update` / `delete` to every client without re-sending the
 /// full hint. The client folds the delta with
-/// `IkpirClient::apply_delta`, which is strict-monotone (only
+/// `IkpirClient::accumulate_delta`, which is strict-monotone (only
 /// `delta.epoch == client.epoch + 1` is accepted).
 ///
 /// # Design / architecture

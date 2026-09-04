@@ -27,7 +27,7 @@
 
 use std::fmt;
 
-use ikpir_common::{ClientUpdateMode, IkpirError};
+use ikpir_common::IkpirError;
 
 /// Errors returned by [`IkpirClient`](crate::IkpirClient) methods.
 ///
@@ -42,8 +42,10 @@ use ikpir_common::{ClientUpdateMode, IkpirError};
 /// flow use a single `?` operator everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IkpirClientError {
-    /// Returned by [`IkpirClient::apply_delta`](crate::IkpirClient::apply_delta)
-    /// when `delta.epoch ≤ self.epoch` — the delta has already been applied
+    /// Returned by
+    /// [`IkpirClient::accumulate_delta`](crate::IkpirClient::accumulate_delta)
+    /// (and the bench-only `HintPatchClient::apply_delta`) when
+    /// `delta.epoch ≤ self.epoch` — the delta has already been applied
     /// or arrived out of order.
     StaleDelta {
         /// Epoch the client expected (`self.epoch + 1`).
@@ -51,8 +53,10 @@ pub enum IkpirClientError {
         /// Epoch the delta carried.
         got: u64,
     },
-    /// Returned by [`IkpirClient::apply_delta`](crate::IkpirClient::apply_delta)
-    /// when `delta.epoch > self.epoch + 1` — the client missed at least one
+    /// Returned by
+    /// [`IkpirClient::accumulate_delta`](crate::IkpirClient::accumulate_delta)
+    /// (and the bench-only `HintPatchClient::apply_delta`) when
+    /// `delta.epoch > self.epoch + 1` — the client missed at least one
     /// update. Caller must call
     /// [`IkpirClient::reset_from`](crate::IkpirClient::reset_from) with a
     /// fresh setup bundle.
@@ -70,31 +74,20 @@ pub enum IkpirClientError {
         /// Epoch the response carried.
         response: u64,
     },
-    /// Returned by [`IkpirClient::apply_delta`](crate::IkpirClient::apply_delta)
-    /// when `delta.params` does not equal the client's cached `params`, or
+    /// Returned by
+    /// [`IkpirClient::accumulate_delta`](crate::IkpirClient::accumulate_delta)
+    /// (and the bench-only `HintPatchClient::apply_delta`) when
+    /// `delta.params` does not equal the client's cached `params`, or
     /// `delta.per_segment_row_deltas.len()` does not match `params.arity()`.
     /// Also returned by `decode` when a bundle's segment count or row width
     /// does not match the cached `params.arity()` /
     /// `bucket_size × cells_per_slot`.
     MalformedBundle,
-    /// A method was called in the wrong
-    /// [`ClientUpdateMode`](ikpir_common::ClientUpdateMode): `apply_delta` /
-    /// `decode` require [`HintPatch`](ikpir_common::ClientUpdateMode::HintPatch);
-    /// `accumulate_delta` / `collect_garbage` require
-    /// [`Rewind`](ikpir_common::ClientUpdateMode::Rewind). Switch the entry point
-    /// (or the mode) to match — the call is a caller-side logic error, never a
-    /// wrong answer.
-    WrongUpdateMode {
-        /// The mode the called method requires.
-        expected: ClientUpdateMode,
-        /// The mode the client is currently in.
-        actual: ClientUpdateMode,
-    },
-    /// Returned by
-    /// [`decode_rewind`](crate::IkpirClient::decode_rewind) when a decoded cell,
-    /// after adding its accumulated `ΔD`, falls outside `[0, 2^plaintext_bits)`.
-    /// Honest operation never triggers this (the running `ΔD` telescopes to
-    /// `current − pinned`, both in range); it is a loud integrity check on a
+    /// Returned by [`decode`](crate::IkpirClient::decode) when a decoded
+    /// cell, after adding its accumulated `ΔD`, falls outside
+    /// `[0, 2^plaintext_bits)`. Honest operation never triggers this (the
+    /// running `ΔD` telescopes to `current − pinned`, both in range); it is
+    /// a loud integrity check on a
     /// corrupt or inconsistent delta/response, never a returned wrong value.
     CellOutOfRange {
         /// Segment whose decoded row went out of range.
@@ -138,12 +131,6 @@ impl fmt::Display for IkpirClientError {
                 write!(
                     f,
                     "malformed bundle: params, segment count, or row width does not match client parameters"
-                )
-            }
-            Self::WrongUpdateMode { expected, actual } => {
-                write!(
-                    f,
-                    "wrong update mode: this method requires {expected:?}, but the client is in {actual:?}"
                 )
             }
             Self::CellOutOfRange {

@@ -38,8 +38,8 @@
 use std::collections::BTreeMap;
 
 use ikpir_client::{
-    ClientUpdateMode, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient,
-    IncrementalPirBackend, IndexPirBackend, SimpleConfig, SimplePirBackend,
+    FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient, IncrementalPirBackend,
+    IndexPirBackend, ResponseRewind, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
 use segmented_cuckoo::{
@@ -279,14 +279,14 @@ fn lookup<S, B>(
 ) -> Option<Vec<u8>>
 where
     S: Scheme,
-    B: IndexPirBackend,
+    B: IncrementalPirBackend + ResponseRewind,
     B::Query: Clone,
     B::Response: Clone,
 {
     let kb = key.to_le_bytes();
     let q = client.build_query(&kb);
     let r = server.answer(&q).expect("answer");
-    client.decode(&kb, &r).expect("decode")
+    client.decode(&kb, &q, &r).expect("decode")
 }
 
 /// Keys the sequence removed, plus the never-inserted probes.
@@ -310,7 +310,7 @@ fn assert_client_tracks_model<S, B>(
     what: &str,
 ) where
     S: Scheme,
-    B: IndexPirBackend,
+    B: IncrementalPirBackend + ResponseRewind,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -331,7 +331,7 @@ fn assert_client_tracks_model<S, B>(
 fn replay_matches_fresh_setup<S, B>(config: B::Config)
 where
     S: Scheme,
-    B: IncrementalPirBackend,
+    B: IncrementalPirBackend + ResponseRewind,
     B::Hint: PartialEq,
     B::Query: Clone,
     B::Response: Clone,
@@ -380,16 +380,14 @@ where
     // epoch-0 bundle fed the deltas of B's current (second) replay.
     let absent = absent_keys(&snap.model, &model_a);
     let mut c_a = IkpirClient::<B>::from_setup(bundle_a0);
-    c_a.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas_a {
-        c_a.apply_delta(d).expect("apply_delta A");
+        c_a.accumulate_delta(d).expect("accumulate_delta A");
     }
     assert_client_tracks_model(&mut c_a, &a, &model_a, &absent, "client A");
 
     let mut c_b = IkpirClient::<B>::from_setup(bundle_b0);
-    c_b.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas_b2 {
-        c_b.apply_delta(d).expect("apply_delta B");
+        c_b.accumulate_delta(d).expect("accumulate_delta B");
     }
     assert_client_tracks_model(&mut c_b, &b, &model_b2, &absent, "client B");
 
@@ -397,7 +395,6 @@ where
     // bootstraps from the rewound server's *post-replay* bundle is right
     // too, because the replayed hints track the replayed cells.
     let mut c_b_fresh = IkpirClient::<B>::from_setup(b.setup());
-    c_b_fresh.set_update_mode(ClientUpdateMode::HintPatch);
     assert_client_tracks_model(
         &mut c_b_fresh,
         &b,
@@ -411,7 +408,7 @@ where
 fn replay_inserts_agree<S, B>(config: B::Config)
 where
     S: Scheme,
-    B: IncrementalPirBackend,
+    B: IncrementalPirBackend + ResponseRewind,
     B::Query: Clone,
     B::Response: Clone,
 {
@@ -441,16 +438,14 @@ where
 
     let absent = NEVER_PRESENT.to_vec();
     let mut c_a = IkpirClient::<B>::from_setup(bundle_a0);
-    c_a.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas_a {
-        c_a.apply_delta(d).expect("apply_delta A");
+        c_a.accumulate_delta(d).expect("accumulate_delta A");
     }
     assert_client_tracks_model(&mut c_a, &a, &model_a, &absent, "client A");
 
     let mut c_b = IkpirClient::<B>::from_setup(bundle_b0);
-    c_b.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas_b {
-        c_b.apply_delta(d).expect("apply_delta B");
+        c_b.accumulate_delta(d).expect("accumulate_delta B");
     }
     assert_client_tracks_model(&mut c_b, &b, &model_b, &absent, "client B");
 }
@@ -459,7 +454,7 @@ where
 fn replay_with_stale_hints_is_detected<S, B>(config: B::Config)
 where
     S: Scheme,
-    B: IncrementalPirBackend,
+    B: IncrementalPirBackend + ResponseRewind,
     B::Hint: PartialEq,
     B::Query: Clone,
     B::Response: Clone,
@@ -504,7 +499,6 @@ where
     // fingerprint cells still match, and the value cells decode as noise —
     // so the stale key comes back wrong (or not at all).
     let mut poisoned = IkpirClient::<B>::from_setup(s.setup());
-    poisoned.set_update_mode(ClientUpdateMode::HintPatch);
     assert_ne!(
         lookup(&mut poisoned, &s, STALE_KEY).as_deref(),
         Some(stale_old.as_slice()),
@@ -518,9 +512,8 @@ where
     // invisible to the delta-fed clients the benches time and visible only
     // through `setup()` — the bundle `setup_bundle_bytes` measures.
     let mut synced = IkpirClient::<B>::from_setup(bundle0);
-    synced.set_update_mode(ClientUpdateMode::HintPatch);
     for d in deltas {
-        synced.apply_delta(d).expect("apply_delta");
+        synced.accumulate_delta(d).expect("accumulate_delta");
     }
     assert_eq!(
         lookup(&mut synced, &s, STALE_KEY).as_deref(),

@@ -16,7 +16,6 @@
 //! functions, then exercised by three thin `#[test]` wrappers (one per
 //! arity) so the diagnostic on failure pins which arity broke.
 
-use ikpir_client::ClientUpdateMode;
 use ikpir_client::IkpirClient;
 use ikpir_server::{FrodoConfig, FrodoPirBackend, IkpirError, IkpirServer, ServerSetupBundle};
 use segmented_cuckoo::{
@@ -65,14 +64,13 @@ where
     assert_eq!(bundle.hints.len(), bundle.params.arity());
 
     let mut client = IkpirClient::<FrodoPirBackend>::from_setup(bundle);
-    client.set_update_mode(ClientUpdateMode::HintPatch);
 
     for k in 0u32..16 {
         let key = k.to_le_bytes();
         let q = client.build_query(&key);
         let resp = server.answer(&q).expect("answer must succeed");
         let got = client
-            .decode(&key, &resp)
+            .decode(&key, &q, &resp)
             .expect("no error")
             .expect("key present");
         assert_eq!(got, vec![k as u8 ^ 0xA5], "value mismatch for key {k}");

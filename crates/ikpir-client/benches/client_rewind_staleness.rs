@@ -1,30 +1,30 @@
 //! **Intent:** Measure the response-rewind client's **per-query correction
 //! cost as a function of staleness** `|ΔD|` — the price paid for the factor-`n`
 //! cheaper maintenance the `client_mutation` bench reports. A rewind client that
-//! never garbage-collects accumulates a growing `ΔD`; `decode_rewind` subtracts
+//! never garbage-collects accumulates a growing `ΔD`; `decode` subtracts
 //! `qᵀ·ΔD` per query (`Θ(|ΔD|)` on top of the constant `client_decode`), so its
 //! per-query latency rises with the number of unpatched mutations, until a
 //! `collect_garbage` folds `ΔD` into the hint and returns it to baseline.
 //!
 //! **Method:** Populate to `--load-factor`, build **one** rewind client from the
-//! epoch-0 setup bundle, and measure a baseline `decode_rewind` latency at
+//! epoch-0 setup bundle, and measure a baseline `decode` latency at
 //! `|ΔD| = 0`. Then, for `--staleness-steps` steps, apply a batch of
 //! `--batch-size` updates to the server, `accumulate_delta` every delta into the
 //! client (its hint is never patched — `pin_epoch` stays 0), and re-measure the
-//! per-query `decode_rewind` latency at the grown `|ΔD|`. Finally
+//! per-query `decode` latency at the grown `|ΔD|`. Finally
 //! `collect_garbage` and re-measure — the correction is reclaimed. Each
-//! measurement times **only** `decode_rewind` (`build_query` + `answer` happen
+//! measurement times **only** `decode` (`build_query` + `answer` happen
 //! outside the timed bracket), over `--queries` present keys round-robin, and
 //! asserts the value is found so a mistimed no-op cannot masquerade as fast.
 //!
-//! **Single-threaded, non-SIMD** timed path (`decode_rewind` → `client_decode`),
+//! **Single-threaded, non-SIMD** timed path (`decode` → `client_decode`),
 //! the paper's regime.
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple),
 //! `--num-buckets`, `--bucket-size`, `--value-bits`, `--fingerprint-bits`,
 //! `--plaintext-bits`, `--lwe-dim`, `--load-factor` (default 0.90),
 //! `--batch-size` (updates accumulated per step, default 512), `--staleness-steps`
-//! (default 8), `--queries` (decode_rewind calls per measurement, default 200).
+//! (default 8), `--queries` (decode calls per measurement, default 200).
 //!
 //! **Output:** `results/ikpir_client_rewind_staleness.csv`
 //! Columns: backend, arity, num_buckets, bucket_size, value_bits, plaintext_bits,
@@ -35,9 +35,8 @@ mod helpers;
 
 use helpers::{Backend, CloneStore};
 use ikpir_client::{
-    BackendWireSize, ClientUpdateMode, FrodoConfig, FrodoPirBackend, IkpirClient,
-    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, ResponseRewind, SimpleConfig,
-    SimplePirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
+    IndexPirBackend, ParallelSetupBackend, ResponseRewind, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -49,9 +48,7 @@ const HEADER: &str = "backend,arity,num_buckets,bucket_size,value_bits,plaintext
     db_rows,db_cols";
 
 #[derive(Clone, clap::Parser)]
-#[command(
-    about = "Measure rewind decode_rewind per-query latency vs staleness |ΔD| (single client)."
-)]
+#[command(about = "Measure rewind decode per-query latency vs staleness |ΔD| (single client).")]
 struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
     arity: u32,
@@ -77,7 +74,7 @@ struct Cli {
     /// Number of staleness steps (each adds `--batch-size` to |ΔD|).
     #[arg(long, default_value_t = 8)]
     staleness_steps: u32,
-    /// `decode_rewind` calls timed per measurement.
+    /// `decode` calls timed per measurement.
     #[arg(long, default_value_t = 200)]
     queries: u32,
 }
@@ -93,7 +90,7 @@ fn fill_value(value: &mut [u8], key: u32, salt: u32) {
     }
 }
 
-/// Time only `decode_rewind` over `m` present keys round-robin; assert every
+/// Time only `decode` over `m` present keys round-robin; assert every
 /// query is found. Returns mean microseconds per query.
 fn measure_decode<S, B>(
     client: &mut IkpirClient<B>,
@@ -114,7 +111,7 @@ where
         let q = client.build_query(&kb);
         let r = server.answer(&q).expect("answer");
         let t = Instant::now();
-        let v = client.decode_rewind(&kb, &q, &r).expect("decode_rewind");
+        let v = client.decode(&kb, &q, &r).expect("decode");
         total += t.elapsed();
         assert!(v.is_some(), "staleness bench queried a present key {key}");
     }
@@ -163,8 +160,6 @@ fn run_one<S, B>(
     let segment_rows = params.segment_size();
 
     let mut client = IkpirClient::<B>::from_setup_parallel(bundle);
-    // Explicit (rewind is already the default), for the reader.
-    client.set_update_mode(ClientUpdateMode::Rewind);
 
     // A pool of present keys to query round-robin (also the update targets).
     let pool: Vec<u32> = (0..(n_seed as u32).min(4096)).collect();

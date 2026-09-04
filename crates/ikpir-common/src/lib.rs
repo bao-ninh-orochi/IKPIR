@@ -19,9 +19,9 @@ pub mod pir_params;
 pub mod wire;
 
 pub use backend::{
-    BackendWireSize, ClientUpdateMode, FrodoConfig, FrodoPirBackend, HintPatchMode,
-    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend,
-    ResponseRewind, SimpleConfig, SimplePirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, HintPatchMode, IncrementalPirBackend,
+    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, ResponseRewind, SimpleConfig,
+    SimplePirBackend,
 };
 pub use error::IkpirError;
 pub use wire::{

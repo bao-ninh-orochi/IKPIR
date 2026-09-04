@@ -21,6 +21,16 @@
 //!   deltas, applies them in-place via
 //!   [`IncrementalPirBackend::server_patch_hint`], and bumps the
 //!   strict-monotone `epoch`.
+//! - **The server's live hint is the sole hint-maintenance path.** The
+//!   client never patches its own hint — response-rewind
+//!   (`ikpir-client`'s only update strategy) pins a bootstrap hint and
+//!   corrects each response instead, `docs/rewind-client-mode.md`. The
+//!   server's continuously-patched `hints` are what [`Self::setup`] and
+//!   [`Self::full_rebuild`] hand to a client bootstrapping or
+//!   resyncing, so it starts from an up-to-date hint without replaying
+//!   any mutation history. `answer` never reads `self.hints` — only
+//!   `self.store.as_cells()` and `self.backend_params` — so this
+//!   maintenance is invisible to the read path.
 //! - **`backend_config` is persistent.** Captured at construction time
 //!   and re-used by every `full_rebuild`, so hint dimensions stay stable
 //!   across the server's lifetime.
@@ -138,7 +148,7 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
     /// parameter-identity fingerprint (e.g. a hash of
     /// `(scheme_kind, num_buckets, bucket_size, fingerprint_bits,
     /// value_bits, plaintext_bits)`) and assert match on
-    /// `IkpirClient::apply_delta` / `IkpirClient::reset_from`.
+    /// `IkpirClient::accumulate_delta` / `IkpirClient::reset_from`.
     ///
     /// # Rationale
     ///
@@ -342,7 +352,7 @@ impl<S: IndexScheme + SchemeMeta, B: IndexPirBackend> IkpirServer<S, B> {
     /// Escape hatch when the incremental hint patches have become more
     /// expensive than a fresh setup, or when the server wants to flip
     /// every connected client into a forced resync (each client's next
-    /// `apply_delta` will hit `FutureDelta`).
+    /// `accumulate_delta` will hit `FutureDelta`).
     ///
     /// # Rationale
     ///
@@ -557,7 +567,7 @@ where
     /// [`IkpirServer`] from that map with a larger `num_buckets`. The
     /// resulting fresh setup bundle must be delivered to clients via
     /// [`IkpirClient::reset_from`](https://docs.rs/ikpir-client/latest/ikpir_client/struct.IkpirClient.html#method.reset_from);
-    /// `apply_delta` cannot bridge a `num_buckets` change.
+    /// `accumulate_delta` cannot bridge a `num_buckets` change.
     ///
     /// # Complexity
     ///

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use criterion::{Criterion, Throughput};
-use ikpir_client::{IkpirClient, IndexPirBackend};
+use ikpir_client::{IkpirClient, IncrementalPirBackend, ResponseRewind};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{IndexScheme, SchemeMeta};
 
@@ -178,17 +178,19 @@ pub fn patch_modes_label(modes: &[PatchMode]) -> String {
 
 /// Client update-strategy selector for the mutation bench.
 ///
-/// `patch` → hint-patch (`apply_delta`, `Θ(n·τ·ω)` per batch — the client
-/// patches its whole hint). `rewind` → response-rewind (`accumulate_delta`,
-/// `Θ(τ·ω)` — the client accumulates the published `ΔD`, a factor-`n` cheaper
-/// maintenance). The mutation bench sweeps both for the head-to-head
-/// client-maintenance column; both decode the same value.
+/// `patch` → hint-patch (the bench-only `HintPatchClient::apply_delta`,
+/// `Θ(n·τ·ω)` per batch — the client patches its whole hint; gated behind
+/// the `hint-patch-bench` feature). `rewind` → response-rewind (the
+/// production `IkpirClient::accumulate_delta`, `Θ(τ·ω)` — the client
+/// accumulates the published `ΔD`, a factor-`n` cheaper maintenance). The
+/// mutation bench sweeps both for the head-to-head client-maintenance
+/// column; both decode the same value.
 #[allow(dead_code)]
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateMode {
-    /// Hint-patch: `apply_delta` patches the hint.
+    /// Hint-patch: `HintPatchClient::apply_delta` patches the hint.
     Patch,
-    /// Response-rewind: `accumulate_delta` rolls up `ΔD`.
+    /// Response-rewind: `IkpirClient::accumulate_delta` rolls up `ΔD`.
     Rewind,
 }
 
@@ -197,17 +199,6 @@ impl std::fmt::Display for UpdateMode {
         match self {
             Self::Patch => write!(f, "patch"),
             Self::Rewind => write!(f, "rewind"),
-        }
-    }
-}
-
-impl UpdateMode {
-    /// Library-level [`ikpir_common::ClientUpdateMode`] equivalent.
-    #[allow(dead_code)]
-    pub const fn to_client_update_mode(self) -> ikpir_common::ClientUpdateMode {
-        match self {
-            Self::Patch => ikpir_common::ClientUpdateMode::HintPatch,
-            Self::Rewind => ikpir_common::ClientUpdateMode::Rewind,
         }
     }
 }
@@ -498,21 +489,18 @@ pub fn verify_decode<B, S>(
     value_bits: u32,
 ) where
     S: IndexScheme + SchemeMeta,
-    B: IndexPirBackend,
+    B: IncrementalPirBackend + ResponseRewind,
     B::Query: Clone,
     B::Response: Clone,
 {
     assert!(n_keys > 0, "verify_decode: n_keys must be positive");
-    // Uses the hint-patch `decode`, so the caller must pass a HintPatch-mode
-    // client (both bench call sites do); a Rewind client fails loudly on the
-    // `decode` below (`WrongUpdateMode`) rather than being silently reconfigured.
     let mut vsize = 0usize;
     for test_key in first_key..first_key + n_keys {
         let key_bytes = test_key.to_le_bytes();
         let q = client.build_query(&key_bytes);
         let r = server.answer(&q).expect("verify_decode: server.answer");
         let decoded = client
-            .decode(&key_bytes, &r)
+            .decode(&key_bytes, &q, &r)
             .expect("verify_decode: client.decode");
         let expected = populate_value_for_key(test_key, value_bits);
         vsize = expected.len();

@@ -190,5 +190,12 @@ fi
 ARGS+=("${EXTRA[@]+"${EXTRA[@]}"}")
 
 log "$BENCH  (crate=$CRATE backend=$BACKEND arity=$ARITY nb=$NUM_BUCKETS bs=$BUCKET_SIZE vb=$VALUE_BITS fb=$FINGERPRINT_BITS pb=$PB lwe=$LWE)"
-cargo bench -p "$CRATE" --bench "$BENCH" -- "${ARGS[@]}"
+# client_mutation's --update-mode patch sweep needs the bench-only
+# HintPatchClient comparator, which is gated behind hint-patch-bench (a
+# production build never links it in) — no other bench needs this feature.
+if [[ "$BENCH" == client_mutation ]]; then
+    cargo bench -p "$CRATE" --bench "$BENCH" --features hint-patch-bench -- "${ARGS[@]}"
+else
+    cargo bench -p "$CRATE" --bench "$BENCH" -- "${ARGS[@]}"
+fi
 ok "CSV(s) under $REL_DIR/"

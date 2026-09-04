@@ -2,11 +2,14 @@
 //! mutations per kind (insert / update / delete), in **empty-queue mode** (no
 //! precomputed slots), across both backends, both update strategies
 //! (`--update-mode patch,rewind`), and — for `patch` — both hint-patch
-//! realizations (entry-level and row-level). `patch` times `apply_delta`
-//! (recompute the hint, `Θ(n·τ·ω)`); `rewind` times `accumulate_delta`
-//! (roll up the published `ΔD`, `Θ(τ·ω)` — the paper's factor-`n` cheaper
-//! client maintenance, `docs/rewind-client-mode.md`). The measurement isolates
-//! that per-batch maintenance cost from any warm-bc queue-maintenance work.
+//! realizations (entry-level and row-level). `patch` times the bench-only
+//! `HintPatchClient::apply_delta` (gated behind the `hint-patch-bench`
+//! feature; recompute the hint, `Θ(n·τ·ω)`) — the classical baseline
+//! response-rewind replaced in production; `rewind` times the production
+//! `IkpirClient::accumulate_delta` (roll up the published `ΔD`, `Θ(τ·ω)` —
+//! the paper's factor-`n` cheaper client maintenance,
+//! `docs/rewind-client-mode.md`). The measurement isolates that per-batch
+//! maintenance cost from any warm-bc queue-maintenance work.
 //!
 //! **Method:** Populate to `--load-factor`, snapshot the cell array, and
 //! build **one** server per config with `IkpirServer::new_parallel`; its
@@ -16,13 +19,14 @@
 //! plus a clone of the epoch-0 hints — the seed-derived `A` is kept, so the
 //! post-reset state *is* the epoch-0 state) and collect N deltas (deltas
 //! are identical under either patch mode). Then per patch mode build a
-//! fresh client from the epoch-0 bundle with no precompute (empty
-//! prepared-query queue), set the client's `HintPatchMode`, and time the
-//! full sequence of N apply_delta calls with wall-clock Instant. The timed
-//! loop runs exactly once per (kind, mode) (state advances with each
-//! mutation, so criterion cycling is not meaningful). Previously every kind
-//! built its own server, four `Θ(d · ρ · n · ω)` setups per config; the
-//! timed region — `apply_delta` only — is unchanged.
+//! fresh `HintPatchClient` from the epoch-0 bundle with no precompute (empty
+//! prepared-query queue), set its `HintPatchMode`, and time the full
+//! sequence of N `apply_delta` calls with wall-clock Instant; per update
+//! mode build a fresh production `IkpirClient` and time
+//! `accumulate_delta` instead. The timed loop runs exactly once per (kind,
+//! mode) (state advances with each mutation, so criterion cycling is not
+//! meaningful). Previously every kind built its own server, four
+//! `Θ(d · ρ · n · ω)` setups per config; the timed region is unchanged.
 //! `tests/replay_equivalence.rs` pins that a replay yields the same deltas
 //! as a fresh setup.
 //!
@@ -56,7 +60,7 @@ mod helpers;
 
 use helpers::{Backend, CloneStore, PatchMode, UpdateMode};
 use ikpir_client::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchClient, IkpirClient,
     IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
@@ -358,64 +362,82 @@ fn run_one<S, B>(
 
         // The deltas are identical under either mode (the wire format does not
         // depend on the realization), so they are collected once per kind and
-        // replayed per (update_mode, patch_mode).
+        // replayed per (update_mode, patch_mode). `patch` sweeps the hint-patch
+        // realization via the bench-only `HintPatchClient`; `rewind` is
+        // patch-mode-independent, so it runs once (patch_mode column `-`)
+        // against the production `IkpirClient`.
         for &umode in &update_modes {
-            // `patch` sweeps the hint-patch realization; `rewind` is
-            // patch-mode-independent, so it runs once (patch_mode column `-`).
-            let sub: Vec<Option<PatchMode>> = match umode {
-                UpdateMode::Patch => patch_modes.iter().copied().map(Some).collect(),
-                UpdateMode::Rewind => vec![None],
-            };
-            for pmode in sub {
-                // Fresh client, empty prepared-query queue (no precompute): so
-                // `patch` times only the hint patch and `rewind` times only the
-                // ΔD accumulate — the "client maintenance per batch" cost in
-                // isolation. The `Θ(n·τ·ω)` patch vs the `Θ(τ·ω)` accumulate is
-                // the paper's factor-`n` client-maintenance gap.
-                let mut client = IkpirClient::<B>::from_setup_parallel(bundle.clone());
-                client.set_update_mode(umode.to_client_update_mode());
-                if let Some(pm) = pmode {
-                    client.set_hint_patch_mode(pm.to_hint_patch_mode());
-                }
+            match umode {
+                UpdateMode::Patch => {
+                    for &pmode in &patch_modes {
+                        // Fresh comparator client, no precompute: times only the
+                        // hint patch — the `Θ(n·τ·ω)` client-maintenance cost the
+                        // production rewind client replaced.
+                        let mut client = HintPatchClient::<B>::from_setup_parallel(bundle.clone());
+                        client.set_hint_patch_mode(pmode.to_hint_patch_mode());
 
-                // Clone outside the timed bracket, then wall-clock time the full
-                // N-delta maintenance sequence.
-                let replay = deltas.clone();
-                let t = Instant::now();
-                match umode {
-                    UpdateMode::Patch => {
+                        let replay = deltas.clone();
+                        let t = Instant::now();
                         for d in replay {
                             client.apply_delta(d).expect("apply_delta");
                         }
-                    }
-                    UpdateMode::Rewind => {
-                        for d in replay {
-                            client.accumulate_delta(d).expect("accumulate_delta");
-                        }
+                        let total_ms = t.elapsed().as_secs_f64() * 1e3;
+                        let ops_per_s = n_succeeded as f64 / total_ms * 1e3;
+                        // Always 0: HintPatchClient patches the hint directly, no ΔD.
+                        let pending_cells = 0usize;
+                        let pmode_str = pmode.to_string();
+
+                        writeln!(
+                            csv,
+                            "{},{},{umode},{pmode_str},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{pending_cells},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+                            cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
+                            cli.n_mutations, cli.load_factor, n_succeeded, total_ms, ops_per_s,
+                        ).unwrap();
+                        println!(
+                            "  backend={} kind={:<6} update={umode:<6} patch={pmode_str:<5} arity={arity} nb={num_buckets:<7} N={:<4} | \
+                             {:.2} ops/s (total={:.1}ms, |ΔD|={pending_cells})",
+                            cli.backend,
+                            kind.as_csv(),
+                            cli.n_mutations,
+                            ops_per_s,
+                            total_ms,
+                        );
                     }
                 }
-                let total_ms = t.elapsed().as_secs_f64() * 1e3;
-                let ops_per_s = n_succeeded as f64 / total_ms * 1e3;
-                // 0 in patch mode (empty ΔD); the accumulated nonzero-cell count
-                // (the Θ(τ·ω) set S) in rewind mode.
-                let pending_cells = client.pending_cells();
-                let pmode_str = pmode.map_or_else(|| "-".to_string(), |p| p.to_string());
+                UpdateMode::Rewind => {
+                    // Fresh client, empty prepared-query queue (no precompute):
+                    // times only the ΔD accumulate — the `Θ(τ·ω)` client
+                    // maintenance the paper reports, a factor-`n` cheaper than
+                    // the hint-patch comparator above.
+                    let mut client = IkpirClient::<B>::from_setup_parallel(bundle.clone());
 
-                writeln!(
-                    csv,
-                    "{},{},{umode},{pmode_str},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{pending_cells},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
-                    cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
-                    cli.n_mutations, cli.load_factor, n_succeeded, total_ms, ops_per_s,
-                ).unwrap();
-                println!(
-                    "  backend={} kind={:<6} update={umode:<6} patch={pmode_str:<5} arity={arity} nb={num_buckets:<7} N={:<4} | \
-                     {:.2} ops/s (total={:.1}ms, |ΔD|={pending_cells})",
-                    cli.backend,
-                    kind.as_csv(),
-                    cli.n_mutations,
-                    ops_per_s,
-                    total_ms,
-                );
+                    let replay = deltas.clone();
+                    let t = Instant::now();
+                    for d in replay {
+                        client.accumulate_delta(d).expect("accumulate_delta");
+                    }
+                    let total_ms = t.elapsed().as_secs_f64() * 1e3;
+                    let ops_per_s = n_succeeded as f64 / total_ms * 1e3;
+                    // The accumulated nonzero-cell count — the Θ(τ·ω) set S.
+                    let pending_cells = client.pending_cells();
+                    let pmode_str = "-".to_string();
+
+                    writeln!(
+                        csv,
+                        "{},{},{umode},{pmode_str},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{},{:.3},{:.2},{pending_cells},{cps},{row_width},{segment_rows},{db_rows},{db_cols}",
+                        cli.backend, kind.as_csv(), cli.bucket_size, cli.value_bits, cli.plaintext_bits,
+                        cli.n_mutations, cli.load_factor, n_succeeded, total_ms, ops_per_s,
+                    ).unwrap();
+                    println!(
+                        "  backend={} kind={:<6} update={umode:<6} patch={pmode_str:<5} arity={arity} nb={num_buckets:<7} N={:<4} | \
+                         {:.2} ops/s (total={:.1}ms, |ΔD|={pending_cells})",
+                        cli.backend,
+                        kind.as_csv(),
+                        cli.n_mutations,
+                        ops_per_s,
+                        total_ms,
+                    );
+                }
             }
         }
     }
