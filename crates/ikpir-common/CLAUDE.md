@@ -20,7 +20,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 | `src/lib.rs` | Top-level re-exports of `backend`, `wire`, and `error` |
 | `src/error.rs` | `IkpirError` enum (5 variants) — returned by server methods, wrapped by `IkpirClientError::Server` on the client side |
 | `src/wire.rs` | Wire-format bundles `ServerSetupBundle / PirQueryBundle / PirResponseBundle / HintDeltaBundle`, the `SegmentRowDeltas` type alias, per-bundle `wire_byte_size` helpers, and `HintDeltaBundle`'s specified bit-packed encoding (`DeltaWireLayout`, `DeltaWireStats`, `WireError`, `encode` / `decode` — `docs/hint-delta-wire-format.md`) |
-| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 7 methods), `IncrementalPirBackend` (+2 methods, both taking a `HintPatchMode`), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods), `ResponseRewind` (+1 method, the client's response-rewind correction — impl'd in `backend/{frodo,simple}/backend.rs`, the sole client update strategy — `docs/rewind-client-mode.md`); `HintPatchMode` enum (`RowLevel` / `EntryLevel`, default `EntryLevel` — a server-side realization choice, plus the client's `hint-patch-bench`-gated bench comparator) |
+| `src/backend/mod.rs` | Trait family: `IndexPirBackend` (6 associated types incl. `Config` + 7 methods), `IncrementalPirBackend` (+2 methods, both taking a `HintPatchMode`), `PrecomputingPirBackend` (+4 methods), `BackendWireSize` (+4 methods), `ResponseRewind` (+1 method, the client-rewind flow's correction — impl'd in `backend/{frodo,simple}/backend.rs` — `docs/rewind-client-mode.md`); `HintPatchMode` enum (`RowLevel` / `EntryLevel`, default `EntryLevel` — the realization of a hint patch, used by the server's live hint and by the client-hint-patch flow, `HintPatchClient`) |
 | `src/backend/frodo/mod.rs` | Re-exports the FrodoPIR backend's public surface |
 | `src/backend/frodo/params.rs` | `FrodoParams` (per-segment runtime values) + `FrodoConfig` (user-facing tunable knobs, default `lwe_dim = 1566`) |
 | `src/backend/frodo/backend.rs` | `FrodoPirBackend` impl of all four traits + `FrodoServerParams / FrodoHint / FrodoClientState / FrodoQuery / FrodoResponse` |
@@ -136,7 +136,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
 - **`HintDeltaBundle::new` is `#[doc(hidden)] pub`** — the constructor
   must be reachable from `ikpir-server` (sibling crate) but is hidden
   from the public API. It takes `(epoch, per_segment_row_deltas, params)`
-  and skips the invariant checks that `IkpirClient::accumulate_delta` then
+  and skips the invariant checks that `RewindClient::accumulate_delta` then
   trusts (epoch monotonicity, `delta.params == self.params`,
   `per_segment_row_deltas.len() == arity`); only
   `IkpirServer::commit_mutations` is permitted to call it, passing its
@@ -154,7 +154,7 @@ sites (`use ikpir_server::IndexPirBackend`, `use ikpir_client::FrodoConfig`,
   buckets were touched, not the slot contents or fingerprint value.
   On side channels: the LWE matvecs avoid data-dependent shortcuts on
   secret values (skips keyed only on the public matrix `A` are fine),
-  and `IkpirClient::decode` scans fingerprints with a branchless
+  and `RewindClient::decode` scans fingerprints with a branchless
   compare as best-effort hardening — but a full constant-time-audited
   decode path is out of scope for this prototype.
 
@@ -215,7 +215,7 @@ the bytes are the same, so server and client may pick independently.
 
 Both `FrodoPirBackend` and `SimplePirBackend` implement all five traits.
 They are drop-in alternatives at the `B: IndexPirBackend` type parameter
-on `IkpirServer<S, B>` / `IkpirClient<B>`. The per-bench `--backend
+on `IkpirServer<S, B>` / `RewindClient<B>` / `HintPatchClient<B>`. The per-bench `--backend
 frodo|simple` flag (default `frodo`) selects between them at runtime;
 the `B::Config` associated type (`FrodoConfig` vs `SimpleConfig`)
 carries the backend-specific tunables (`lwe_dim`, plus `sigma` for

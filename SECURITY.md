@@ -11,9 +11,10 @@ Known, deliberate limitations of the prototype's side-channel posture:
 
 - The LWE matrix-vector products avoid data-dependent shortcuts on secret
   values (skips keyed only on the public matrix `A` are fine), and
-  `IkpirClient::decode` scans fingerprints with a branchless compare as
-  best-effort hardening — but a fully constant-time-audited decode path is
-  explicitly out of scope for this prototype.
+  `RewindClient::decode` and `HintPatchClient::decode` scan fingerprints
+  with a branchless compare as best-effort hardening — but a fully
+  constant-time-audited decode path is explicitly out of scope for this
+  prototype.
 - The wire bundles are plain in-process data with no serialisation layer;
   any deployment must layer (and harden) its own encoding.
 

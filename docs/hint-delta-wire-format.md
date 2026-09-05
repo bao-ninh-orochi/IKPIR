@@ -2,7 +2,8 @@
 
 Normative specification of the byte encoding of a `HintDeltaBundle`, the
 mutation-phase transcript an `IkpirServer` publishes after each successful
-`insert` / `update` / `delete` and every `IkpirClient` folds into its hint.
+`insert` / `update` / `delete` and every client folds into its hint
+(client-hint-patch) or accumulates (client-rewind).
 `crates/ikpir-common/src/wire.rs` implements it (`encode`, `decode`,
 `wire_stats`, `wire_byte_size`); `crates/ikpir-client/tests/wire_transcript.rs`
 and the unit tests in `wire.rs` enforce it. Where prose and code disagree, this
@@ -147,7 +148,7 @@ Bounds are checked before any index is used. The decoder drops literal zero
 deltas, so the result is the sparse in-memory form.
 
 The result carries the `CuckooParams` it was decoded under, and
-`IkpirClient::accumulate_delta` rejects a bundle whose params differ from the
+`RewindClient::accumulate_delta` rejects a bundle whose params differ from the
 client's.
 
 ## 8. Encoding preconditions

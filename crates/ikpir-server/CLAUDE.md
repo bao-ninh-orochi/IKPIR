@@ -216,7 +216,7 @@ Four focused benches covering classical and incremental server criteria for the 
 > **`server_setup` is the only bench that runs the reference setup.** It is
 > the one that *reports* setup cost, so it must. Every other bench builds its
 > server with `IkpirServer::new_parallel` and its client with
-> `IkpirClient::from_setup_parallel` — untimed preamble, byte-identical state,
+> `RewindClient::from_setup_parallel` — untimed preamble, byte-identical state,
 > minutes to hours saved at paper scale. `server_setup --setup-impl parallel`
 > opts into the optimized path to quantify that saving; the CSV's `setup_mode`
 > column then reads `full_parallel` rather than `full`, so such a row can never

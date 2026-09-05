@@ -11,8 +11,12 @@ Keyword Private Information Retrieval from d-ary Segmented Cuckoo Filters"*
 index PIR (UIPIR)** and instantiates the construction over LWE as **RisePIR**,
 in two variants:
 
-- **RisePIR-F** — over FrodoPIR: `IkpirServer<S, FrodoPirBackend>` / `IkpirClient<FrodoPirBackend>`;
-- **RisePIR-S** — over SimplePIR: `IkpirServer<S, SimplePirBackend>` / `IkpirClient<SimplePirBackend>`.
+- **RisePIR-F** — over FrodoPIR: `IkpirServer<S, FrodoPirBackend>` paired with a client at the same
+  `B` — `RewindClient<FrodoPirBackend>` (client-rewind) or `HintPatchClient<FrodoPirBackend>`
+  (client-hint-patch); `IkpirClient<FrodoPirBackend>` remains as a source-compatible alias of
+  `RewindClient<FrodoPirBackend>`;
+- **RisePIR-S** — over SimplePIR: `IkpirServer<S, SimplePirBackend>` paired the same way with
+  `RewindClient<SimplePirBackend>` / `HintPatchClient<SimplePirBackend>`.
 
 The crates keep the generic names (`ikpir-*`): the code implements the generic
 IKPIR-from-UIPIR construction, and the RisePIR variants are what you get by
@@ -91,11 +95,11 @@ RisePIR-S.
 | Segmented Cuckoo Filter + KV store | Shipped (`segmented-cuckoo`) |
 | Backend trait family + wire bundles + shared error | Shipped (`ikpir-common`) |
 | Server protocol (setup / answer / insert / update / delete / full_rebuild) | Shipped (`ikpir-server`) |
-| Client protocol (from_setup / build_query / decode / accumulate_delta / collect_garbage / reset_from — response-rewind, the client's sole update strategy) | Shipped (`ikpir-client`) |
+| Client, client-hint-patch (`HintPatchClient`: from_setup / build_query / decode / apply_delta / reset_from, selectable `HintPatchMode`) | Shipped (`ikpir-client`) |
+| Client, client-rewind (`RewindClient`, alias `IkpirClient`: from_setup / build_query / decode / accumulate_delta / collect_garbage / reset_from) | Shipped (`ikpir-client`) |
 | FrodoPIR backend | Shipped (`ikpir-common`) — ternary errors, tall-skinny matrix, default `lwe_dim = 1566` |
 | SimplePIR backend | Shipped (`ikpir-common`) — discrete-Gaussian errors (σ = 6.4), √N×√N reshape, default `lwe_dim = 1275` |
 | Hint-patch realizations (`HintPatchMode`) | Shipped (`ikpir-common`) — entry-level (iSimplePIR, default) and row-level (SimplePIR baseline); server-side, identical state + wire bytes either way |
-| Client-side hint-patching (`HintPatchClient`) | Bench comparator only (`ikpir-client`, `hint-patch-bench` feature, disabled by default) — measures the classical baseline response-rewind replaced in production |
 
 ## Repository tour
 
@@ -138,10 +142,10 @@ The paper's notation maps onto the code as follows.
 |---|---|---|
 | `UIPIR.Setup` | preprocess one segment | `IndexPirBackend::server_setup` |
 | `UIPIR.Query / Answer / Recover` | online phase | `client_query` / `server_answer` / `client_decode` |
-| `UIPIR.DBMutation + HintUpdate` | mutation phase | server `insert/update/delete` → `IncrementalPirBackend::server_patch_hint`; client `IkpirClient::accumulate_delta` + `decode` (response-rewind, the client's sole strategy — `docs/rewind-client-mode.md`) |
+| `UIPIR.DBMutation + HintUpdate` | mutation phase | server `insert/update/delete` → `IncrementalPirBackend::server_patch_hint`; client's `HintUpdate`, either flow: `HintPatchClient::apply_delta` (client-hint-patch) or `RewindClient::accumulate_delta` + `decode` (client-rewind, response rewind — `docs/rewind-client-mode.md`) |
 | `IKPIR.Setup(DB)` | offline phase, all `d` segments | `IkpirServer::new` + `IkpirServer::setup` → `ServerSetupBundle` |
-| (same, computed across cores) | identical output, untimed preamble | `IkpirServer::new_parallel` / `IkpirClient::from_setup_parallel` — see `ParallelSetupBackend` |
-| `IKPIR.Query / Answer / Recover` | keyword online phase | `IkpirClient::build_query` / `IkpirServer::answer` / `IkpirClient::decode` |
+| (same, computed across cores) | identical output, untimed preamble | `IkpirServer::new_parallel` / `RewindClient::from_setup_parallel` / `HintPatchClient::from_setup_parallel` — see `ParallelSetupBackend` |
+| `IKPIR.Query / Answer / Recover` | keyword online phase | `{RewindClient,HintPatchClient}::build_query` / `IkpirServer::answer` / `{RewindClient,HintPatchClient}::decode` |
 | transcript `trans = (S_j)` | sparse per-segment overwrites; specified byte encoding | `HintDeltaBundle`, `SegmentRowDeltas`, `docs/hint-delta-wire-format.md` |
 | hint `H = A·D` | client preprocessing material | `B::Hint` (`FrodoHint` / `SimpleHint`) |
 | `A` (expanded from seed `β`) | public LWE matrix, never on the wire | `B::HintMaterial`, `expand_hint_material` |

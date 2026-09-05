@@ -85,14 +85,19 @@ per-segment architecture, protocol invariants, and backend-author checklist.
 ### `ikpir-client`
 
 Holds `CuckooParams` and per-segment `ClientState`; translates keyword
-lookups into PIR query/response bundles and stays consistent with server
-mutations via **response-rewind** — the client's sole update strategy — which
-pins the bootstrap hint and accumulates the published `ΔD` for a factor-`n`
-cheaper client maintenance than patching the hint directly
-(`docs/rewind-client-mode.md`). Client-side hint-patching survives only as a
-benchmark comparator (`HintPatchClient`, gated behind the `hint-patch-bench`
-Cargo feature, disabled by default) so `client_mutation` can measure the two
-head-to-head for the paper's §6.2 evaluation. See
+lookups into PIR query/response bundles. Ships **two parallel, first-class
+client flows** over the same server-published `HintDeltaBundle` stream:
+**client-hint-patch** (`HintPatchClient` — `apply_delta` folds every delta
+into its own hint immediately, `Θ(n·τ·ω)` per batch, decodes with
+`decode(key, resp)`; the flow whose numbers the CANS 2026 camera-ready
+reports) and **client-rewind** (`RewindClient`, alias `IkpirClient` —
+`accumulate_delta` rolls the published `ΔD` forward, `Θ(τ·ω)` per batch — a
+factor-`n` cheaper client maintenance — `decode(key, query, resp)` rewinds
+the response to the pinned hint `H₀` before decoding, `collect_garbage`
+reclaims the staleness-growing per-query correction; the flow the extended
+(full) paper reports). Both are first-class alternatives, always
+available and chosen at the type, like the backend at `B`
+(`docs/rewind-client-mode.md`). See
 [`crates/ikpir-client/CLAUDE.md`](crates/ikpir-client/CLAUDE.md) for the epoch
 state machine, failure-mode table, and entry-point map.
 
@@ -105,11 +110,7 @@ Ten focused `clap`-parsed PIR benches — four server (`server_setup`,
 Each invocation = one config = one CSV row (`client_mutation` emits one row per
 `(update mode, patch mode, kind)`; the `headtohead_*` benches fix `--num-keys`
 and add `num_keys`/`db_size` columns for the fixed-N comparison vs ChalametPIR /
-Hao 2025). `client_mutation`'s `--update-mode patch` sweep needs the
-`hint-patch-bench` Cargo feature (`cargo bench --features hint-patch-bench`;
-`scripts/bench.sh` passes it automatically) — it is the only bench that does,
-since it is the one comparing the production rewind client against the
-bench-only hint-patch comparator.
+Hao 2025).
 
 `segmented-cuckoo` adds eight filter/KV-store benches: five `cuckoo_filter_*`
 (`load_factor`, `insert_throughput`, `lookup_throughput`, `delete_throughput`,
@@ -197,8 +198,8 @@ So the setup phase ships in two implementations with identical output:
 
 | | Entry points | Used by |
 |---|---|---|
-| **Reference** — single-threaded, non-SIMD; the paper's regime | `B::server_setup`, `IkpirServer::{new, full_rebuild}`, `IkpirClient::{from_setup, reset_from}` | `benches/server_setup.rs` — the measurement |
-| **Optimized** — same output, all cores | `B::server_setup_parallel`, `IkpirServer::{new_parallel, full_rebuild_parallel}`, `IkpirClient::{from_setup_parallel, reset_from_parallel}` | every other bench's preamble |
+| **Reference** — single-threaded, non-SIMD; the paper's regime | `B::server_setup`, `IkpirServer::{new, full_rebuild}`, `RewindClient` / `HintPatchClient::{from_setup, reset_from}` | `benches/server_setup.rs` — the measurement |
+| **Optimized** — same output, all cores | `B::server_setup_parallel`, `IkpirServer::{new_parallel, full_rebuild_parallel}`, `RewindClient` / `HintPatchClient::{from_setup_parallel, reset_from_parallel}` | every other bench's preamble |
 
 The optimized path is **bit-identical**, not merely decode-equivalent: it
 partitions only the output — disjoint bands of the hint matrix `H`,
@@ -283,7 +284,7 @@ cargo bench -p ikpir-server --bench server_answer -- \
 ## Design principles
 
 - Each crate has a single, well-defined responsibility; cross-crate dependencies flow in one direction: `ikpir-server` and `ikpir-client` are siblings that both depend on `ikpir-common` and `segmented-cuckoo`. `ikpir-client` carries `ikpir-server` only as a `[dev-dependency]` for end-to-end tests / benches / doctest.
-- The PIR backend (FrodoPIR vs SimplePIR) is selected at the `B: IndexPirBackend` type parameter on `IkpirServer<S, B>` / `IkpirClient<B>` (monomorphised, no Cargo features involved); the benches expose it as a runtime `--backend frodo|simple` flag.
+- The PIR backend (FrodoPIR vs SimplePIR) is selected at the `B: IndexPirBackend` type parameter on `IkpirServer<S, B>` / `RewindClient<B>` / `HintPatchClient<B>` (monomorphised, no Cargo features involved); the benches expose it as a runtime `--backend frodo|simple` flag.
 - Avoid dynamic dispatch on the hot path; prefer generics.
 - All cryptographic and PIR primitives must be constant-time where relevant to avoid side-channel leakage.
 - **Measured code stays single-threaded and non-SIMD.** The paper reports that regime, so every operation a bench times runs it. Parallelism is confined to the setup phase, offered as a separate, explicitly named entry point (`*_parallel`) with a bit-identical-output contract — never as a flag that could silently change what a timed path does. Adding an optimized twin of any other operation must follow the same shape.
