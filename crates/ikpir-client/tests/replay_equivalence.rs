@@ -38,8 +38,8 @@
 use std::collections::BTreeMap;
 
 use ikpir_client::{
-    FrodoConfig, FrodoPirBackend, HintDeltaBundle, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, ResponseRewind, SimpleConfig, SimplePirBackend,
+    FrodoConfig, FrodoPirBackend, HintDeltaBundle, IncrementalPirBackend, IndexPirBackend,
+    ResponseRewind, RewindClient, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
 use segmented_cuckoo::{
@@ -273,7 +273,7 @@ fn assert_bundles_equal<B: IndexPirBackend>(
 
 /// One `build_query` → `answer` → `decode` round trip.
 fn lookup<S, B>(
-    client: &mut IkpirClient<B>,
+    client: &mut RewindClient<B>,
     server: &IkpirServer<S, B>,
     key: u32,
 ) -> Option<Vec<u8>>
@@ -303,7 +303,7 @@ fn absent_keys(before: &Model, after: &Model) -> Vec<u32> {
 /// Every key in `model` decodes to its value; every key in `absent` decodes
 /// to `None`.
 fn assert_client_tracks_model<S, B>(
-    client: &mut IkpirClient<B>,
+    client: &mut RewindClient<B>,
     server: &IkpirServer<S, B>,
     model: &Model,
     absent: &[u32],
@@ -379,13 +379,13 @@ where
     // Clients: C_A from A's epoch-0 bundle fed A's deltas; C_B from B's
     // epoch-0 bundle fed the deltas of B's current (second) replay.
     let absent = absent_keys(&snap.model, &model_a);
-    let mut c_a = IkpirClient::<B>::from_setup(bundle_a0);
+    let mut c_a = RewindClient::<B>::from_setup(bundle_a0);
     for d in deltas_a {
         c_a.accumulate_delta(d).expect("accumulate_delta A");
     }
     assert_client_tracks_model(&mut c_a, &a, &model_a, &absent, "client A");
 
-    let mut c_b = IkpirClient::<B>::from_setup(bundle_b0);
+    let mut c_b = RewindClient::<B>::from_setup(bundle_b0);
     for d in deltas_b2 {
         c_b.accumulate_delta(d).expect("accumulate_delta B");
     }
@@ -394,7 +394,7 @@ where
     // Honest counterpart of the negative control below: a client that
     // bootstraps from the rewound server's *post-replay* bundle is right
     // too, because the replayed hints track the replayed cells.
-    let mut c_b_fresh = IkpirClient::<B>::from_setup(b.setup());
+    let mut c_b_fresh = RewindClient::<B>::from_setup(b.setup());
     assert_client_tracks_model(
         &mut c_b_fresh,
         &b,
@@ -437,13 +437,13 @@ where
     assert_eq!(model_a, model_b, "key set after inserts");
 
     let absent = NEVER_PRESENT.to_vec();
-    let mut c_a = IkpirClient::<B>::from_setup(bundle_a0);
+    let mut c_a = RewindClient::<B>::from_setup(bundle_a0);
     for d in deltas_a {
         c_a.accumulate_delta(d).expect("accumulate_delta A");
     }
     assert_client_tracks_model(&mut c_a, &a, &model_a, &absent, "client A");
 
-    let mut c_b = IkpirClient::<B>::from_setup(bundle_b0);
+    let mut c_b = RewindClient::<B>::from_setup(bundle_b0);
     for d in deltas_b {
         c_b.accumulate_delta(d).expect("accumulate_delta B");
     }
@@ -498,7 +498,7 @@ where
     // cells. The server answers from the true cells, the untouched
     // fingerprint cells still match, and the value cells decode as noise —
     // so the stale key comes back wrong (or not at all).
-    let mut poisoned = IkpirClient::<B>::from_setup(s.setup());
+    let mut poisoned = RewindClient::<B>::from_setup(s.setup());
     assert_ne!(
         lookup(&mut poisoned, &s, STALE_KEY).as_deref(),
         Some(stale_old.as_slice()),
@@ -511,7 +511,7 @@ where
     // hints, and deltas are folded from the cells alone. The misuse is
     // invisible to the delta-fed clients the benches time and visible only
     // through `setup()` — the bundle `setup_bundle_bytes` measures.
-    let mut synced = IkpirClient::<B>::from_setup(bundle0);
+    let mut synced = RewindClient::<B>::from_setup(bundle0);
     for d in deltas {
         synced.accumulate_delta(d).expect("accumulate_delta");
     }

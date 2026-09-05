@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use criterion::{Criterion, Throughput};
-use ikpir_client::{IkpirClient, IncrementalPirBackend, ResponseRewind};
+use ikpir_client::{IncrementalPirBackend, ResponseRewind, RewindClient};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{IndexScheme, SchemeMeta};
 
@@ -178,11 +178,10 @@ pub fn patch_modes_label(modes: &[PatchMode]) -> String {
 
 /// Client update-strategy selector for the mutation bench.
 ///
-/// `patch` → hint-patch (the bench-only `HintPatchClient::apply_delta`,
-/// `Θ(n·τ·ω)` per batch — the client patches its whole hint; gated behind
-/// the `hint-patch-bench` feature). `rewind` → response-rewind (the
-/// production `IkpirClient::accumulate_delta`, `Θ(τ·ω)` — the client
-/// accumulates the published `ΔD`, a factor-`n` cheaper maintenance). The
+/// `patch` → client-hint-patch (`HintPatchClient::apply_delta`,
+/// `Θ(n·τ·ω)` per batch — the client patches its whole hint). `rewind` →
+/// client-rewind (`RewindClient::accumulate_delta`, `Θ(τ·ω)` — the client
+/// accumulates the published `ΔD`, a cheaper maintenance). The
 /// mutation bench sweeps both for the head-to-head client-maintenance
 /// column; both decode the same value.
 #[allow(dead_code)]
@@ -190,7 +189,7 @@ pub fn patch_modes_label(modes: &[PatchMode]) -> String {
 pub enum UpdateMode {
     /// Hint-patch: `HintPatchClient::apply_delta` patches the hint.
     Patch,
-    /// Response-rewind: `IkpirClient::accumulate_delta` rolls up `ΔD`.
+    /// Response-rewind: `RewindClient::accumulate_delta` rolls up `ΔD`.
     Rewind,
 }
 
@@ -482,7 +481,7 @@ pub fn populate_value_for_key(key: u32, value_bits: u32) -> Vec<u8> {
 /// The cost is negligible next to populate + setup.
 #[allow(dead_code)]
 pub fn verify_decode<B, S>(
-    client: &mut IkpirClient<B>,
+    client: &mut RewindClient<B>,
     server: &IkpirServer<S, B>,
     first_key: u32,
     n_keys: u32,

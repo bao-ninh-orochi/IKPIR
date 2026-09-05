@@ -21,16 +21,16 @@
 //!
 //! # Why probe-set decode comparison instead of direct `ClientState` access
 //!
-//! `IkpirClient<B>` keeps its per-segment `B::ClientState` (and hence the
+//! `RewindClient<B>` keeps its per-segment `B::ClientState` (and hence the
 //! patched `B::Hint`) in a **private** field; this file is an integration
 //! test (a separate compiled crate) and therefore cannot reach it, even
 //! though the concrete `FrodoHint` / `SimpleHint` types happen to derive
 //! `PartialEq`. So T1 establishes "client C1 (patched from the real
 //! bundle) and client C2 (patched from the decoded bundle) are identical"
-//! by comparing `IkpirClient::decode` outputs on a small **fixed probe
+//! by comparing `RewindClient::decode` outputs on a small **fixed probe
 //! set** of keys through the *same* server response — if the two
 //! clients' hints ever diverged, some probe would eventually decode
-//! differently. T2/T3 instead bypass `IkpirClient` entirely and call
+//! differently. T2/T3 instead bypass `RewindClient` entirely and call
 //! `IncrementalPirBackend::server_patch_hint` directly on two clones of
 //! the same starting `B::Hint` (which *does* derive `PartialEq` for both
 //! shipped backends), which is the more direct and more powerful check —
@@ -56,9 +56,9 @@
 use std::collections::HashMap;
 
 use ikpir_client::{
-    DeltaWireLayout, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode, IkpirClient,
+    DeltaWireLayout, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchMode,
     IkpirClientError, IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, ResponseRewind,
-    SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend,
+    RewindClient, SegmentRowDeltas, ServerSetupBundle, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
@@ -349,8 +349,8 @@ fn run_t1<S, B>(
 
     let setup = server.setup();
     let params = setup.params;
-    let mut c1: IkpirClient<B> = IkpirClient::from_setup(setup.clone());
-    let mut c2: IkpirClient<B> = IkpirClient::from_setup(setup);
+    let mut c1: RewindClient<B> = RewindClient::from_setup(setup.clone());
+    let mut c2: RewindClient<B> = RewindClient::from_setup(setup);
 
     let ops = build_trace(seed_count, N_OPS);
     let first_new_key = ops
@@ -797,7 +797,7 @@ fn p_equals_256_cells_use_nine_bit_deltas() {
 /// panic — `Ok` under the foreign geometry or a `WireError` are both
 /// acceptable branches, since the input crosses a trust boundary
 /// (`docs/hint-delta-wire-format.md` §7). Separately,
-/// `IkpirClient::accumulate_delta` must reject a bundle carrying the
+/// `RewindClient::accumulate_delta` must reject a bundle carrying the
 /// client's own real deltas but a different `params` with
 /// `MalformedBundle` — catching a version where `accumulate_delta`
 /// forgot the `delta.params != self.params` check (or checked it after
@@ -843,7 +843,7 @@ fn run_t4<S, B>(
     let _ = HintDeltaBundle::<B>::decode(&bytes, foreign);
 
     // (b) accumulate_delta rejects the client's own deltas under foreign params.
-    let mut client: IkpirClient<B> = IkpirClient::from_setup(server.setup());
+    let mut client: RewindClient<B> = RewindClient::from_setup(server.setup());
     let forged: HintDeltaBundle<B> = HintDeltaBundle::new(
         client.epoch() + 1,
         delta.per_segment_row_deltas.clone(),
@@ -1016,7 +1016,7 @@ fn run_t5<S, B>(
         // version of this test did) is O(variants) setup calls and made
         // this test dominate the file's runtime for no additional
         // coverage.
-        let mut client: IkpirClient<B> = IkpirClient::from_setup(pre_setup.clone());
+        let mut client: RewindClient<B> = RewindClient::from_setup(pre_setup.clone());
 
         for cbytes in variants {
             match HintDeltaBundle::<B>::decode(&cbytes, params) {

@@ -2,9 +2,10 @@
 //!
 //! # Purpose
 //!
-//! Enumerates every failure mode reachable from `IkpirClient`'s public
-//! API plus a wrapper variant that forwards server errors for
-//! ergonomic `?` propagation in synchronous in-process composition.
+//! Enumerates every failure mode reachable from `RewindClient`'s and
+//! `HintPatchClient`'s public API plus a wrapper variant that forwards
+//! server errors for ergonomic `?` propagation in synchronous in-process
+//! composition.
 //!
 //! # Design / architecture
 //!
@@ -22,14 +23,16 @@
 //!
 //! # Related files
 //!
-//! - `client.rs` — sole producer of these variants.
+//! - `client_rewind.rs` / `client_hint_patch.rs` — producers of these
+//!   variants (`RewindClient` / `HintPatchClient`).
 //! - `ikpir-server::IkpirError` — wrapped by the `Server` variant.
 
 use std::fmt;
 
 use ikpir_common::IkpirError;
 
-/// Errors returned by [`IkpirClient`](crate::IkpirClient) methods.
+/// Errors returned by [`RewindClient`](crate::RewindClient) /
+/// [`HintPatchClient`](crate::HintPatchClient) methods.
 ///
 /// # Purpose
 ///
@@ -42,48 +45,43 @@ use ikpir_common::IkpirError;
 /// flow use a single `?` operator everywhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IkpirClientError {
-    /// Returned by
-    /// [`IkpirClient::accumulate_delta`](crate::IkpirClient::accumulate_delta)
-    /// (and the bench-only `HintPatchClient::apply_delta`) when
-    /// `delta.epoch ≤ self.epoch` — the delta has already been applied
-    /// or arrived out of order.
+    /// Returned by `RewindClient::accumulate_delta` /
+    /// `HintPatchClient::apply_delta` when `delta.epoch ≤ self.epoch` —
+    /// the delta has already been applied or arrived out of order.
     StaleDelta {
         /// Epoch the client expected (`self.epoch + 1`).
         expected: u64,
         /// Epoch the delta carried.
         got: u64,
     },
-    /// Returned by
-    /// [`IkpirClient::accumulate_delta`](crate::IkpirClient::accumulate_delta)
-    /// (and the bench-only `HintPatchClient::apply_delta`) when
-    /// `delta.epoch > self.epoch + 1` — the client missed at least one
-    /// update. Caller must call
-    /// [`IkpirClient::reset_from`](crate::IkpirClient::reset_from) with a
-    /// fresh setup bundle.
+    /// Returned by `RewindClient::accumulate_delta` /
+    /// `HintPatchClient::apply_delta` when `delta.epoch > self.epoch + 1` —
+    /// the client missed at least one update. Caller must call
+    /// `reset_from` (on either client) with a fresh setup bundle.
     FutureDelta {
         /// Epoch the client expected (`self.epoch + 1`).
         expected: u64,
         /// Epoch the delta carried.
         got: u64,
     },
-    /// Returned by [`IkpirClient::decode`](crate::IkpirClient::decode) when
-    /// `resp.epoch != self.epoch` — the server moved between query and answer.
+    /// Returned by
+    /// [`RewindClient::decode`](crate::RewindClient::decode) (and
+    /// `HintPatchClient::decode`) when `resp.epoch != self.epoch` — the
+    /// server moved between query and answer.
     EpochMismatch {
         /// Client's current epoch.
         client: u64,
         /// Epoch the response carried.
         response: u64,
     },
-    /// Returned by
-    /// [`IkpirClient::accumulate_delta`](crate::IkpirClient::accumulate_delta)
-    /// (and the bench-only `HintPatchClient::apply_delta`) when
-    /// `delta.params` does not equal the client's cached `params`, or
-    /// `delta.per_segment_row_deltas.len()` does not match `params.arity()`.
-    /// Also returned by `decode` when a bundle's segment count or row width
-    /// does not match the cached `params.arity()` /
-    /// `bucket_size × cells_per_slot`.
+    /// Returned by `RewindClient::accumulate_delta` /
+    /// `HintPatchClient::apply_delta` when `delta.params` does not equal
+    /// the client's cached `params`, or `delta.per_segment_row_deltas.len()`
+    /// does not match `params.arity()`. Also returned by `decode` on either
+    /// client when a bundle's segment count or row width does not match the
+    /// cached `params.arity()` / `bucket_size × cells_per_slot`.
     MalformedBundle,
-    /// Returned by [`decode`](crate::IkpirClient::decode) when a decoded
+    /// Returned by [`decode`](crate::RewindClient::decode) when a decoded
     /// cell, after adding its accumulated `ΔD`, falls outside
     /// `[0, 2^plaintext_bits)`. Honest operation never triggers this (the
     /// running `ΔD` telescopes to `current − pinned`, both in range); it is

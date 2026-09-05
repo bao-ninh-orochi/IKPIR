@@ -5,7 +5,8 @@
 //! **UIPIR** interface), the two shipped LWE backends (FrodoPIR and
 //! SimplePIR — instantiating the paper's **RisePIR-F** and
 //! **RisePIR-S**), the wire-format bundles exchanged between
-//! `IkpirServer` and `IkpirClient`, the operating-point selection in
+//! `IkpirServer` and the `ikpir-client` types (`RewindClient` /
+//! `HintPatchClient`), the operating-point selection in
 //! [`pir_params`], and the `IkpirError` enum.
 //!
 //! Production callers should not depend on this crate directly — they

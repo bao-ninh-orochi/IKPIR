@@ -91,7 +91,7 @@ impl PendingDelta {
     /// sum, dropping any cell that nets to zero so the map stays sparse.
     ///
     /// `per_segment.len()` must equal this accumulator's arity — the caller
-    /// (`IkpirClient::accumulate_delta`) validates it before calling.
+    /// (`RewindClient::accumulate_delta`) validates it before calling.
     ///
     /// # Returns
     ///

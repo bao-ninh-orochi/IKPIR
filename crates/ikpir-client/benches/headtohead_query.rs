@@ -21,8 +21,8 @@ mod helpers;
 use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, PrecomputingPirBackend, RewindClient, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -116,7 +116,7 @@ fn run_one<S, B>(
     server.drop_hint_material();
 
     let query_bytes = {
-        let mut probe: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle.clone());
+        let mut probe: RewindClient<B> = RewindClient::from_setup_parallel(bundle.clone());
         probe.build_query(&0u32.to_le_bytes()).wire_byte_size()
     };
 
@@ -201,7 +201,7 @@ fn run_one<S, B>(
     // ── 4. Measure build_query (warm-bc) ─────────────────────────────────────────
     let n = n_inserted as u32;
     let keys: Vec<[u8; 4]> = (0..cli.batch).map(|i| (i % n).to_le_bytes()).collect();
-    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle);
+    let mut client: RewindClient<B> = RewindClient::from_setup_parallel(bundle);
 
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut idx = 0usize;

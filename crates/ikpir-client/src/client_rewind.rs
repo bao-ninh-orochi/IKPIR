@@ -1,4 +1,5 @@
-//! `IkpirClient<B>` — the client-side state machine.
+//! `RewindClient<B>` — the client-side state machine for the
+//! **client-rewind** flow.
 //!
 //! # Purpose
 //!
@@ -21,25 +22,23 @@
 //!   unpacked and merged into a fixed-size accumulator via a
 //!   branchless OR-masked select; a timing observer learns at most
 //!   `(arity, bucket_size)`.
-//! - **Response-rewind is the sole update strategy.** The client pins its
-//!   bootstrap hint `H₀` and never patches it: `accumulate_delta` rolls the
-//!   published `ΔD` forward (`Θ(τ·ω)` per batch — a factor-`n` cheaper
-//!   maintenance than patching the hint), and `decode` corrects each
-//!   response back to `H₀`'s epoch before decoding. `collect_garbage`
-//!   reclaims the staleness-growing per-query correction by folding `ΔD`
-//!   into the hint on demand. `reset_from` recovers after a `full_rebuild`
-//!   or an unbridgeable `FutureDelta` gap. The classical alternative —
-//!   patching the hint immediately — survives only as a benchmark
-//!   comparator behind the `hint-patch-bench` Cargo feature
-//!   (`crate::bench_comparator::HintPatchClient`); see
+//! - **Client-rewind is one of two first-class update flows.** The client
+//!   pins its bootstrap hint `H₀` and never patches it: `accumulate_delta`
+//!   rolls the published `ΔD` forward (`Θ(τ·ω)` per batch), and `decode`
+//!   corrects each response back to `H₀`'s epoch before decoding.
+//!   `collect_garbage` reclaims the staleness-growing per-query correction
+//!   by folding `ΔD` into the hint on demand. `reset_from` recovers after a
+//!   `full_rebuild` or an unbridgeable `FutureDelta` gap. The parallel
+//!   client-hint-patch flow — which folds every delta into the hint
+//!   immediately instead — is [`crate::HintPatchClient`]; see
 //!   `docs/rewind-client-mode.md`.
 //!
 //! # Related files
 //!
-//! - `lib.rs` — re-exports `IkpirClient`, `DeltaApplyOutcome`, and the
+//! - `lib.rs` — re-exports `RewindClient`, `DeltaApplyOutcome`, and the
 //!   ikpir-server wire/backend types.
 //! - `error.rs` — `IkpirClientError` variants.
-//! - `bench_comparator/` — the feature-gated hint-patch comparator client.
+//! - `client_hint_patch.rs` — the client-hint-patch flow, `HintPatchClient`.
 //! - `ikpir-server::IkpirServer` — counterpart on the server side.
 
 use ikpir_common::{
@@ -56,17 +55,20 @@ use segmented_cuckoo::{unpack_slot_cells, CuckooParams};
 /// and [`ParallelSetupBackend::client_setup_parallel`] (the optimized
 /// twin) have identical signatures and, by the latter's equivalence
 /// contract, produce observationally identical `ClientState`s. Passing
-/// one as a value lets [`IkpirClient::from_setup`] and
-/// [`IkpirClient::from_setup_parallel`] share a single body.
+/// one as a value lets [`RewindClient::from_setup`] and
+/// [`RewindClient::from_setup_parallel`] share a single body.
 type PerSegmentClientSetup<B> = fn(
     &<B as IndexPirBackend>::ServerParams,
     &<B as IndexPirBackend>::Hint,
 ) -> <B as IndexPirBackend>::ClientState;
 
+use crate::ct::ct_eq_u64_mask;
 use crate::error::IkpirClientError;
+use crate::outcome::DeltaApplyOutcome;
 use crate::pending::PendingDelta;
 
-/// Client-side IKPIR engine, generic over the PIR backend `B`.
+/// Client-side IKPIR engine for the **client-rewind** flow, generic over the
+/// PIR backend `B`.
 ///
 /// # Purpose
 ///
@@ -85,7 +87,7 @@ use crate::pending::PendingDelta;
 ///
 /// All methods are synchronous. `build_query` and `accumulate_delta` take
 /// `&mut self`. Wrap in `Mutex` if exposing across threads.
-pub struct IkpirClient<B: IndexPirBackend> {
+pub struct RewindClient<B: IndexPirBackend> {
     params: CuckooParams,
     states: Vec<B::ClientState>,
     epoch: u64,
@@ -98,17 +100,7 @@ pub struct IkpirClient<B: IndexPirBackend> {
     pin_epoch: u64,
 }
 
-/// Outcome of [`IkpirClient::try_accumulate_delta_or_resync`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeltaApplyOutcome {
-    /// The delta was applied incrementally (the common case).
-    Synced,
-    /// The delta was too far ahead; the fetched fresh bundle was used to
-    /// [`IkpirClient::reset_from`] the client.
-    Resynced,
-}
-
-impl<B: IndexPirBackend> IkpirClient<B> {
+impl<B: IndexPirBackend> RewindClient<B> {
     /// Build a fresh client from a server setup bundle.
     ///
     /// # Purpose
@@ -179,7 +171,7 @@ impl<B: IndexPirBackend> IkpirClient<B> {
     /// # Purpose
     ///
     /// Resync entry point. Use after a server-side `full_rebuild`, or
-    /// whenever [`IkpirClient::accumulate_delta`] reports
+    /// whenever [`RewindClient::accumulate_delta`] reports
     /// [`IkpirClientError::FutureDelta`] (the gap is unbridgeable
     /// incrementally).
     ///
@@ -231,7 +223,7 @@ impl<B: IndexPirBackend> IkpirClient<B> {
 ///
 /// Bootstrapping a client re-expands the public matrix `A` from each
 /// segment's seed — `Θ(arity · n_rows · lwe_dim)` ChaCha20 words, which
-/// is the entire cost of [`IkpirClient::from_setup`] and reaches
+/// is the entire cost of [`RewindClient::from_setup`] and reaches
 /// gigabytes at paper scale. These twins produce the identical client
 /// across all cores.
 ///
@@ -244,7 +236,7 @@ impl<B: IndexPirBackend> IkpirClient<B> {
 /// bench that does not itself report client-bootstrap cost should
 /// prefer these. Worker count follows `IKPIR_SETUP_THREADS`, else the
 /// machine's available parallelism.
-impl<B: ParallelSetupBackend> IkpirClient<B> {
+impl<B: ParallelSetupBackend> RewindClient<B> {
     /// Multi-threaded twin of [`Self::from_setup`] — identical
     /// resulting client, computed across cores.
     pub fn from_setup_parallel(bundle: ServerSetupBundle<B>) -> Self {
@@ -259,7 +251,7 @@ impl<B: ParallelSetupBackend> IkpirClient<B> {
     }
 }
 
-impl<B: IndexPirBackend> IkpirClient<B>
+impl<B: IndexPirBackend> RewindClient<B>
 where
     B::Query: Clone,
 {
@@ -306,21 +298,10 @@ where
     }
 }
 
-/// Branchless `u64` equality mask: returns `u64::MAX` if `a == b`, else `0`.
-///
-/// Standard constant-time trick: `x ^ b == 0` iff `a == b`; squeeze that
-/// zero/non-zero into bit 63 via `x | -x`, shift down, then subtract 1 to
-/// flip the meaning.
-#[inline]
-const fn ct_eq_u64_mask(a: u64, b: u64) -> u64 {
-    let x = a ^ b;
-    ((x | x.wrapping_neg()) >> 63).wrapping_sub(1)
-}
-
-impl<B: PrecomputingPirBackend> IkpirClient<B> {
+impl<B: PrecomputingPirBackend> RewindClient<B> {
     /// Phase B amortisation — pre-sample `count` query slots **per segment**.
     ///
-    /// Each subsequent [`IkpirClient::build_query`] call consumes one slot
+    /// Each subsequent [`RewindClient::build_query`] call consumes one slot
     /// per segment off the prepared queue (cheap path: one vector add)
     /// before falling back to inline LWE sampling. The prepared material is
     /// independent of the database, so it stays valid across mutations.
@@ -336,9 +317,9 @@ impl<B: PrecomputingPirBackend> IkpirClient<B> {
     /// for every prepared (and currently in-flight) slot per segment that
     /// does not already have it. Idempotent.
     ///
-    /// After this call, every matching [`IkpirClient::decode`] takes the
+    /// After this call, every matching [`RewindClient::decode`] takes the
     /// cheap path (one vector subtract + rounding) against the pinned hint.
-    /// [`IkpirClient::collect_garbage`] keeps the precomputed `c` values
+    /// [`RewindClient::collect_garbage`] keeps the precomputed `c` values
     /// consistent with the hint it folds `ΔD` into.
     ///
     /// Cost per call: `prepared_count × arity × lwe_dim × row_width` matvec work.
@@ -361,7 +342,7 @@ impl<B: PrecomputingPirBackend> IkpirClient<B> {
     }
 }
 
-impl<B: IncrementalPirBackend> IkpirClient<B> {
+impl<B: IncrementalPirBackend> RewindClient<B> {
     /// Accumulate a hint-delta bundle into the rolling `ΔD`.
     ///
     /// # Purpose
@@ -383,7 +364,7 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     /// `delta.epoch == self.epoch + 1`. Older deltas are
     /// [`IkpirClientError::StaleDelta`]; gaps are
     /// [`IkpirClientError::FutureDelta`] — the caller must recover by
-    /// calling [`IkpirClient::reset_from`] with a fresh server bundle.
+    /// calling [`RewindClient::reset_from`] with a fresh server bundle.
     /// `delta.params` must equal the client's cached `params`, and
     /// `delta.per_segment_row_deltas.len()` must equal `params.arity()`.
     ///
@@ -402,10 +383,9 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     /// # Complexity
     ///
     /// `O(Σ |touched cells|)` `BTreeMap` work per segment — independent of
-    /// the LWE dimension `n`, the factor-`n` maintenance saving over
-    /// patching the hint directly (see the bench-only
-    /// `bench_comparator::HintPatchClient` behind the `hint-patch-bench`
-    /// feature).
+    /// the LWE dimension `n`, the cheaper maintenance over folding every
+    /// delta into the hint directly (see the parallel client-hint-patch
+    /// flow, [`crate::HintPatchClient`]).
     pub fn accumulate_delta(&mut self, delta: HintDeltaBundle<B>) -> Result<(), IkpirClientError> {
         let expected = self.epoch + 1;
         if delta.epoch < expected {
@@ -504,12 +484,12 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
     ///
     /// ```no_run
     /// use ikpir_client::{
-    ///     DeltaApplyOutcome, FrodoPirBackend, HintDeltaBundle, IkpirClient,
+    ///     DeltaApplyOutcome, FrodoPirBackend, HintDeltaBundle, RewindClient,
     ///     ServerSetupBundle,
     /// };
     ///
     /// fn handle(
-    ///     client: &mut IkpirClient<FrodoPirBackend>,
+    ///     client: &mut RewindClient<FrodoPirBackend>,
     ///     delta:  HintDeltaBundle<FrodoPirBackend>,
     ///     fresh:  impl FnOnce() -> ServerSetupBundle<FrodoPirBackend>,
     /// ) {
@@ -539,9 +519,9 @@ impl<B: IncrementalPirBackend> IkpirClient<B> {
 }
 
 /// Response-rewind read path — available for every backend that implements
-/// [`ResponseRewind`] (both shipped LWE backends do). This is the client's
-/// **sole decode path**.
-impl<B: IncrementalPirBackend + ResponseRewind> IkpirClient<B>
+/// [`ResponseRewind`] (both shipped LWE backends do). This is the
+/// client-rewind flow's decode path.
+impl<B: IncrementalPirBackend + ResponseRewind> RewindClient<B>
 where
     B::Query: Clone,
     B::Response: Clone,
@@ -560,8 +540,8 @@ where
     /// recovering the *stale* row; (3) adds `ΔD[row]` to reach the current
     /// row; then (4) runs a branchless fingerprint scan. The decoded value
     /// is identical to what a fresh setup at the head would return (and to
-    /// the bench-only `HintPatchClient` comparator's decode — pinned by
-    /// `tests/rewind_equivalence.rs` behind the `hint-patch-bench` feature).
+    /// [`crate::HintPatchClient`]'s decode — pinned by
+    /// `tests/client_flow_parity.rs`).
     ///
     /// When `ΔD` is empty (a freshly bootstrapped or just-garbage-collected
     /// client, `pin_epoch() == epoch()`), steps 1 and 3 are no-ops and this

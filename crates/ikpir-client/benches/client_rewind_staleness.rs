@@ -35,8 +35,8 @@ mod helpers;
 
 use helpers::{Backend, CloneStore};
 use ikpir_client::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, ParallelSetupBackend, ResponseRewind, SimpleConfig, SimplePirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, ResponseRewind, RewindClient, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -93,7 +93,7 @@ fn fill_value(value: &mut [u8], key: u32, salt: u32) {
 /// Time only `decode` over `m` present keys round-robin; assert every
 /// query is found. Returns mean microseconds per query.
 fn measure_decode<S, B>(
-    client: &mut IkpirClient<B>,
+    client: &mut RewindClient<B>,
     server: &IkpirServer<S, B>,
     keys: &[u32],
     m: u32,
@@ -159,7 +159,7 @@ fn run_one<S, B>(
     let row_width = cli.bucket_size * cps;
     let segment_rows = params.segment_size();
 
-    let mut client = IkpirClient::<B>::from_setup_parallel(bundle);
+    let mut client = RewindClient::<B>::from_setup_parallel(bundle);
 
     // A pool of present keys to query round-robin (also the update targets).
     let pool: Vec<u32> = (0..(n_seed as u32).min(4096)).collect();

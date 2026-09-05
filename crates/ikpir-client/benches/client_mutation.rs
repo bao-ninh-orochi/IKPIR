@@ -1,12 +1,11 @@
 //! **Intent:** Measure client-side per-batch **maintenance** throughput for N
 //! mutations per kind (insert / update / delete), in **empty-queue mode** (no
-//! precomputed slots), across both backends, both update strategies
+//! precomputed slots), across both backends and both client flows
 //! (`--update-mode patch,rewind`), and — for `patch` — both hint-patch
-//! realizations (entry-level and row-level). `patch` times the bench-only
-//! `HintPatchClient::apply_delta` (gated behind the `hint-patch-bench`
-//! feature; recompute the hint, `Θ(n·τ·ω)`) — the classical baseline
-//! response-rewind replaced in production; `rewind` times the production
-//! `IkpirClient::accumulate_delta` (roll up the published `ΔD`, `Θ(τ·ω)` —
+//! realizations (entry-level and row-level). `patch` times the
+//! client-hint-patch flow's `HintPatchClient::apply_delta` (recompute the
+//! hint, `Θ(n·τ·ω)`); `rewind` times the client-rewind flow's
+//! `RewindClient::accumulate_delta` (roll up the published `ΔD`, `Θ(τ·ω)` —
 //! the paper's factor-`n` cheaper client maintenance,
 //! `docs/rewind-client-mode.md`). The measurement isolates that per-batch
 //! maintenance cost from any warm-bc queue-maintenance work.
@@ -22,7 +21,7 @@
 //! fresh `HintPatchClient` from the epoch-0 bundle with no precompute (empty
 //! prepared-query queue), set its `HintPatchMode`, and time the full
 //! sequence of N `apply_delta` calls with wall-clock Instant; per update
-//! mode build a fresh production `IkpirClient` and time
+//! mode build a fresh `RewindClient` and time
 //! `accumulate_delta` instead. The timed loop runs exactly once per (kind,
 //! mode) (state advances with each mutation, so criterion cycling is not
 //! meaningful). Previously every kind built its own server, four
@@ -60,8 +59,9 @@ mod helpers;
 
 use helpers::{Backend, CloneStore, PatchMode, UpdateMode};
 use ikpir_client::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchClient, IkpirClient,
-    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, SimpleConfig, SimplePirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchClient,
+    IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend, RewindClient, SimpleConfig,
+    SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
 use segmented_cuckoo::{
@@ -363,16 +363,16 @@ fn run_one<S, B>(
         // The deltas are identical under either mode (the wire format does not
         // depend on the realization), so they are collected once per kind and
         // replayed per (update_mode, patch_mode). `patch` sweeps the hint-patch
-        // realization via the bench-only `HintPatchClient`; `rewind` is
-        // patch-mode-independent, so it runs once (patch_mode column `-`)
-        // against the production `IkpirClient`.
+        // realization via the client-hint-patch flow's `HintPatchClient`;
+        // `rewind` is patch-mode-independent, so it runs once (patch_mode
+        // column `-`) against the client-rewind flow's `RewindClient`.
         for &umode in &update_modes {
             match umode {
                 UpdateMode::Patch => {
                     for &pmode in &patch_modes {
-                        // Fresh comparator client, no precompute: times only the
-                        // hint patch — the `Θ(n·τ·ω)` client-maintenance cost the
-                        // production rewind client replaced.
+                        // Fresh client-hint-patch client, no precompute: times
+                        // only the hint patch — the `Θ(n·τ·ω)` client-maintenance
+                        // cost the client-rewind flow avoids.
                         let mut client = HintPatchClient::<B>::from_setup_parallel(bundle.clone());
                         client.set_hint_patch_mode(pmode.to_hint_patch_mode());
 
@@ -408,8 +408,8 @@ fn run_one<S, B>(
                     // Fresh client, empty prepared-query queue (no precompute):
                     // times only the ΔD accumulate — the `Θ(τ·ω)` client
                     // maintenance the paper reports, a factor-`n` cheaper than
-                    // the hint-patch comparator above.
-                    let mut client = IkpirClient::<B>::from_setup_parallel(bundle.clone());
+                    // the client-hint-patch flow above.
+                    let mut client = RewindClient::<B>::from_setup_parallel(bundle.clone());
 
                     let replay = deltas.clone();
                     let t = Instant::now();
