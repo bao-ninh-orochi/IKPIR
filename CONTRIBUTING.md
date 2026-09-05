@@ -31,6 +31,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 - Fast correctness pass over every PIR bench on both backends:
   `./scripts/smoke.sh` (~a couple of minutes).
 - Never commit `results/` — it is git-ignored and regenerated on demand.
+- Reproducing a paper table end to end: [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md)
+  (which flow, which command, which output file, per paper).
 
 ## Workspace conventions
 

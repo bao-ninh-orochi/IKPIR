@@ -18,6 +18,7 @@ RisePIR/                          ← workspace root
 ├── CLAUDE.md
 ├── README.md
 ├── CONTRIBUTING.md               ← toolchain pin, local CI gates, PR conventions
+├── REPRODUCIBILITY.md            ← per paper: client flow, command per table, output file
 ├── SECURITY.md                   ← threat-model caveats, private vulnerability reporting
 ├── LICENSE / NOTICE              ← Apache-2.0 only, plus the copyright notice
 ├── deny.toml                     ← cargo-deny allow-list: dependencies stay permissive

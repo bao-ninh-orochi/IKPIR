@@ -24,6 +24,11 @@ choosing a backend at the `B: IndexPirBackend` type parameter.
 
 > **Status.** Research prototype. Interfaces, parameters, and internals are
 > subject to change.
+>
+> **Reproducing a paper's numbers:** [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md)
+> maps each paper to its client flow, the exact command per table, and the
+> output file — the camera-ready to client-hint-patch, the extended version to
+> client-rewind.
 
 ## Background
 
@@ -213,6 +218,8 @@ small **dev-scale** config (~2¹⁶ slots, sub-second), *not* the paper's; for t
 PIR geometry, use the table sweeps below rather than this one-off runner.
 
 ### Reproduce a paper table
+
+Per paper, with the flow and output file for every table: [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md).
 
 One sweep per table. Each resolves the paper's config matrix, then loops
 `bench.sh` over it — so a table is one command, not twenty:
