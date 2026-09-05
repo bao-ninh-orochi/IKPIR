@@ -1,8 +1,9 @@
 //! **Intent:** Measure the response-rewind client's **per-query correction
 //! cost as a function of staleness** `|ΔD|` — the price paid for the factor-`n`
-//! cheaper maintenance the `client_mutation` bench reports. A rewind client that
-//! never garbage-collects accumulates a growing `ΔD`; `decode` subtracts
-//! `qᵀ·ΔD` per query (`Θ(|ΔD|)` on top of the constant `client_decode`), so its
+//! cheaper maintenance the `client_rewind_mutation` bench reports. A rewind
+//! client that never garbage-collects accumulates a growing `ΔD`; `decode`
+//! subtracts `qᵀ·ΔD` per query (`Θ(|ΔD|)` on top of the constant
+//! `client_rewind_decode`), so its
 //! per-query latency rises with the number of unpatched mutations, until a
 //! `collect_garbage` folds `ΔD` into the hint and returns it to baseline.
 //!

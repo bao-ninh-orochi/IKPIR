@@ -26,16 +26,32 @@ die()  { echo "${C_YELLOW}error:${C_RESET} $*" >&2; exit 1; }
 # their own flags (see crates/segmented-cuckoo/benches/configs.rs) and default to
 # the paper's Table 2 matrix, so bench.sh forwards their flags unchanged.
 PIR_SERVER_BENCHES=(server_setup server_answer server_mutation headtohead_answer)
-PIR_CLIENT_BENCHES=(client_query client_decode client_mutation client_rewind_staleness headtohead_query headtohead_decode)
+# Nine client benches: three flow-independent (query construction is
+# identical on both flows) plus a client-hint-patch / client-rewind pair
+# each for decode, mutation, and head-to-head decode.
+PIR_CLIENT_BENCHES=(client_query client_hint_patch_decode client_rewind_decode
+                     client_hint_patch_mutation client_rewind_mutation
+                     client_rewind_staleness headtohead_query
+                     headtohead_hint_patch_decode headtohead_rewind_decode)
 # The four that populate Table 2, in the order the table's columns read.
 CUCKOO_TABLE2_BENCHES=(cuckoo_filter_load_factor cuckoo_filter_insert_throughput
                        cuckoo_filter_lookup_throughput cuckoo_filter_delete_throughput)
-# The benches behind each keyword-PIR table. Read by the sourcing table{3,4,5}.sh,
-# never here — hence the disables.
+# The benches behind each keyword-PIR table, split into the flow-independent
+# common leg and each flow's own leg. Read by the sourcing table{3,4}.sh
+# (via `table_benches_for_flow`) and table5.sh, never here — hence the
+# disables.
 # shellcheck disable=SC2034
-PIR_TABLE3_BENCHES=(headtohead_answer headtohead_query headtohead_decode)
+PIR_TABLE3_COMMON=(headtohead_answer headtohead_query)
 # shellcheck disable=SC2034
-PIR_TABLE4_BENCHES=(server_mutation client_mutation)
+PIR_TABLE3_HINT_PATCH=(headtohead_hint_patch_decode)
+# shellcheck disable=SC2034
+PIR_TABLE3_REWIND=(headtohead_rewind_decode)
+# shellcheck disable=SC2034
+PIR_TABLE4_COMMON=(server_mutation)
+# shellcheck disable=SC2034
+PIR_TABLE4_HINT_PATCH=(client_hint_patch_mutation)
+# shellcheck disable=SC2034
+PIR_TABLE4_REWIND=(client_rewind_mutation)
 # shellcheck disable=SC2034
 PIR_TABLE5_BENCHES=(server_setup)
 CUCKOO_BENCHES=("${CUCKOO_TABLE2_BENCHES[@]}" cuckoo_filter_false_positive_rate
@@ -52,18 +68,58 @@ crate_for_bench() {
     return 1
 }
 is_pir_bench()        { _contains "$1" "${PIR_SERVER_BENCHES[@]}" "${PIR_CLIENT_BENCHES[@]}"; }
-is_mutation_bench()   { [[ "$1" == server_mutation || "$1" == client_mutation ]]; }
+is_mutation_bench()   { [[ "$1" == server_mutation || "$1" == client_hint_patch_mutation || "$1" == client_rewind_mutation ]]; }
 is_headtohead_bench() { [[ "$1" == headtohead_* ]]; }
 # Benches that seed their store to a target fill (--load-factor): the mutation
 # benches, server_setup, and client_rewind_staleness. The rest populate to
-# TableFull (server_answer, client_query, client_decode) or to an exact key
-# count (the headtohead_* trio) and reject --load-factor.
+# TableFull (server_answer, client_query, client_{hint_patch,rewind}_decode)
+# or to an exact key count (the headtohead_* quartet) and reject --load-factor.
 takes_load_factor()   { is_mutation_bench "$1" || [[ "$1" == server_setup || "$1" == client_rewind_staleness ]]; }
+# Benches that accept `--patch-mode`: server_mutation and the client-hint-patch
+# mutation bench only. client_rewind_mutation has no --patch-mode flag — the
+# client-rewind flow's maintenance is patch-mode-independent.
+takes_patch_mode()    { [[ "$1" == server_mutation || "$1" == client_hint_patch_mutation ]]; }
 all_benches()         { printf '%s\n' "${PIR_SERVER_BENCHES[@]}" "${PIR_CLIENT_BENCHES[@]}" "${CUCKOO_BENCHES[@]}"; }
 
 # ── Backend parameters ────────────────────────────────────────────────────────
 validate_backend() {
     case "$1" in frodo|simple) return 0 ;; *) die "unknown backend '$1' (valid: frodo, simple)" ;; esac
+}
+
+# ── Flow selection (client-hint-patch | client-rewind | all) ──────────────────
+validate_flow() {
+    case "$1" in
+        client-hint-patch|client-rewind|all) return 0 ;;
+        *) die "unknown flow '$1' (valid: client-hint-patch, client-rewind, all)" ;;
+    esac
+}
+
+# Bench list for one keyword-PIR table (3 or 4) at the selected flow
+# (client-hint-patch | client-rewind | all), one bench name per line so
+# bash 3.2 callers can collect it with a `while read` loop. Always includes
+# the table's flow-independent common leg (PIR_TABLE{3,4}_COMMON).
+table_benches_for_flow() {
+    local table=$1 flow=$2
+    validate_flow "$flow"
+    case "$table" in
+        3)
+            printf '%s\n' "${PIR_TABLE3_COMMON[@]}"
+            case "$flow" in
+                client-hint-patch) printf '%s\n' "${PIR_TABLE3_HINT_PATCH[@]}" ;;
+                client-rewind)     printf '%s\n' "${PIR_TABLE3_REWIND[@]}" ;;
+                all)               printf '%s\n' "${PIR_TABLE3_HINT_PATCH[@]}" "${PIR_TABLE3_REWIND[@]}" ;;
+            esac
+            ;;
+        4)
+            printf '%s\n' "${PIR_TABLE4_COMMON[@]}"
+            case "$flow" in
+                client-hint-patch) printf '%s\n' "${PIR_TABLE4_HINT_PATCH[@]}" ;;
+                client-rewind)     printf '%s\n' "${PIR_TABLE4_REWIND[@]}" ;;
+                all)               printf '%s\n' "${PIR_TABLE4_HINT_PATCH[@]}" "${PIR_TABLE4_REWIND[@]}" ;;
+            esac
+            ;;
+        *) die "table_benches_for_flow: unknown table '$table' (expected 3 or 4)" ;;
+    esac
 }
 
 # LWE dimension for 128-bit security, lattice estimator under the ADPS16 model.
@@ -214,12 +270,14 @@ tau_for_geometry() {
 # axis and forwards everything else to the bench. `$1` is the base config list as
 # a space-separated string ("2:4 4:1 …") because bash 3.2 has no namerefs.
 #
-# Sets: PAPER_SEL_CONFIGS, PAPER_SEL_VALUE_BITS, PAPER_SEL_BACKENDS, PAPER_EXTRA
+# Sets: PAPER_SEL_CONFIGS, PAPER_SEL_VALUE_BITS, PAPER_SEL_BACKENDS,
+#       PAPER_SEL_FLOW, PAPER_EXTRA
 paper_select() {
     local base=$1; shift
     local sel_arity="" sel_bs="" c a b be
     local all=()
     PAPER_SEL_CONFIGS=(); PAPER_SEL_VALUE_BITS=(); PAPER_SEL_BACKENDS=(); PAPER_EXTRA=()
+    PAPER_SEL_FLOW="all"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -227,6 +285,7 @@ paper_select() {
             --bucket-size) sel_bs=$2;    shift 2 ;;
             --value-bits)  IFS=',' read -ra PAPER_SEL_VALUE_BITS <<< "$2"; shift 2 ;;
             --backend)     IFS=',' read -ra PAPER_SEL_BACKENDS  <<< "$2"; shift 2 ;;
+            --flow)        PAPER_SEL_FLOW=$2; shift 2 ;;
             *)             PAPER_EXTRA+=("$1"); shift ;;
         esac
     done
@@ -245,6 +304,7 @@ paper_select() {
     [[ ${#PAPER_SEL_VALUE_BITS[@]} -gt 0 ]] || PAPER_SEL_VALUE_BITS=("${PAPER_VALUE_BITS[@]}")
     [[ ${#PAPER_SEL_BACKENDS[@]}   -gt 0 ]] || PAPER_SEL_BACKENDS=("${PAPER_BACKENDS[@]}")
     for be in "${PAPER_SEL_BACKENDS[@]}"; do validate_backend "$be"; done
+    validate_flow "$PAPER_SEL_FLOW"
 }
 
 # Count of bench invocations a sweep is about to make, for its banner.

@@ -1,4 +1,12 @@
-//! **Intent:** Measure client-side `decode` throughput across both backends
+//! Shared generic measurement body for the per-flow decode benches
+//! (`client_hint_patch_decode.rs`, `client_rewind_decode.rs`), included via
+//! `mod flow_decode_body;` the same way `mod helpers;` is. Each thin binary
+//! supplies its own `C: helpers::ClientFlow<B>` (`HintPatchClient<B>` /
+//! `RewindClient<B>`) at the two backend-dispatch call sites; everything
+//! else — CLI, populate, setup, the criterion loop, and CSV writing — lives
+//! here, once.
+//!
+//! **Intent:** Measure one flow's `decode` throughput across both backends
 //! (FrodoPIR and SimplePIR), always in warm-bc mode (precompute_queries +
 //! precompute_decodes refilled per-sample).
 //!
@@ -6,8 +14,12 @@
 //! `decode`. Before each criterion sample's timing bracket, refill the
 //! precomputed-query queue with exactly `iters` warm-bc slots (Phase B + C).
 //! Per timed iteration: build_query (pops a slot) and server.answer run
-//! outside the timing bracket; only decode is timed. This guarantees warm-bc
-//! for every timed decode without stalling at paper-scale configs.
+//! outside the timing bracket; only decode is timed. For client-hint-patch
+//! this is the real 2-arg `HintPatchClient::decode(key, resp)` (the query
+//! bundle is threaded through `ClientFlow::decode`'s uniform signature but
+//! ignored, never cloned); for client-rewind it is the real 3-arg
+//! `RewindClient::decode(key, query, resp)` at empty `ΔD`, exactly as
+//! before the flows were split into separate benches.
 //!
 //! **Arguments (CLI):** `--arity` (2/3/4), `--backend` (frodo|simple,
 //! default frodo), `--num-buckets`, `--bucket-size`, `--value-bits`,
@@ -15,9 +27,11 @@
 //! the bench rotates through this many distinct keys so repeated iterations
 //! do not reuse hot CPU-cache state from the previous call; default 64).
 //!
-//! **Output:** `results/ikpir_client_decode.csv`
-//! Columns: backend, arity, num_buckets, bucket_size, value_bits, plaintext_bits,
-//! lwe_dim, batch, mean_dps, min_dps, max_dps, stddev_dps,
+//! **Output:** `results/ikpir_client_hint_patch_decode.csv` /
+//! `results/ikpir_client_rewind_decode.csv` (never merged — the CSV file
+//! name is derived from `C::FLOW`).
+//! Columns: flow, backend, arity, num_buckets, bucket_size, value_bits,
+//! plaintext_bits, lwe_dim, batch, mean_dps, min_dps, max_dps, stddev_dps,
 //! cells_per_slot, row_width, segment_rows, db_rows, db_cols, load_factor
 //!
 //! `db_rows` / `db_cols` report the per-segment PIR matrix shape **after** any
@@ -27,75 +41,66 @@
 // significant_drop_tightening: clippy's inline-`Criterion` fix borrows a temporary dropped while `BenchmarkGroup` holds it (won't compile).
 #![allow(clippy::significant_drop_tightening)]
 
-mod helpers;
-
+use crate::helpers::{self, Backend, ClientFlow, MakeStore};
 use criterion::Throughput;
-use helpers::{Backend, MakeStore};
 use ikpir_client::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, IncrementalPirBackend, IndexPirBackend,
-    ParallelSetupBackend, PrecomputingPirBackend, ResponseRewind, RewindClient, SimpleConfig,
-    SimplePirBackend,
+    BackendWireSize, IncrementalPirBackend, IndexPirBackend, ParallelSetupBackend,
+    PrecomputingPirBackend,
 };
 use ikpir_server::IkpirServer;
-use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const HEADER: &str =
-    "backend,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,batch,\
+    "flow,backend,arity,num_buckets,bucket_size,value_bits,plaintext_bits,lwe_dim,batch,\
     mean_dps,min_dps,max_dps,stddev_dps,\
     cells_per_slot,row_width,segment_rows,db_rows,db_cols,load_factor";
 
 #[derive(Clone, clap::Parser)]
-#[command(about = "Measure ikpir-client decode throughput (warm-bc) via criterion.")]
-struct Cli {
+#[command(about = "Measure one ikpir-client flow's decode throughput (warm-bc) via criterion.")]
+pub struct Cli {
     #[arg(long, value_parser = clap::value_parser!(u32).range(2..=4), default_value_t = 2)]
-    arity: u32,
+    pub arity: u32,
     #[arg(long, value_enum, default_value_t = Backend::Frodo)]
-    backend: Backend,
+    pub backend: Backend,
     #[arg(long, default_value_t = 16_384)]
-    num_buckets: u32,
+    pub num_buckets: u32,
     #[arg(long, default_value_t = 4)]
-    bucket_size: u32,
+    pub bucket_size: u32,
     /// Value width in bits. The paper reports 2048 (256 B) and 8192 (1 kB).
     #[arg(long, default_value_t = 2048)]
-    value_bits: u32,
+    pub value_bits: u32,
     #[arg(long, default_value_t = 64)]
-    fingerprint_bits: u32,
+    pub fingerprint_bits: u32,
     #[arg(long, default_value_t = 8)]
-    plaintext_bits: u32,
+    pub plaintext_bits: u32,
     /// LWE dimension. Defaults to 1566 (Frodo) or 1275 (Simple) when omitted.
     #[arg(long)]
-    lwe_dim: Option<u32>,
+    pub lwe_dim: Option<u32>,
     /// Key-pool size: the bench rotates through this many distinct keys so
     /// repeated iterations do not reuse hot CPU-cache state from the previous call.
     #[arg(long, default_value_t = 64)]
-    batch: u32,
+    pub batch: u32,
 }
 
-fn effective_lwe_dim(cli: &Cli) -> u32 {
+pub fn effective_lwe_dim(cli: &Cli) -> u32 {
     cli.lwe_dim
         .unwrap_or_else(|| helpers::backend_default_lwe_dim(cli.backend))
 }
 
-fn run_one<S, B>(
-    csv: &mut std::io::BufWriter<std::fs::File>,
-    cli: &Cli,
-    arity: u32,
-    num_buckets: u32,
-    backend_config: B::Config,
-) where
+pub fn run_one<S, B, C>(cli: &Cli, arity: u32, num_buckets: u32, backend_config: B::Config)
+where
     S: MakeStore,
     B: IndexPirBackend
         + ParallelSetupBackend
         + IncrementalPirBackend
-        + ResponseRewind
         + PrecomputingPirBackend
         + BackendWireSize
         + Clone,
     B::Query: Clone,
     B::Response: Clone,
+    C: ClientFlow<B>,
 {
     use clap::parser::ValueSource;
     let (_, matches) = helpers::parse_cli_with_matches::<Cli>();
@@ -121,7 +126,7 @@ fn run_one<S, B>(
     // live to end-of-function and coexist with `client` — doubling peak `A`
     // RAM at paper-scale configs.
     let (query_bytes, response_bytes) = {
-        let mut probe: RewindClient<B> = RewindClient::from_setup_parallel(bundle.clone());
+        let mut probe: C = C::from_setup_parallel(bundle.clone());
         let probe_q = probe.build_query(&0u32.to_le_bytes());
         let rb = server.answer(&probe_q).expect("answer ok").wire_byte_size();
         let qb = probe_q.wire_byte_size();
@@ -150,6 +155,8 @@ fn run_one<S, B>(
         response_bytes,
         hint_delta_typical_bytes: None,
     };
+    let flow_slug = C::FLOW.replace('-', "_");
+    let bench_name = format!("{flow_slug}_decode");
     let knobs = [
         helpers::Knob {
             name: "backend",
@@ -192,23 +199,23 @@ fn run_one<S, B>(
             is_default: matches.value_source("batch") != Some(ValueSource::CommandLine),
         },
     ];
-    helpers::print_preamble("client_decode", &knobs, &store_state, &geom);
+    helpers::print_preamble(&bench_name, &knobs, &store_state, &geom);
 
     let n = n_inserted as u32;
     let keys: Vec<Vec<u8>> = (0..cli.batch)
         .map(|i| (i % n).to_le_bytes().to_vec())
         .collect();
 
-    let mut client: RewindClient<B> = RewindClient::from_setup_parallel(server.setup());
+    let mut client: C = C::from_setup_parallel(server.setup());
     // No upfront precompute — refill per criterion sample (see iter_custom below).
 
     let samples: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut idx = 0usize;
     {
         let mut c = helpers::configured_criterion();
-        let mut group = c.benchmark_group("client_decode");
+        let mut group = c.benchmark_group(bench_name.clone());
         group.throughput(Throughput::Elements(1));
-        group.bench_function("client_decode", |b| {
+        group.bench_function(bench_name.clone(), |b| {
             b.iter_custom(|iters| {
                 // Refill iters warm-bc slots (Phase B + C) before timing bracket.
                 client.precompute_queries(iters as u32);
@@ -253,64 +260,23 @@ fn run_one<S, B>(
         }
     };
 
+    let csv_name = format!("ikpir_{flow_slug}_decode.csv");
+    let mut csv = helpers::csv_writer(&csv_name, HEADER);
     writeln!(
         csv,
-        "{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{:.2},{:.2},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
-        cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits, cli.batch,
+        "{},{},{arity},{num_buckets},{},{},{},{lwe_dim_eff},{},{:.2},{:.2},{:.2},{:.2},{cps},{row_width},{segment_rows},{db_rows},{db_cols},{:.4}",
+        C::FLOW, cli.backend, cli.bucket_size, cli.value_bits, cli.plaintext_bits, cli.batch,
         crit.mean_ops_per_s, crit.min_ops_per_s, crit.max_ops_per_s, crit.stddev_ops_per_s,
         load_factor,
     ).unwrap();
     println!(
-        "  backend={} arity={arity} nb={num_buckets:<7} vb={:<4} | \
+        "  flow={} backend={} arity={arity} nb={num_buckets:<7} vb={:<4} | \
          mean={:.2} dps (±{:.2})",
-        cli.backend, cli.value_bits, crit.mean_ops_per_s, crit.stddev_ops_per_s,
+        C::FLOW,
+        cli.backend,
+        cli.value_bits,
+        crit.mean_ops_per_s,
+        crit.stddev_ops_per_s,
     );
-}
-
-fn dispatch_backend<S: MakeStore>(
-    csv: &mut std::io::BufWriter<std::fs::File>,
-    cli: &Cli,
-    arity: u32,
-    num_buckets: u32,
-) {
-    let lwe_dim = effective_lwe_dim(cli);
-    match cli.backend {
-        Backend::Frodo => run_one::<S, FrodoPirBackend>(
-            csv,
-            cli,
-            arity,
-            num_buckets,
-            FrodoConfig::with_lwe_dim(lwe_dim),
-        ),
-        Backend::Simple => run_one::<S, SimplePirBackend>(
-            csv,
-            cli,
-            arity,
-            num_buckets,
-            SimpleConfig::with_lwe_dim(lwe_dim),
-        ),
-    }
-}
-
-fn main() {
-    if helpers::skip_when_cargo_test() {
-        return;
-    }
-    let (cli, matches) = helpers::parse_cli_with_matches::<Cli>();
-    let num_buckets =
-        if matches.value_source("num_buckets") == Some(clap::parser::ValueSource::CommandLine) {
-            cli.num_buckets
-        } else {
-            helpers::default_num_buckets_for_arity(cli.arity)
-        };
-
-    let mut csv = helpers::csv_writer("ikpir_client_decode.csv", HEADER);
-
-    match cli.arity {
-        2 => dispatch_backend::<Segmented2aryScheme>(&mut csv, &cli, 2, num_buckets),
-        3 => dispatch_backend::<Segmented3aryScheme>(&mut csv, &cli, 3, num_buckets),
-        4 => dispatch_backend::<Segmented4aryScheme>(&mut csv, &cli, 4, num_buckets),
-        _ => unreachable!("clap value_parser bounds arity to 2..=4"),
-    }
-    println!("\nResults written to results/ikpir_client_decode.csv");
+    println!("\nResults written to results/{csv_name}");
 }

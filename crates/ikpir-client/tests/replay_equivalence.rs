@@ -3,8 +3,10 @@
 //!
 //! # Purpose
 //!
-//! `benches/server_mutation.rs` and `benches/client_mutation.rs` build one
-//! `IkpirServer` per config and rewind it between mutation sequences with
+//! `benches/server_mutation.rs` and `benches/flow_mutation_body.rs` (shared
+//! by `benches/client_hint_patch_mutation.rs` and
+//! `benches/client_rewind_mutation.rs`) build one `IkpirServer` per config
+//! and rewind it between mutation sequences with
 //! `IkpirServer::reset_for_replay` instead of paying a full setup per
 //! sequence. That is only a valid measurement if a rewound server produces
 //! exactly what a freshly built one would. This file pins that, for both

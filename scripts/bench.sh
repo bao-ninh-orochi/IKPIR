@@ -7,10 +7,16 @@
 # Usage:
 #   ./scripts/bench.sh <bench-name> [flags...]
 #
-# PIR benches (one config per run; all flags optional, defaults shown):
+# PIR benches (one config per run; all flags optional, defaults shown). Client
+# flows are always separate binaries — never a runtime flag — and always write
+# to separate CSV files, never merged:
 #   server_setup  server_answer  server_mutation  headtohead_answer
-#   client_query  client_decode  client_mutation  client_rewind_staleness
-#   headtohead_query  headtohead_decode
+#   client_query                                    flow-independent (build_query)
+#   client_hint_patch_decode    client_rewind_decode          measures decode, one per flow
+#   client_hint_patch_mutation  client_rewind_mutation        measures HintUpdate, one per flow
+#   client_rewind_staleness                         client-rewind only (ΔD staleness sweep)
+#   headtohead_query                                flow-independent (build_query)
+#   headtohead_hint_patch_decode  headtohead_rewind_decode    fixed-N decode, one per flow
 #
 #     --arity N            2 | 3 | 4                         (default 2)
 #     --num-buckets N                             (default: per-arity, dev scale)
@@ -41,7 +47,11 @@
 #                          force the reference schedule.
 #   Mutation benches also take:
 #     --n-mutations N      (default: 1% of the table's slots — the paper's τ)
+#   server_mutation and client_hint_patch_mutation also take:
 #     --patch-mode M       entry | row | entry,row           (default entry,row)
+#                          client_rewind_mutation has no --patch-mode flag (its
+#                          maintenance cost is patch-mode-independent); passing
+#                          it there is ignored, with a warning.
 #   Head-to-head benches also take:
 #     --num-keys N         (default: ~90% of capacity)
 #   Any other flag (--batch, --trials, --warmup, …) is forwarded to the bench
@@ -76,8 +86,10 @@
 #
 # Examples:
 #   ./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --bucket-size 4 --value-bits 8192
-#   ./scripts/bench.sh client_decode --backend simple
+#   ./scripts/bench.sh client_hint_patch_decode --backend simple
+#   ./scripts/bench.sh client_rewind_decode --backend simple
 #   ./scripts/bench.sh server_mutation --patch-mode entry
+#   ./scripts/bench.sh client_hint_patch_mutation --patch-mode entry
 #   ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
 #   ./scripts/bench.sh cuckoo_filter_insert_throughput                    # full Table 2 matrix
 #   ./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2   # one cell
@@ -164,8 +176,11 @@ ARGS=(--arity "$ARITY" --num-buckets "$NUM_BUCKETS" --bucket-size "$BUCKET_SIZE"
 if [[ -n "$LOAD_FACTOR" ]] && ! takes_load_factor "$BENCH"; then
     warn "$BENCH takes no --load-factor (it populates to TableFull, or to --num-keys); ignoring it"
 fi
-if [[ -n "$N_MUT$PATCH_MODE" ]] && ! is_mutation_bench "$BENCH"; then
-    warn "$BENCH is not a mutation bench; ignoring --n-mutations / --patch-mode"
+if [[ -n "$N_MUT" ]] && ! is_mutation_bench "$BENCH"; then
+    warn "$BENCH is not a mutation bench; ignoring --n-mutations"
+fi
+if [[ -n "$PATCH_MODE" ]] && ! takes_patch_mode "$BENCH"; then
+    warn "$BENCH takes no --patch-mode (only server_mutation and client_hint_patch_mutation sweep it); ignoring it"
 fi
 if [[ -n "$NUM_KEYS" ]] && ! is_headtohead_bench "$BENCH"; then
     warn "$BENCH takes no --num-keys (only the headtohead_* benches fix a key count); ignoring it"
@@ -175,8 +190,10 @@ if is_mutation_bench "$BENCH"; then
     # τ = PAPER_TAU_PERCENT of the table's slots, the paper's batch rule. There
     # is no upper clamp: the rule is what the paper's method sentence states, and
     # a clamp would only ever bind at paper scale — exactly where it must not.
-    ARGS+=(--n-mutations "${N_MUT:-$(tau_for_geometry "$NUM_BUCKETS" "$BUCKET_SIZE")}"
-           --patch-mode "${PATCH_MODE:-entry,row}")
+    ARGS+=(--n-mutations "${N_MUT:-$(tau_for_geometry "$NUM_BUCKETS" "$BUCKET_SIZE")}")
+    if takes_patch_mode "$BENCH"; then
+        ARGS+=(--patch-mode "${PATCH_MODE:-entry,row}")
+    fi
 fi
 
 if takes_load_factor "$BENCH"; then

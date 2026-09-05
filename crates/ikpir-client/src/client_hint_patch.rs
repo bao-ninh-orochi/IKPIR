@@ -28,7 +28,7 @@
 //! # Related files
 //!
 //! - `client_rewind.rs` — the client-rewind flow, `RewindClient`.
-//! - `benches/client_mutation.rs` — the `--update-mode patch` sweep.
+//! - `benches/client_hint_patch_mutation.rs` — the `--patch-mode` sweep.
 //! - `tests/client_flow_parity.rs` — the patch == rewind == fresh pin.
 
 use ikpir_common::{
