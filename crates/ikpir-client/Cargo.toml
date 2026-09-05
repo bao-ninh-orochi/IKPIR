@@ -33,11 +33,19 @@ name    = "client_query"
 harness = false
 
 [[bench]]
-name    = "client_decode"
+name    = "client_hint_patch_decode"
 harness = false
 
 [[bench]]
-name    = "client_mutation"
+name    = "client_rewind_decode"
+harness = false
+
+[[bench]]
+name    = "client_hint_patch_mutation"
+harness = false
+
+[[bench]]
+name    = "client_rewind_mutation"
 harness = false
 
 [[bench]]
@@ -49,5 +57,9 @@ name    = "headtohead_query"
 harness = false
 
 [[bench]]
-name    = "headtohead_decode"
+name    = "headtohead_hint_patch_decode"
+harness = false
+
+[[bench]]
+name    = "headtohead_rewind_decode"
 harness = false

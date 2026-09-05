@@ -38,8 +38,10 @@ IFS=',' read -ra BACKENDS <<< "${IKPIR_SMOKE_BACKENDS:-frodo,simple}"
 TINY=(--arity 2 --num-buckets 256 --bucket-size 4 --value-bits 2048)
 
 SMOKE_BENCHES=(server_setup server_answer server_mutation
-               client_query client_decode client_mutation client_rewind_staleness
-               headtohead_answer headtohead_query headtohead_decode)
+               client_query client_hint_patch_decode client_rewind_decode
+               client_hint_patch_mutation client_rewind_mutation client_rewind_staleness
+               headtohead_answer headtohead_query
+               headtohead_hint_patch_decode headtohead_rewind_decode)
 
 for be in "${BACKENDS[@]}"; do
     validate_backend "$be"

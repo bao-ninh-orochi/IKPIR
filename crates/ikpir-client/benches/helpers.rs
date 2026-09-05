@@ -13,7 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use criterion::{Criterion, Throughput};
-use ikpir_client::{IncrementalPirBackend, ResponseRewind, RewindClient};
+use ikpir_client::{
+    HintDeltaBundle, HintPatchClient, IkpirClientError, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, PirQueryBundle, PirResponseBundle, PrecomputingPirBackend,
+    ResponseRewind, RewindClient, ServerSetupBundle,
+};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{IndexScheme, SchemeMeta};
 
@@ -176,40 +180,134 @@ pub fn patch_modes_label(modes: &[PatchMode]) -> String {
         .join(",")
 }
 
-/// Client update-strategy selector for the mutation bench.
+// ── The two client flows, unified for the shared bench bodies ──────────────
+
+/// Bench-local unification of the two first-class client flows
+/// (`ikpir_client::HintPatchClient` / `ikpir_client::RewindClient`), so a
+/// single generic bench body — `benches/flow_decode_body.rs`,
+/// `benches/flow_headtohead_decode_body.rs`, `benches/flow_mutation_body.rs`
+/// — can drive either flow without dynamic dispatch: the flow is chosen at
+/// the type `C`, monomorphised per thin binary, exactly like the backend is
+/// chosen at `B`. **Not** part of `ikpir-client`'s public API — this trait
+/// exists only to let the bench bodies stay generic.
 ///
-/// `patch` → client-hint-patch (`HintPatchClient::apply_delta`,
-/// `Θ(n·τ·ω)` per batch — the client patches its whole hint). `rewind` →
-/// client-rewind (`RewindClient::accumulate_delta`, `Θ(τ·ω)` — the client
-/// accumulates the published `ΔD`, a cheaper maintenance). The
-/// mutation bench sweeps both for the head-to-head client-maintenance
-/// column; both decode the same value.
+/// `decode` always takes the query bundle so both flows share one call
+/// shape; `HintPatchClient`'s implementation ignores it (a borrow, never
+/// cloned) and forwards to the real 2-arg `HintPatchClient::decode(key,
+/// resp)` — so the timed region a hint-patch decode bench measures is
+/// exactly that 2-arg call, no query threading, no extra clone.
 #[allow(dead_code)]
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UpdateMode {
-    /// Hint-patch: `HintPatchClient::apply_delta` patches the hint.
-    Patch,
-    /// Response-rewind: `RewindClient::accumulate_delta` rolls up `ΔD`.
-    Rewind,
+pub trait ClientFlow<B>: Sized
+where
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + PrecomputingPirBackend,
+    B::Query: Clone,
+    B::Response: Clone,
+{
+    /// `"client-hint-patch"` or `"client-rewind"` — the literal value CSV
+    /// rows and file names are derived from.
+    const FLOW: &'static str;
+    /// Multi-threaded bootstrap — see `RewindClient` / `HintPatchClient`'s
+    /// own `from_setup_parallel`. No bench reports client-bootstrap cost.
+    fn from_setup_parallel(bundle: ServerSetupBundle<B>) -> Self;
+    /// Build a per-segment query for `key`. Identical on both flows.
+    fn build_query(&mut self, key: &[u8]) -> PirQueryBundle<B>;
+    /// Decode `resp` for `key`. `q` is the matching query bundle;
+    /// client-hint-patch ignores it (its real `decode` takes only `key` and
+    /// `resp`), client-rewind uses it to rewind the response to its pinned
+    /// hint before decoding.
+    fn decode(
+        &self,
+        key: &[u8],
+        q: &PirQueryBundle<B>,
+        r: &PirResponseBundle<B>,
+    ) -> Result<Option<Vec<u8>>, IkpirClientError>;
+    /// Consume one published delta: `HintPatchClient::apply_delta` (folds
+    /// into the hint) or `RewindClient::accumulate_delta` (rolls `ΔD`
+    /// forward).
+    fn sync_delta(&mut self, delta: HintDeltaBundle<B>) -> Result<(), IkpirClientError>;
+    /// Phase B amortisation — see `PrecomputingPirBackend`.
+    fn precompute_queries(&mut self, count: u32);
+    /// Phase C amortisation — see `PrecomputingPirBackend`.
+    fn precompute_decodes(&mut self);
+    /// Accumulated `|ΔD|` — always 0 for client-hint-patch (there is no
+    /// accumulator; the hint always tracks the head).
+    fn pending_cells(&self) -> usize;
 }
 
-impl std::fmt::Display for UpdateMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Patch => write!(f, "patch"),
-            Self::Rewind => write!(f, "rewind"),
-        }
+impl<B> ClientFlow<B> for HintPatchClient<B>
+where
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + PrecomputingPirBackend,
+    B::Query: Clone,
+    B::Response: Clone,
+{
+    const FLOW: &'static str = "client-hint-patch";
+
+    fn from_setup_parallel(bundle: ServerSetupBundle<B>) -> Self {
+        Self::from_setup_parallel(bundle)
+    }
+    fn build_query(&mut self, key: &[u8]) -> PirQueryBundle<B> {
+        Self::build_query(self, key)
+    }
+    fn decode(
+        &self,
+        key: &[u8],
+        _q: &PirQueryBundle<B>,
+        r: &PirResponseBundle<B>,
+    ) -> Result<Option<Vec<u8>>, IkpirClientError> {
+        Self::decode(self, key, r)
+    }
+    fn sync_delta(&mut self, delta: HintDeltaBundle<B>) -> Result<(), IkpirClientError> {
+        Self::apply_delta(self, delta)
+    }
+    fn precompute_queries(&mut self, count: u32) {
+        Self::precompute_queries(self, count);
+    }
+    fn precompute_decodes(&mut self) {
+        Self::precompute_decodes(self);
+    }
+    fn pending_cells(&self) -> usize {
+        0
     }
 }
 
-/// Render an `--update-mode` list for the bench preamble (e.g. `patch,rewind`).
-#[allow(dead_code)]
-pub fn update_modes_label(modes: &[UpdateMode]) -> String {
-    modes
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
+impl<B> ClientFlow<B> for RewindClient<B>
+where
+    B: IndexPirBackend
+        + ParallelSetupBackend
+        + IncrementalPirBackend
+        + PrecomputingPirBackend
+        + ResponseRewind,
+    B::Query: Clone,
+    B::Response: Clone,
+{
+    const FLOW: &'static str = "client-rewind";
+
+    fn from_setup_parallel(bundle: ServerSetupBundle<B>) -> Self {
+        Self::from_setup_parallel(bundle)
+    }
+    fn build_query(&mut self, key: &[u8]) -> PirQueryBundle<B> {
+        Self::build_query(self, key)
+    }
+    fn decode(
+        &self,
+        key: &[u8],
+        q: &PirQueryBundle<B>,
+        r: &PirResponseBundle<B>,
+    ) -> Result<Option<Vec<u8>>, IkpirClientError> {
+        Self::decode(self, key, q, r)
+    }
+    fn sync_delta(&mut self, delta: HintDeltaBundle<B>) -> Result<(), IkpirClientError> {
+        Self::accumulate_delta(self, delta)
+    }
+    fn precompute_queries(&mut self, count: u32) {
+        Self::precompute_queries(self, count);
+    }
+    fn precompute_decodes(&mut self) {
+        Self::precompute_decodes(self);
+    }
+    fn pending_cells(&self) -> usize {
+        Self::pending_cells(self)
+    }
 }
 
 // ── Default num_buckets per arity ────────────────────────────────────────────
@@ -478,19 +576,22 @@ pub fn populate_value_for_key(key: u32, value_bits: u32) -> Vec<u8> {
 /// bad `plaintext_bits` operating point fails per *query* with modest
 /// probability (the dominant LWE noise term is shared across a response),
 /// several independent queries are needed for the check to have power.
-/// The cost is negligible next to populate + setup.
+/// The cost is negligible next to populate + setup. Flow-generic via
+/// [`ClientFlow`], so it backs the `headtohead_{hint_patch,rewind}_decode`
+/// sanity checks on either flow.
 #[allow(dead_code)]
-pub fn verify_decode<B, S>(
-    client: &mut RewindClient<B>,
+pub fn verify_decode<B, S, C>(
+    client: &mut C,
     server: &IkpirServer<S, B>,
     first_key: u32,
     n_keys: u32,
     value_bits: u32,
 ) where
     S: IndexScheme + SchemeMeta,
-    B: IncrementalPirBackend + ResponseRewind,
+    B: IndexPirBackend + ParallelSetupBackend + IncrementalPirBackend + PrecomputingPirBackend,
     B::Query: Clone,
     B::Response: Clone,
+    C: ClientFlow<B>,
 {
     assert!(n_keys > 0, "verify_decode: n_keys must be positive");
     let mut vsize = 0usize;
