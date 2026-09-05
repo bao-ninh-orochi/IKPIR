@@ -64,36 +64,47 @@ assert_eq!(v, &[0x01u8]);
 
 ## Benches
 
-Six focused `clap`-parsed CSV-emitting benches under `benches/`. The
-recommended way to run one is the workspace runner
+Nine focused `clap`-parsed CSV-emitting benches under `benches/`. The client
+flow is always a separate binary, never a runtime flag, and **benchmark data
+of the two flows is always written to separate CSV files and never merged**;
+`client_query` and `headtohead_query` are the only client-side benches
+without a per-flow pair, because `build_query` is identical code on both
+flows. The recommended way to run one is the workspace runner
 [`../../scripts/bench.sh`](../../scripts/bench.sh), which auto-derives the largest
 correct `--plaintext-bits` and the backend `--lwe-dim`, and routes output to
 `results/ikpir-client/`:
 
 ```bash
-./scripts/bench.sh client_decode --arity 4 --num-buckets 65536 --value-bits 256
-./scripts/bench.sh client_mutation --patch-mode entry,row
+./scripts/bench.sh client_hint_patch_decode --arity 4 --num-buckets 65536 --value-bits 256
+./scripts/bench.sh client_rewind_decode --arity 4 --num-buckets 65536 --value-bits 256
+./scripts/bench.sh client_hint_patch_mutation --patch-mode entry,row
+./scripts/bench.sh client_rewind_mutation
 ./scripts/bench.sh                              # -h: full flag + bench list
 ```
 
-Each invocation is one config = one appended CSV row (`client_mutation` emits
-one row per `(update mode, patch mode, kind)` combination). `client_query` /
-`client_decode` run in **warm-bc** mode (precompute before the timed loop);
-`client_mutation` runs in **empty-queue** mode so its `rewind` leg times the
-client-rewind flow's `accumulate_delta` (`ΔD` roll-forward) in isolation,
-and its `patch` leg times the client-hint-patch flow's `HintPatchClient::apply_delta`.
-The root [README](../../README.md#benches) has the paper config matrix.
+Each invocation is one config = one appended CSV row (the mutation benches
+emit one row per `(patch mode, kind)` for client-hint-patch, one per `kind`
+for client-rewind). `client_query` / `client_{hint_patch,rewind}_decode` run
+in **warm-bc** mode (precompute before the timed loop); `client_rewind_mutation`
+runs in **empty-queue** mode so it times the client-rewind flow's
+`accumulate_delta` (`ΔD` roll-forward) in isolation, and
+`client_hint_patch_mutation` times the client-hint-patch flow's
+`HintPatchClient::apply_delta` the same way. The root
+[README](../../README.md#benches) has the paper config matrix.
 
 ### Bench overview
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
-| `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
-| `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
-| `client_mutation` | `--load-factor` (0.90) | per-batch maintenance throughput per (kind, `--update-mode` patch\|rewind [, `--patch-mode` entry\|row]); `patch` times `HintPatchClient::apply_delta`, `rewind` times `RewindClient::accumulate_delta` | `ikpir_client_mutation.csv` |
+| `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc); flow-independent | `ikpir_client_query.csv` |
+| `client_hint_patch_decode` | `TableFull` | client-hint-patch's `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_hint_patch_decode.csv` |
+| `client_rewind_decode` | `TableFull` | client-rewind's `decode` rate at empty `ΔD` (queries/sec, criterion, warm-bc) | `ikpir_client_rewind_decode.csv` |
+| `client_hint_patch_mutation` | `--load-factor` (0.90) | per-batch maintenance throughput per (kind, `--patch-mode` entry\|row); times `HintPatchClient::apply_delta` | `ikpir_client_hint_patch_mutation.csv` |
+| `client_rewind_mutation` | `--load-factor` (0.90) | per-batch maintenance throughput per kind (no `--patch-mode`); times `RewindClient::accumulate_delta` | `ikpir_client_rewind_mutation.csv` |
 | `client_rewind_staleness` | `--load-factor` (0.90) | `decode` per-query latency vs staleness \|ΔD\|, then post-`collect_garbage` | `ikpir_client_rewind_staleness.csv` |
-| `headtohead_query` | fixed `--num-keys` | `build_query` rate at a fixed keyword count; +`num_keys`/`db_size` cols | `ikpir_headtohead_client_query.csv` |
-| `headtohead_decode` | fixed `--num-keys` | `decode` rate at a fixed keyword count; +`num_keys`/`db_size` cols | `ikpir_headtohead_client_decode.csv` |
+| `headtohead_query` | fixed `--num-keys` | `build_query` rate at a fixed keyword count; +`num_keys`/`db_size` cols; flow-independent | `ikpir_headtohead_client_query.csv` |
+| `headtohead_hint_patch_decode` | fixed `--num-keys` | client-hint-patch's `decode` rate at a fixed keyword count; +`num_keys`/`db_size` cols | `ikpir_headtohead_client_hint_patch_decode.csv` |
+| `headtohead_rewind_decode` | fixed `--num-keys` | client-rewind's `decode` rate at a fixed keyword count; +`num_keys`/`db_size` cols | `ikpir_headtohead_client_rewind_decode.csv` |
 
 `num_buckets` constraints differ per arity: 2-ary `2^t`, 3-ary `3·2^t`, 4-ary `2^t ≥ 4`.
 
@@ -109,12 +120,14 @@ The root [README](../../README.md#benches) has the paper config matrix.
 | `--plaintext-bits <N>` | `8` bench / max via `bench.sh` | PIR cell width |
 | `--lwe-dim <N>` | 1566 (frodo) / 1275 (simple) | LWE dimension |
 
-Bench-specific: `client_query` / `client_decode` / `headtohead_*` take `--batch`
-(key-pool size); `client_mutation` takes `--update-mode patch\|rewind` (comma
-list, default `patch,rewind`), `--patch-mode entry\|row` (comma list, default
-`entry`, applies only to `patch`), `--n-mutations`, `--load-factor`;
+Bench-specific: `client_query` / `client_{hint_patch,rewind}_decode` /
+`headtohead_*` take `--batch` (key-pool size); `client_hint_patch_mutation`
+takes `--patch-mode entry\|row` (comma list, default `entry`) — no such flag
+on `client_rewind_mutation`, whose maintenance cost is patch-mode-independent
+— plus `--n-mutations`, `--load-factor` on both mutation benches;
 `client_rewind_staleness` takes `--batch-size`, `--staleness-steps`,
-`--queries`; `headtohead_query` / `headtohead_decode` require `--num-keys`.
+`--queries`; `headtohead_query` / `headtohead_{hint_patch,rewind}_decode`
+require `--num-keys`.
 
 ### Low-level: `cargo bench`
 
@@ -123,8 +136,8 @@ list, default `patch,rewind`), `--patch-mode entry\|row` (comma list, default
 `results/` unless `IKPIR_RESULTS_DIR` is set:
 
 ```bash
-cargo bench -p ikpir-client --bench client_decode -- --backend simple --plaintext-bits 10
-cargo bench -p ikpir-client --bench client_mutation -- --patch-mode entry,row --n-mutations 64
+cargo bench -p ikpir-client --bench client_hint_patch_decode -- --backend simple --plaintext-bits 10
+cargo bench -p ikpir-client --bench client_rewind_mutation -- --n-mutations 64
 cargo bench -p ikpir-client --bench <name> -- --help
 ```
 
@@ -179,7 +192,7 @@ let client = RewindClient::<FrodoPirBackend>::from_setup_parallel(bundle);
 ```
 
 Worker count comes from `IKPIR_SETUP_THREADS`, else the machine's available
-parallelism. All six benches use the parallel path — none of them reports
+parallelism. All nine benches use the parallel path — none of them reports
 client-bootstrap cost.
 
 See [`../../docs/rewind-client-mode.md`](../../docs/rewind-client-mode.md)

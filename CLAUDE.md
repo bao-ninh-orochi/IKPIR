@@ -103,13 +103,20 @@ state machine, failure-mode table, and entry-point map.
 
 ## Benches
 
-Ten focused `clap`-parsed PIR benches — four server (`server_setup`,
-`server_answer`, `server_mutation`, `headtohead_answer`) and six client
-(`client_query`, `client_decode`, `client_mutation`, `client_rewind_staleness`,
-`headtohead_query`, `headtohead_decode`) — emit CSV under `results/<crate>/`.
-Each invocation = one config = one CSV row (`client_mutation` emits one row per
-`(update mode, patch mode, kind)`; the `headtohead_*` benches fix `--num-keys`
-and add `num_keys`/`db_size` columns for the fixed-N comparison vs ChalametPIR /
+Thirteen focused `clap`-parsed PIR benches — four server (`server_setup`,
+`server_answer`, `server_mutation`, `headtohead_answer`) and nine client
+(`client_query`, `client_hint_patch_decode`, `client_rewind_decode`,
+`client_hint_patch_mutation`, `client_rewind_mutation`,
+`client_rewind_staleness`, `headtohead_query`, `headtohead_hint_patch_decode`,
+`headtohead_rewind_decode`) — emit CSV under `results/<crate>/`. The client
+flow (client-hint-patch vs client-rewind) is always a separate binary, never a
+runtime flag, and the two flows' benchmark data is always written to separate
+CSV files and never merged — `client_query` and `headtohead_query` are the
+exception, flow-independent because `build_query` is the same code in both
+flows. Each invocation = one config = one CSV row (the mutation benches emit
+one row per `(patch mode, kind)` for client-hint-patch, one per `kind` for
+client-rewind; the `headtohead_*` benches fix `--num-keys` and add
+`num_keys`/`db_size` columns for the fixed-N comparison vs ChalametPIR /
 Hao 2025).
 
 `segmented-cuckoo` adds eight filter/KV-store benches: five `cuckoo_filter_*`
@@ -167,12 +174,16 @@ CSV row carries its `plaintext_bits`. The `#[ignore]`d `noise_margin` tests in
 `ikpir-common` (`cargo test -p ikpir-common --release -- --ignored
 noise_margin`) validate the selected operating points empirically.
 
-The mutation benches (`server_mutation`, `client_mutation`) sweep the
-hint-patch realization via `--patch-mode entry|row` (bench CLI default `entry`;
-`bench.sh` passes `entry,row`), emitting one CSV row per `(patch mode, kind)`
-pair with a `patch_mode` column — the empirical counterpart of the paper's
-row-level vs entry-level mutation columns. Both build **one** server per
-config and rewind it between `(patch mode, kind)` sequences with
+The mutation benches (`server_mutation`, `client_hint_patch_mutation`) sweep
+the hint-patch realization via `--patch-mode entry|row` (bench CLI default
+`entry`; `bench.sh` passes `entry,row`), emitting one CSV row per
+`(patch mode, kind)` pair with a `patch_mode` column — the empirical
+counterpart of the paper's row-level vs entry-level mutation columns.
+`client_rewind_mutation` has no `--patch-mode` flag — its maintenance cost
+(`RewindClient::accumulate_delta`) is patch-mode-independent — and emits one
+row per `kind` with a `pending_cells` column instead. All three build **one**
+server (or, client-side, one server + client) per config and rewind it
+between sequences with
 `IkpirServer::reset_for_replay` (fresh store from the snapshot cells, clone of
 the epoch-0 hints; the seed-derived `A` is kept), so a config pays the
 `Θ(d·ρ·n·ω)` setup once rather than once per sequence;
@@ -260,14 +271,15 @@ Why these, and not others:
 ```bash
 # One bench at one config, DEV scale (auto pb + lwe; results → results/<crate>/).
 ./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --value-bits 8192
-./scripts/bench.sh client_mutation --backend simple --patch-mode entry,row
+./scripts/bench.sh client_hint_patch_mutation --backend simple --patch-mode entry,row
+./scripts/bench.sh client_rewind_mutation --backend simple
 ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
 
 # Reproduce a paper table end to end (paper geometry, from the matrix above).
-./scripts/table2.sh                    # filter: SCF vs standard, five configs
-./scripts/table3.sh                    # online: query / response / answer
-./scripts/table4.sh --arity 3          # mutation: the full-paper arity-3 cells
-./scripts/table5.sh --backend frodo    # setup: RisePIR-F rows only
+./scripts/table2.sh                                # filter: SCF vs standard, five configs
+./scripts/table3.sh                                # online: query / response / answer, both flows
+./scripts/table4.sh --arity 3 --flow client-rewind # mutation: full-paper arity-3 cells, one flow
+./scripts/table5.sh --backend frodo                # setup: RisePIR-F rows only
 
 # One segmented-cuckoo bench: no flags = the full Table 2 matrix.
 ./scripts/bench.sh cuckoo_filter_insert_throughput --arity 4 --bucket-size 2

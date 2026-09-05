@@ -175,27 +175,38 @@ differs (`apply_delta` on `HintPatchClient`, `accumulate_delta` on
 | Task | Where to look |
 |---|---|
 | Integration tests | `tests/client_hint_patch_e2e.rs` + `tests/client_hint_patch_simple_e2e.rs` — client-hint-patch, `FrodoPirBackend` / `SimplePirBackend`, arities 2/3/4; `tests/client_rewind_e2e.rs` + `tests/client_rewind_simple_e2e.rs` — client-rewind, same matrix; `tests/client_flow_parity.rs` — both flows decode identically and equal a fresh client at the head (fixed mixed traces × both backends × arities 2/3/4, GC-then-query, post-pin insert, plus a proptest over random insert/update/delete traces); `tests/replay_equivalence.rs` — the mutation benches' `reset_for_replay` harness measures what a fresh setup would (both backends, arities 2/3/4, plus a stale-hints negative control) |
-| Benches | `benches/client_query.rs`, `benches/client_decode.rs`, `benches/client_mutation.rs` (`--update-mode patch,rewind`, no Cargo feature needed), `benches/client_rewind_staleness.rs`, `benches/headtohead_query.rs`, `benches/headtohead_decode.rs`. All accept `--backend frodo\|simple`; run via `../../scripts/bench.sh <name>` |
+| Benches | `benches/client_query.rs`, `benches/client_rewind_staleness.rs`, `benches/headtohead_query.rs` (flow-independent) plus a client-hint-patch / client-rewind pair each for decode (`client_hint_patch_decode.rs` / `client_rewind_decode.rs`), mutation (`client_hint_patch_mutation.rs` / `client_rewind_mutation.rs`), and head-to-head decode (`headtohead_hint_patch_decode.rs` / `headtohead_rewind_decode.rs`) — every pair a thin binary over a shared generic body (`benches/flow_decode_body.rs`, `benches/flow_headtohead_decode_body.rs`, `benches/flow_mutation_body.rs`). No Cargo feature needed — the flow is chosen at the type, monomorphised per binary. All accept `--backend frodo\|simple`; run via `../../scripts/bench.sh <name>` |
 | Backend enum (bench CLI) | `benches/helpers.rs::Backend` + `backend_default_lwe_dim` — duplicated in `ikpir-server/benches/helpers.rs` |
 
 ### Bench layer (under `benches/`)
 
-Six focused benches covering classical and incremental client criteria for the paper:
+Nine focused benches covering classical and incremental client criteria for
+the paper. The client flow is always a separate binary, never a runtime flag,
+and **benchmark data of the two flows is always written to separate CSV
+files and never merged**:
 
 | Bench | Populate to | What it measures | CSV |
 |---|---|---|---|
-| `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc) | `ikpir_client_query.csv` |
-| `client_decode` | `TableFull` | `decode` rate (queries/sec, criterion, warm-bc) | `ikpir_client_decode.csv` |
-| `client_mutation` | `--load-factor` (0.90) | per-batch **maintenance** throughput per (kind, `--update-mode` patch\|rewind [, `--patch-mode` entry\|row]): `patch` times the client-hint-patch flow's `HintPatchClient::apply_delta`, `rewind` times the client-rewind flow's `RewindClient::accumulate_delta`; wall-clock, empty queue; `pending_cells` = final \|ΔD\| (0 for `patch`); one setup per config, deltas collected from a server rewound per kind with `reset_for_replay` | `ikpir_client_mutation.csv` |
+| `client_query` | `TableFull` | `build_query` rate (queries/sec, criterion, warm-bc); flow-independent — `build_query` is the same code in both flows | `ikpir_client_query.csv` |
+| `client_hint_patch_decode` | `TableFull` | client-hint-patch's `HintPatchClient::decode(key, resp)` rate (queries/sec, criterion, warm-bc) — the flow the CANS 2026 camera-ready reports | `ikpir_client_hint_patch_decode.csv` |
+| `client_rewind_decode` | `TableFull` | client-rewind's `RewindClient::decode(key, query, resp)` rate at empty `ΔD` (queries/sec, criterion, warm-bc) — the flow the extended (full) paper reports | `ikpir_client_rewind_decode.csv` |
+| `client_hint_patch_mutation` | `--load-factor` (0.90) | per-batch **maintenance** throughput per (kind, `--patch-mode` entry\|row): times `HintPatchClient::apply_delta`; wall-clock, empty queue; one setup per config, deltas collected from a server rewound per kind with `reset_for_replay` | `ikpir_client_hint_patch_mutation.csv` |
+| `client_rewind_mutation` | `--load-factor` (0.90) | per-batch **maintenance** throughput per kind (no `--patch-mode` — patch-mode-independent): times `RewindClient::accumulate_delta`; wall-clock, empty queue; `pending_cells` = final \|ΔD\| | `ikpir_client_rewind_mutation.csv` |
 | `client_rewind_staleness` | `--load-factor` (0.90) | `RewindClient::decode` per-query latency vs staleness \|ΔD\| (one client accumulates over `--staleness-steps` × `--batch-size` updates, never GC'd, then a `collect_garbage` returns it to baseline); times only `decode` | `ikpir_client_rewind_staleness.csv` |
-| `headtohead_query` | fixed `--num-keys` | `build_query` rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `client_query` + `num_keys`/`db_size` columns | `ikpir_headtohead_client_query.csv` |
-| `headtohead_decode` | fixed `--num-keys` | `decode` rate at a fixed keyword count; mirrors `client_decode` + `num_keys`/`db_size` columns, with the once-per-config `verify_decode` sanity check | `ikpir_headtohead_client_decode.csv` |
+| `headtohead_query` | fixed `--num-keys` | `build_query` rate at a fixed keyword count (fair comparison vs ChalametPIR / Hao 2025); mirrors `client_query` + `num_keys`/`db_size` columns; flow-independent | `ikpir_headtohead_client_query.csv` |
+| `headtohead_hint_patch_decode` | fixed `--num-keys` | client-hint-patch's `decode` rate at a fixed keyword count; mirrors `client_hint_patch_decode` + `num_keys`/`db_size` columns, with the once-per-config `verify_decode` sanity check | `ikpir_headtohead_client_hint_patch_decode.csv` |
+| `headtohead_rewind_decode` | fixed `--num-keys` | client-rewind's `decode` rate at a fixed keyword count; mirrors `client_rewind_decode` + `num_keys`/`db_size` columns, with the once-per-config `verify_decode` sanity check | `ikpir_headtohead_client_rewind_decode.csv` |
 
-`client_query` and `client_decode` use **warm-bc** mode (precompute the
+`client_{hint_patch,rewind}_decode` use **warm-bc** mode (precompute the
 prepared-query queue + decode material before the timed loop), so the
-timed call hits the cheap amortised path.
+timed call hits the cheap amortised path. For client-hint-patch the timed
+call is the real 2-arg `HintPatchClient::decode(key, resp)` — no query
+threading, no response clone — even though the shared `ClientFlow::decode`
+trait method used by the generic bench body takes a `query` parameter for
+both flows uniformly; `HintPatchClient`'s implementation just ignores it
+(a borrow, never cloned).
 
-`client_mutation` runs the
+`client_hint_patch_mutation` / `client_rewind_mutation` run the
 client in **empty-queue** mode (no `precompute_queries` /
 `precompute_decodes`). Each `apply_delta` / `accumulate_delta` then patches
 only the hint `H` / rolls `ΔD` forward — the queue-iteration inside
@@ -207,6 +218,16 @@ queue-maintenance overhead mixed in.
   `parse_cli` / `parse_cli_with_matches`). Per-arity dispatch happens
   through `MakeStore` / `CloneStore`; the typed scheme is picked once in
   `main` based on `--arity`.
+- **Flow dispatch.** The client-hint-patch / client-rewind pairs are thin
+  binaries: `mod helpers; mod flow_{decode,headtohead_decode,mutation}_body;`
+  plus a `dispatch_backend` that matches `--backend` and calls the shared
+  body's generic `run_one::<S, B, C>` with `C = HintPatchClient<B>` or
+  `RewindClient<B>` named explicitly per arm — the only place the flow's
+  concrete type appears. Every other line (CLI struct, preamble, populate,
+  setup, the criterion/wall-clock loop, CSV writing) lives once in the body
+  file, generic over `C: helpers::ClientFlow<B>` (decode bodies) or
+  `C: MutationFlow<B>` (the mutation body's small extension of it, in
+  `flow_mutation_body.rs`) — never dynamic dispatch in the timed loop.
 - **Backend dispatch.** Every bench exposes `--backend frodo|simple`
   (default `frodo`). A two-level match in `main` picks the typed
   `<S, B>` pair; `run_one` is generic over both. `--lwe-dim` defaults
@@ -219,19 +240,22 @@ queue-maintenance overhead mixed in.
   uses the largest `pb` admitted by the backend's correctness bound at
   `q = 2^32`. The chosen value is written to every CSV row as the
   `plaintext_bits` column.
-- **Patch modes.** `client_mutation` accepts `--patch-mode entry|row`
-  (comma-separated list, default `entry`) and emits one CSV row per
-  `(patch mode, kind)` pair; the `patch_mode` column records which
-  `HintPatchMode` realization the client-hint-patch flow's
-  `HintPatchClient` used for its timed `apply_delta` loop (`patch_mode`
-  = `-` for `rewind` rows, which are patch-mode-independent). Deltas
-  are collected once per kind (identical under either mode) and replayed
-  per mode — from **one** server per config, rewound before each kind with
+- **Patch modes.** `client_hint_patch_mutation` accepts `--patch-mode
+  entry|row` (comma-separated list, default `entry`) and emits one CSV row
+  per `(patch mode, kind)` pair; the `patch_mode` column records which
+  `HintPatchMode` realization `HintPatchClient` used for its timed
+  `apply_delta` loop. `client_rewind_mutation` has no `--patch-mode` flag —
+  `RewindClient::accumulate_delta` is patch-mode-independent — and instead
+  carries a `pending_cells` column (final \|ΔD\|). Deltas are collected once
+  per kind (identical regardless of patch mode) and replayed per variant —
+  from **one** server per config, rewound before each kind with
   `IkpirServer::reset_for_replay` (fresh store from the snapshot cells,
   clone of the epoch-0 hints), whose epoch-0 `setup()` bundle also
   bootstraps every timed client. `tests/replay_equivalence.rs` pins that a
   replay yields the same deltas as a fresh setup. `scripts/bench.sh`
-  passes `entry,row` by default.
+  passes `entry,row` by default (only to `client_hint_patch_mutation` and
+  `server_mutation`; forwarding it to `client_rewind_mutation` is a no-op
+  with a warning).
 - **Runner.** `scripts/bench.sh <bench> [flags]` maps the bench to its
   crate, auto-derives `--plaintext-bits` / `--lwe-dim`, and exports
   `IKPIR_RESULTS_DIR=results/ikpir-client` before `cargo bench`. One
@@ -239,22 +263,30 @@ queue-maintenance overhead mixed in.
   `IKPIR_RESULTS_DIR`; default `results/`). Its geometry defaults are dev
   scale, not the paper's: the paper matrix lives in `scripts/lib.sh`
   (`PAPER_*`) and is swept by `scripts/table3.sh` (online, via
-  `headtohead_{query,decode}`) and `table4.sh` (mutation, via
-  `client_mutation`). `scripts/smoke.sh` runs every PIR bench tiny.
+  `headtohead_{query,hint_patch_decode,rewind_decode}`) and `table4.sh`
+  (mutation, via `client_{hint_patch,rewind}_mutation`) — both take
+  `--flow client-hint-patch|client-rewind|all` to pick which flow's leg
+  runs. `scripts/smoke.sh` runs every PIR bench tiny.
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — a common core is mirrored in `ikpir-server/benches/helpers.rs`,
-  but this copy additionally carries `verify_decode`, which round-trips
-  through both client and server — a dev-dep cycle on the server side —
-  and backs the `client_decode` / `headtohead_decode` sanity checks):
+  but this copy additionally carries `verify_decode` — flow-generic via
+  `ClientFlow`, round-trips through both client and server — a dev-dep
+  cycle on the server side — and backs the `headtohead_{hint_patch,rewind}_decode`
+  sanity checks) plus the bench-local `ClientFlow<B>` trait: unifies
+  `HintPatchClient<B>` and `RewindClient<B>` behind one interface
+  (`FLOW`, `build_query`, `decode`, `sync_delta`, `precompute_{queries,decodes}`,
+  `pending_cells`) so the shared body files stay generic instead of
+  duplicating per-flow logic; not part of `ikpir-client`'s public API:
     - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard
       `=== <bench> ===` / Parameters / KV store / Geometry banner.
     - `configured_criterion()` — the `Criterion` pinned to the shared
       Table 3 contract (100 samples, 3 s warm-up, 5 s measurement), which
-      `client_query`, `client_decode`, `headtohead_query`, and
-      `headtohead_decode` drive directly through `iter_custom`.
-- `client_mutation` uses wall-clock `Instant` batch timing (not criterion)
+      `client_query`, `client_{hint_patch,rewind}_decode`, `headtohead_query`,
+      and `headtohead_{hint_patch,rewind}_decode` drive directly through
+      `iter_custom`.
+- The mutation benches use wall-clock `Instant` batch timing (not criterion)
   because `apply_delta` / `accumulate_delta` advances the client epoch with
   each call; criterion's cycling pattern is not meaningful when state
   changes between calls.

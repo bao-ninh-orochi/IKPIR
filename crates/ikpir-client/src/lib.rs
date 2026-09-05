@@ -115,10 +115,16 @@
 //! assert_eq!(v, vec![0xAB]);
 //! ```
 //!
-//! For systematic measurement of build_query / decode / accumulate_delta
-//! across parameter ranges, see
-//! `benches/{client_query,client_decode,client_mutation,client_rewind_staleness,headtohead_query,headtohead_decode}.rs`,
-//! run via the `scripts/bench.sh <name>` runner at the workspace root.
+//! For systematic measurement of build_query / decode / apply_delta /
+//! accumulate_delta across parameter ranges, see the nine
+//! `benches/*.rs` binaries — `client_query`, `client_rewind_staleness`,
+//! `headtohead_query` (flow-independent), plus a client-hint-patch /
+//! client-rewind pair each for decode
+//! (`client_{hint_patch,rewind}_decode`), mutation
+//! (`client_{hint_patch,rewind}_mutation`), and head-to-head decode
+//! (`headtohead_{hint_patch,rewind}_decode`) — run via the
+//! `scripts/bench.sh <name>` runner at the workspace root. Benchmark data of
+//! the two flows is always written to separate CSV files and never merged.
 
 mod client_hint_patch;
 mod client_rewind;

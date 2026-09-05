@@ -164,15 +164,20 @@ table above is the disambiguation.
 
 ## Benches
 
-The PIR evaluation is ten focused, `clap`-parsed, CSV-emitting benches — four
-in `ikpir-server`, six in `ikpir-client` — each measuring one criterion at one
-config and appending one row (`client_mutation` appends one row per
-`(update mode, patch mode, kind)`):
+The PIR evaluation is thirteen focused, `clap`-parsed, CSV-emitting benches —
+four in `ikpir-server`, nine in `ikpir-client` — each measuring one criterion
+at one config and appending one row (the mutation benches append one row per
+`(patch mode, kind)` for client-hint-patch, one per `kind` for client-rewind).
+The client flow (client-hint-patch vs client-rewind) is always a separate
+binary, never a runtime flag, and **benchmark data of the two flows is always
+written to separate CSV files and never merged**; `client_query` and
+`headtohead_query` are the only client-side benches that don't come in a
+per-flow pair, because `build_query` is identical code on both flows:
 
 | Crate | Benches |
 |---|---|
 | `ikpir-server` | `server_setup`, `server_answer`, `server_mutation`, `headtohead_answer` |
-| `ikpir-client` | `client_query`, `client_decode`, `client_mutation`, `client_rewind_staleness`, `headtohead_query`, `headtohead_decode` |
+| `ikpir-client` | `client_query`, `client_hint_patch_decode`, `client_rewind_decode`, `client_hint_patch_mutation`, `client_rewind_mutation`, `client_rewind_staleness`, `headtohead_query`, `headtohead_hint_patch_decode`, `headtohead_rewind_decode` |
 
 The `headtohead_*` benches fix the **keyword count** (`--num-keys`) and report
 the DB size each scheme needed — the fair-comparison setting vs ChalametPIR /
@@ -193,7 +198,8 @@ and `--lwe-dim`, and writing the CSV under `results/<crate>/`:
 
 ```bash
 ./scripts/bench.sh server_answer --arity 4 --num-buckets 65536 --bucket-size 4 --value-bits 8192
-./scripts/bench.sh client_decode --backend simple
+./scripts/bench.sh client_hint_patch_decode --backend simple
+./scripts/bench.sh client_rewind_decode --backend simple
 ./scripts/bench.sh server_mutation --patch-mode entry,row
 ./scripts/bench.sh headtohead_answer --arity 4 --num-buckets 262144 --num-keys 1000000
 ./scripts/bench.sh cuckoo_filter_insert_throughput               # all five Table 2 configs
@@ -214,19 +220,24 @@ One sweep per table. Each resolves the paper's config matrix, then loops
 | Script | Table | Benches behind it |
 |---|---|---|
 | `scripts/table2.sh` | filter: load factor + insert/lookup/delete throughput, SCF vs standard | the four `cuckoo_filter_*` |
-| `scripts/table3.sh` | online: query / response / answer latency | `headtohead_{answer,query,decode}` |
-| `scripts/table4.sh` | mutation throughput (insert/update/delete) | `{server,client}_mutation` |
+| `scripts/table3.sh` | online: query / response / answer latency | `headtohead_answer`, `headtohead_query` (common) + `headtohead_{hint_patch,rewind}_decode` (selected flow) |
+| `scripts/table4.sh` | mutation throughput (insert/update/delete) | `server_mutation` (common) + `client_{hint_patch,rewind}_mutation` (selected flow) |
 | `scripts/table5.sh` | setup: the static rebuild cost table 4 replaces | `server_setup` |
 
 `table2.sh` forwards any flags to each bench; `table{3,4,5}.sh` additionally
 accept `--arity` / `--bucket-size` / `--value-bits` / `--backend` to narrow the
-matrix, and forward anything else:
+matrix, and forward anything else. `table3.sh` and `table4.sh` additionally
+accept `--flow client-hint-patch|client-rewind|all` (default `all`) to pick
+which flow's leg runs; the common (flow-independent) legs always run once,
+and — like every other benchmark data in this repo — the two flows' rows land
+in separate CSV files, never merged:
 
 ```bash
 ./scripts/table2.sh                              # the full published table (~1-2 h)
 ./scripts/table2.sh --arity 4                    # just the arity-4 rows
-./scripts/table4.sh                              # all 5 configs × 2 widths × 2 backends
-./scripts/table3.sh --arity 3                    # the full-paper arity-3 cells
+./scripts/table4.sh                              # all 5 configs × 2 widths × 2 backends, both flows
+./scripts/table4.sh --flow client-hint-patch     # camera-ready's HintUpdate column only
+./scripts/table3.sh --arity 3 --flow client-rewind   # full-paper arity-3 cells, one flow
 ./scripts/table5.sh --backend frodo               # setup: RisePIR-F rows only
 ```
 

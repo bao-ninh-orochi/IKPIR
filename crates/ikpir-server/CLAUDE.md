@@ -265,8 +265,9 @@ Four focused benches covering classical and incremental server criteria for the 
   `csv_writer`, honoring `IKPIR_RESULTS_DIR`; default `results/`).
 - Shared helpers in `benches/helpers.rs` (deliberately duplicated across
   crates — a common core is mirrored in `ikpir-client/benches/helpers.rs`;
-  the client copy additionally carries `verify_decode`, used by the
-  `headtohead_decode` sanity check):
+  the client copy additionally carries `verify_decode` — flow-generic via
+  its `ClientFlow` trait — used by the `headtohead_{hint_patch,rewind}_decode`
+  sanity checks):
     - `populate_until_full::<S>(…)` / `populate_to_load::<S>(load_factor, …)`
       — seed a `CuckooKVStore<S>` to `TableFull` or to a target load.
     - `print_preamble(name, knobs, store_state, geom)` — the standard
