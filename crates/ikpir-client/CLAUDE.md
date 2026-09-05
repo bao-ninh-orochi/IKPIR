@@ -32,7 +32,7 @@ always available, chosen at the type like the backend at `B`
 
 > Production code in this crate depends only on `ikpir-common` and
 > `segmented-cuckoo`. `ikpir-server` is carried as a `[dev-dependency]`
-> for the crate's integration tests (§6), the six benches, and the two
+> for the crate's integration tests (§6), the nine benches, and the two
 > quick-start doctests (one per flow).
 
 ## 3. Key design decisions (the WHY)
