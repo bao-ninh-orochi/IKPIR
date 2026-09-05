@@ -22,8 +22,8 @@ mod helpers;
 use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, ResponseRewind, SimpleConfig,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, PrecomputingPirBackend, ResponseRewind, RewindClient, SimpleConfig,
     SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
@@ -118,7 +118,7 @@ fn run_one<S, B>(
     server.drop_hint_material();
 
     let (query_bytes, response_bytes) = {
-        let mut probe: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle.clone());
+        let mut probe: RewindClient<B> = RewindClient::from_setup_parallel(bundle.clone());
         let q = probe.build_query(&0u32.to_le_bytes());
         let rb = server.answer(&q).expect("answer ok").wire_byte_size();
         (q.wire_byte_size(), rb)
@@ -207,7 +207,7 @@ fn run_one<S, B>(
     let keys: Vec<Vec<u8>> = (0..cli.batch)
         .map(|i| (i % n).to_le_bytes().to_vec())
         .collect();
-    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle);
+    let mut client: RewindClient<B> = RewindClient::from_setup_parallel(bundle);
 
     // Once-per-config decode sanity check — catches silent decode regressions
     // (wrong cells_per_slot, packing bug, hint mismatch, bad plaintext_bits

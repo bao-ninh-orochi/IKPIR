@@ -1,9 +1,8 @@
-//! Response-rewind equivalence: the production `IkpirClient` (response-rewind,
-//! the client's sole update strategy) decodes **bit-identically** to the
-//! bench-only `HintPatchClient` comparator and to a fresh setup, for both
-//! shipped backends and every arity. Feature-gated behind `hint-patch-bench`
-//! (disabled by default) since it is the regression net the paper's §6.2
-//! comparison relies on, not a production-path test.
+//! Client-flow parity: on the same `(database, key)` inputs, the
+//! client-rewind flow (`RewindClient`) and the client-hint-patch flow
+//! (`HintPatchClient`) decode **bit-identically**, and both agree with a
+//! fresh client built at the head, for both shipped backends and every
+//! arity. This is the regression net the paper's §6.2 comparison relies on.
 //!
 //! # What is pinned
 //!
@@ -12,24 +11,33 @@
 //! Then three clients, all bootstrapped from the same epoch-0 bundle unless
 //! noted, are brought to the server's head and queried for every key:
 //!
-//! - **R (rewind, the production client)** — `accumulate_delta` each delta,
+//! - **R (client-rewind)** — `RewindClient::accumulate_delta` each delta,
 //!   then `decode`. Its hint is never patched (`pin_epoch()` stays 0), yet it
 //!   decodes the current database.
-//! - **P (hint-patch, the bench comparator)** — `HintPatchClient::apply_delta`
-//!   each delta, then `HintPatchClient::decode`.
+//! - **P (client-hint-patch)** — `HintPatchClient::apply_delta` each delta,
+//!   then `HintPatchClient::decode`.
 //! - **F (fresh)** — a `HintPatchClient` bootstrapped from the server's
 //!   *post-M* `setup()` bundle.
 //!
 //! Every present key must decode to its model value under all three; every
 //! absent key to `None`. Then R garbage-collects and must still agree — proving
 //! the fold-into-hint path (`collect_garbage`) matches.
+//!
+//! `flow_parity_proptest_*` complements the fixed sequence above with a
+//! randomised mutation trace (insert/update/delete over a small key
+//! universe), bringing a `RewindClient`, a `HintPatchClient`, and a fresh
+//! `HintPatchClient` built from the head bundle to the same state and
+//! checking all three agree with the model for every seed / touched /
+//! never-present key.
 
 use ikpir_client::{
-    FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchClient, IkpirClient,
-    IncrementalPirBackend, IndexPirBackend, PrecomputingPirBackend, ResponseRewind, SimpleConfig,
+    FrodoConfig, FrodoPirBackend, HintDeltaBundle, HintPatchClient, IncrementalPirBackend,
+    IndexPirBackend, PrecomputingPirBackend, ResponseRewind, RewindClient, SimpleConfig,
     SimplePirBackend,
 };
 use ikpir_server::{IkpirError, IkpirServer};
+use proptest::prelude::*;
+use proptest::test_runner::TestRunner;
 use segmented_cuckoo::{
     CuckooKVStore, CuckooParams, IndexScheme, SchemeMeta, Segmented2aryScheme, Segmented3aryScheme,
     Segmented4aryScheme,
@@ -199,9 +207,9 @@ where
     deltas
 }
 
-/// Rewind-mode lookup: `build_query` → `answer` → `decode(key, &q, &r)`.
+/// Client-rewind lookup: `build_query` → `answer` → `decode(key, &q, &r)`.
 fn lookup_rewind<S, B>(
-    client: &mut IkpirClient<B>,
+    client: &mut RewindClient<B>,
     server: &IkpirServer<S, B>,
     key: u32,
 ) -> Option<Vec<u8>>
@@ -217,8 +225,7 @@ where
     client.decode(&kb, &q, &r).expect("decode")
 }
 
-/// Hint-patch (bench comparator) lookup: `build_query` → `answer` →
-/// `decode(key, &r)`.
+/// Client-hint-patch lookup: `build_query` → `answer` → `decode(key, &r)`.
 fn lookup_patch<S, B>(
     client: &mut HintPatchClient<B>,
     server: &IkpirServer<S, B>,
@@ -266,8 +273,8 @@ where
     let head = server.epoch();
     let absent = absent_keys(&snap.model, &model);
 
-    // R — rewind (the production client). Never patched; pin stays at 0.
-    let mut r = IkpirClient::<B>::from_setup(bundle0.clone());
+    // R — client-rewind. Never patched; pin stays at 0.
+    let mut r = RewindClient::<B>::from_setup(bundle0.clone());
     for d in &deltas {
         r.accumulate_delta(d.clone()).expect("accumulate_delta");
     }
@@ -275,7 +282,7 @@ where
     assert_eq!(r.pin_epoch(), 0, "R hint never re-pinned");
     assert!(r.pending_cells() > 0, "R accumulated a nonempty ΔD");
 
-    // P — hint-patch (bench comparator).
+    // P — client-hint-patch.
     let mut p = HintPatchClient::<B>::from_setup(bundle0.clone());
     for d in &deltas {
         p.apply_delta(d.clone()).expect("apply_delta");
@@ -345,7 +352,7 @@ where
     let mut model = snap.model.clone();
     let deltas = apply(&mut server, &sequence_mixed(n), &mut model);
 
-    let mut r = IkpirClient::<B>::from_setup(bundle0);
+    let mut r = RewindClient::<B>::from_setup(bundle0);
     for d in &deltas {
         r.accumulate_delta(d.clone()).expect("accumulate_delta");
     }
@@ -385,7 +392,7 @@ where
     let absent = absent_keys(&snap.model, &model);
     let present: Vec<u32> = model.keys().copied().collect();
 
-    let mut r = IkpirClient::<B>::from_setup(bundle0);
+    let mut r = RewindClient::<B>::from_setup(bundle0);
     // Warm the query + decode material against the pinned hint H₀.
     r.precompute_queries(present.len() as u32 + absent.len() as u32 + 8);
     r.precompute_decodes();
@@ -446,4 +453,152 @@ instantiate! {
     warm_gc_frodo_2ary: warm_rewind_and_gc<Segmented2aryScheme, FrodoPirBackend>(frodo_config());
     warm_gc_simple_2ary: warm_rewind_and_gc<Segmented2aryScheme, SimplePirBackend>(simple_config());
     warm_gc_frodo_4ary: warm_rewind_and_gc<Segmented4aryScheme, FrodoPirBackend>(frodo_config());
+}
+
+// ── Property-based flow parity ──────────────────────────────────────────────
+
+/// Like [`apply`], but tolerant of the ways a randomly generated trace can be
+/// a model no-op: an `Insert` of a key the model already holds is skipped
+/// before it reaches the server (a real "insert" is only meaningful for a new
+/// key — re-inserting one would place a second fingerprint entry for it in
+/// the SCF, which is not a mutation the `model: BTreeMap` can represent), and
+/// an `Update` / `Delete` of a key the server does not have is let through to
+/// `server.update` / `server.delete`, whose
+/// [`IkpirError::NotFound`] is caught and treated as a model no-op too. Every
+/// other error is a genuine test failure, exactly as in `apply`.
+fn apply_tolerant<S, B>(
+    server: &mut IkpirServer<S, B>,
+    ops: &[Op],
+    model: &mut Model,
+) -> Vec<HintDeltaBundle<B>>
+where
+    S: Scheme,
+    B: IncrementalPirBackend,
+{
+    let mut deltas = Vec::new();
+    for &op in ops {
+        if let Op::Insert(k, _) = op {
+            if model.contains_key(&k) {
+                continue; // model no-op: re-inserting an existing key.
+            }
+        }
+        let res = match op {
+            Op::Insert(k, salt) => server.insert(&k.to_le_bytes(), &value_for(k, salt)),
+            Op::Update(k, salt) => server.update(&k.to_le_bytes(), &value_for(k, salt)),
+            Op::Delete(k) => server.delete(&k.to_le_bytes()),
+        };
+        match res {
+            Ok(delta) => {
+                match op {
+                    Op::Insert(k, salt) | Op::Update(k, salt) => {
+                        model.insert(k, value_for(k, salt));
+                    }
+                    Op::Delete(k) => {
+                        model.remove(&k);
+                    }
+                }
+                deltas.push(delta);
+            }
+            Err(IkpirError::TableFull) => assert!(matches!(op, Op::Insert(..)), "TableFull {op:?}"),
+            Err(IkpirError::NotFound) => assert!(
+                matches!(op, Op::Update(..) | Op::Delete(..)),
+                "NotFound {op:?}"
+            ), // model no-op: update/delete of an absent key.
+            Err(e) => panic!("{op:?}: {e:?}"),
+        }
+    }
+    deltas
+}
+
+/// One randomly-generated `Op` over a `seed_count + 8`-key universe:
+/// `Insert` targets only the 8 keys past the seed range (`apply_tolerant`
+/// still guards against re-insertion within that range), `Update` / `Delete`
+/// target any key in the universe (including ones never inserted —
+/// `apply_tolerant` turns those into model no-ops via `NotFound`).
+fn op_strategy(seed_count: u32) -> impl Strategy<Value = Op> {
+    let universe_hi = seed_count + 8;
+    prop_oneof![
+        (seed_count..universe_hi, 1u32..=250).prop_map(|(k, s)| Op::Insert(k, s)),
+        (0u32..universe_hi, 1u32..=250).prop_map(|(k, s)| Op::Update(k, s)),
+        (0u32..universe_hi).prop_map(Op::Delete),
+    ]
+}
+
+/// A trace of 1..=24 ops drawn from [`op_strategy`].
+fn trace_strategy(seed_count: u32) -> impl Strategy<Value = Vec<Op>> {
+    proptest::collection::vec(op_strategy(seed_count), 1..=24)
+}
+
+/// Property: for a random mutation trace, a client-rewind client, a
+/// client-hint-patch client (both fed the trace's deltas from the epoch-0
+/// bundle), and a fresh client-hint-patch client built from the head bundle
+/// all agree with the model — for every seed key, every key the trace
+/// touched, and [`NEVER_PRESENT`]. Rebuilds a small 2-ary server from the
+/// file's shared fixture per case; `cases` is the caller-chosen
+/// [`ProptestConfig::cases`] (small, so CI time stays bounded — each case
+/// pays a full server rebuild plus a decode pass over the whole key
+/// universe).
+fn flow_parity_property<S, B>(config: B::Config, cases: u32)
+where
+    S: Scheme,
+    B: IncrementalPirBackend + ResponseRewind + Clone,
+    B::Query: Clone,
+    B::Response: Clone,
+{
+    let snap = populate::<S>();
+    let seed_count = snap.num_items as u32;
+    let strategy = trace_strategy(seed_count);
+
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases,
+        ..ProptestConfig::default()
+    });
+    runner
+        .run(&strategy, |ops| {
+            let mut server: IkpirServer<S, B> = IkpirServer::new(snap.restore(), config.clone());
+            let bundle0 = server.setup();
+            let mut model = snap.model.clone();
+            let deltas = apply_tolerant(&mut server, &ops, &mut model);
+
+            let mut r = RewindClient::<B>::from_setup(bundle0.clone());
+            for d in &deltas {
+                r.accumulate_delta(d.clone()).expect("accumulate_delta");
+            }
+            let mut p = HintPatchClient::<B>::from_setup(bundle0);
+            for d in &deltas {
+                p.apply_delta(d.clone()).expect("apply_delta");
+            }
+            let mut f = HintPatchClient::<B>::from_setup(server.setup());
+
+            let mut universe: Vec<u32> = (0..seed_count).collect();
+            for op in &ops {
+                let (Op::Insert(k, _) | Op::Update(k, _) | Op::Delete(k)) = *op;
+                universe.push(k);
+            }
+            universe.extend(NEVER_PRESENT);
+            universe.sort_unstable();
+            universe.dedup();
+
+            for k in universe {
+                let expected = model.get(&k).cloned();
+                let vr = lookup_rewind(&mut r, &server, k);
+                let vp = lookup_patch(&mut p, &server, k);
+                let vf = lookup_patch(&mut f, &server, k);
+                prop_assert_eq!(&vr, &expected, "rewind mismatch for key {}", k);
+                prop_assert_eq!(&vp, &expected, "patch mismatch for key {}", k);
+                prop_assert_eq!(&vf, &expected, "fresh mismatch for key {}", k);
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn flow_parity_proptest_frodo_2ary() {
+    flow_parity_property::<Segmented2aryScheme, FrodoPirBackend>(frodo_config(), 6);
+}
+
+#[test]
+fn flow_parity_proptest_simple_2ary() {
+    flow_parity_property::<Segmented2aryScheme, SimplePirBackend>(simple_config(), 4);
 }

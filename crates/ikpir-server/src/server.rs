@@ -21,13 +21,13 @@
 //!   deltas, applies them in-place via
 //!   [`IncrementalPirBackend::server_patch_hint`], and bumps the
 //!   strict-monotone `epoch`.
-//! - **The server's live hint is the sole hint-maintenance path.** The
-//!   client never patches its own hint — response-rewind
-//!   (`ikpir-client`'s only update strategy) pins a bootstrap hint and
-//!   corrects each response instead, `docs/rewind-client-mode.md`. The
+//! - **The server's live hint feeds a client of either flow.** The
 //!   server's continuously-patched `hints` are what [`Self::setup`] and
 //!   [`Self::full_rebuild`] hand to a client bootstrapping or
-//!   resyncing, so it starts from an up-to-date hint without replaying
+//!   resyncing, whichever flow it runs: client-hint-patch mirrors the
+//!   same patch on its own copy, while client-rewind pins its copy and
+//!   corrects responses instead (`docs/rewind-client-mode.md`) — either
+//!   way the client starts from an up-to-date hint without replaying
 //!   any mutation history. `answer` never reads `self.hints` — only
 //!   `self.store.as_cells()` and `self.backend_params` — so this
 //!   maintenance is invisible to the read path.

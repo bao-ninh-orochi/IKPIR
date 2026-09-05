@@ -1,13 +1,17 @@
-//! End-to-end integration tests for `IkpirClient` against a real
-//! `IkpirServer` and `SimplePirBackend`.
+//! End-to-end integration tests for the **client-hint-patch** flow
+//! (`HintPatchClient`) against a real `IkpirServer` and `SimplePirBackend`.
 //!
 //! # Purpose
 //!
-//! Mirror of `client_e2e.rs`: pins the same client-side behaviours, but
-//! against `SimplePirBackend` so the reshape + sparse-patch math gets
-//! exercised end-to-end through the public client API.
+//! Mirror of `client_hint_patch_e2e.rs`: pins the same client-side
+//! behaviours, but against `SimplePirBackend` so the reshape + sparse-patch
+//! math gets exercised end-to-end through the public client API. The
+//! wire-byte accounting tests
+//! (`hint_delta_is_much_smaller_than_setup_bundle`,
+//! `query_response_wire_sizes_match_underlying_vectors`) are
+//! flow-independent and live only in `tests/client_rewind_simple_e2e.rs`.
 
-use ikpir_client::{IkpirClient, IkpirClientError, SimpleConfig, SimplePirBackend};
+use ikpir_client::{HintPatchClient, IkpirClientError, SimpleConfig, SimplePirBackend};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
     IndexScheme, SchemeMeta, Segmented2aryCuckooKVStore, Segmented2aryScheme,
@@ -15,7 +19,7 @@ use segmented_cuckoo::{
     Segmented4aryScheme,
 };
 
-type Client = IkpirClient<SimplePirBackend>;
+type Client = HintPatchClient<SimplePirBackend>;
 
 /// Reduced LWE dimension keeps the per-segment matvec fast in tests.
 const fn test_config() -> SimpleConfig {
@@ -42,7 +46,7 @@ fn fresh_client<S>(server: &IkpirServer<S, SimplePirBackend>) -> Client
 where
     S: IndexScheme + SchemeMeta + 'static,
 {
-    IkpirClient::from_setup(server.setup())
+    HintPatchClient::from_setup(server.setup())
 }
 
 const fn pair(k: u32) -> ([u8; 4], [u8; 1]) {
@@ -64,10 +68,7 @@ where
     for (key, val) in &inserted {
         let q = client.build_query(key);
         let resp = server.answer(&q).expect("answer ok");
-        let got = client
-            .decode(key, &q, &resp)
-            .expect("no error")
-            .expect("found");
+        let got = client.decode(key, &resp).expect("no error").expect("found");
         assert_eq!(got, val.to_vec(), "value mismatch for key {key:?}");
     }
 }
@@ -85,10 +86,10 @@ where
     let absent = 9_999u32.to_le_bytes();
     let q = client.build_query(&absent);
     let resp = server.answer(&q).expect("answer ok");
-    assert_eq!(client.decode(&absent, &q, &resp).expect("no error"), None);
+    assert_eq!(client.decode(&absent, &resp).expect("no error"), None);
 }
 
-fn decode_after_accumulate_delta_inner<S>(mut server: IkpirServer<S, SimplePirBackend>)
+fn decode_after_apply_delta_inner<S>(mut server: IkpirServer<S, SimplePirBackend>)
 where
     S: IndexScheme + SchemeMeta + 'static,
 {
@@ -97,7 +98,7 @@ where
     for k in 0u32..10 {
         let (key, val) = pair(k);
         let delta = server.insert(&key, &val).unwrap();
-        inc.accumulate_delta(delta).unwrap();
+        inc.apply_delta(delta).unwrap();
     }
 
     let ops = [
@@ -118,7 +119,7 @@ where
             "del" => server.delete(&key).unwrap(),
             _ => unreachable!(),
         };
-        inc.accumulate_delta(delta).unwrap();
+        inc.apply_delta(delta).unwrap();
 
         let mut oracle: Client = fresh_client(&server);
 
@@ -127,11 +128,11 @@ where
 
             let q_inc = inc.build_query(&pkey);
             let r_inc = server.answer(&q_inc).unwrap();
-            let v_inc = inc.decode(&pkey, &q_inc, &r_inc).unwrap();
+            let v_inc = inc.decode(&pkey, &r_inc).unwrap();
 
             let q_oracle = oracle.build_query(&pkey);
             let r_oracle = server.answer(&q_oracle).unwrap();
-            let v_oracle = oracle.decode(&pkey, &q_oracle, &r_oracle).unwrap();
+            let v_oracle = oracle.decode(&pkey, &r_oracle).unwrap();
 
             assert_eq!(
                 v_inc, v_oracle,
@@ -168,10 +169,7 @@ where
     for (i, (key, val)) in inserted.iter().enumerate() {
         let q = client.build_query(key);
         let resp = server.answer(&q).expect("answer ok");
-        let got = client
-            .decode(key, &q, &resp)
-            .expect("no error")
-            .expect("found");
+        let got = client.decode(key, &resp).expect("no error").expect("found");
         assert_eq!(got, val.to_vec(), "value mismatch on lookup {i}");
 
         let remaining = (n - 1) - i as u32;
@@ -183,7 +181,7 @@ where
     }
 }
 
-fn precomputed_survives_accumulate_delta_inner<S>(mut server: IkpirServer<S, SimplePirBackend>)
+fn precomputed_survives_apply_delta_inner<S>(mut server: IkpirServer<S, SimplePirBackend>)
 where
     S: IndexScheme + SchemeMeta + 'static,
 {
@@ -209,7 +207,7 @@ where
             "del" => server.delete(&key).unwrap(),
             _ => unreachable!(),
         };
-        client.accumulate_delta(delta).unwrap();
+        client.apply_delta(delta).unwrap();
     }
 
     let mut oracle = fresh_client(&server);
@@ -217,11 +215,11 @@ where
         let key = k.to_le_bytes();
         let q_warm = client.build_query(&key);
         let r_warm = server.answer(&q_warm).unwrap();
-        let v_warm = client.decode(&key, &q_warm, &r_warm).unwrap();
+        let v_warm = client.decode(&key, &r_warm).unwrap();
 
         let q_oracle = oracle.build_query(&key);
         let r_oracle = server.answer(&q_oracle).unwrap();
-        let v_oracle = oracle.decode(&key, &q_oracle, &r_oracle).unwrap();
+        let v_oracle = oracle.decode(&key, &r_oracle).unwrap();
 
         assert_eq!(v_warm, v_oracle, "warm-path decode diverged on key {k}");
     }
@@ -238,7 +236,7 @@ where
     let _delta2 = server.insert(&k2, &v2).unwrap();
 
     let mut client = fresh_client(&server);
-    let err = client.accumulate_delta(delta1).unwrap_err();
+    let err = client.apply_delta(delta1).unwrap_err();
     assert!(
         matches!(err, IkpirClientError::StaleDelta { .. }),
         "got {err:?}"
@@ -272,16 +270,16 @@ fn decode_returns_none_for_absent_key_4ary() {
 }
 
 #[test]
-fn decode_after_accumulate_delta_matches_freshly_setup_client() {
-    decode_after_accumulate_delta_inner(build_server_2());
+fn decode_after_apply_delta_matches_freshly_setup_client() {
+    decode_after_apply_delta_inner(build_server_2());
 }
 #[test]
-fn decode_after_accumulate_delta_matches_freshly_setup_client_3ary() {
-    decode_after_accumulate_delta_inner(build_server_3());
+fn decode_after_apply_delta_matches_freshly_setup_client_3ary() {
+    decode_after_apply_delta_inner(build_server_3());
 }
 #[test]
-fn decode_after_accumulate_delta_matches_freshly_setup_client_4ary() {
-    decode_after_accumulate_delta_inner(build_server_4());
+fn decode_after_apply_delta_matches_freshly_setup_client_4ary() {
+    decode_after_apply_delta_inner(build_server_4());
 }
 
 #[test]
@@ -311,72 +309,16 @@ fn precomputed_warm_path_4ary() {
 }
 
 #[test]
-fn precomputed_survives_accumulate_delta() {
-    precomputed_survives_accumulate_delta_inner(build_server_2());
+fn precomputed_survives_apply_delta() {
+    precomputed_survives_apply_delta_inner(build_server_2());
 }
 #[test]
-fn precomputed_survives_accumulate_delta_3ary() {
-    precomputed_survives_accumulate_delta_inner(build_server_3());
+fn precomputed_survives_apply_delta_3ary() {
+    precomputed_survives_apply_delta_inner(build_server_3());
 }
 #[test]
-fn precomputed_survives_accumulate_delta_4ary() {
-    precomputed_survives_accumulate_delta_inner(build_server_4());
-}
-
-/// Wire-size accounting: one mutation's HintDeltaBundle is dramatically
-/// smaller than the corresponding ServerSetupBundle. SimplePIR-specific:
-/// the setup bundle hint is larger than FrodoPIR's (square reshape), so
-/// the ratio is even more pronounced.
-#[test]
-fn hint_delta_is_much_smaller_than_setup_bundle() {
-    let mut server = build_server_2();
-    for k in 0u32..30 {
-        let (key, val) = pair(k);
-        server.insert(&key, &val).unwrap();
-    }
-    let setup = server.setup();
-    let setup_bytes = setup.wire_byte_size();
-
-    let (key, val) = pair(100);
-    let delta = server.insert(&key, &val).unwrap();
-    let delta_bytes = delta.wire_byte_size();
-
-    assert!(
-        delta_bytes * 20 < setup_bytes,
-        "hint delta ({delta_bytes} B) must be >20× smaller than setup ({setup_bytes} B)",
-    );
-}
-
-/// Query/response wire-size accounting reflects the SimplePIR-specific
-/// shape: query length = `reshape_rows`, response length =
-/// `reshape_row_width = k · row_width`.
-#[test]
-fn query_response_wire_sizes_match_underlying_vectors() {
-    let mut server = build_server_2();
-    for k in 0u32..5 {
-        let (key, val) = pair(k);
-        server.insert(&key, &val).unwrap();
-    }
-    let setup = server.setup();
-    // Compute the SimplePIR reshape dims off the first segment's server params.
-    let sp0 = &setup.backend_params[0];
-    let reshape_rows = sp0.reshape_rows as usize;
-    let reshape_row_width = sp0.reshape_row_width as usize;
-    let arity = setup.params.arity();
-
-    let mut client = fresh_client(&server);
-    let (key, _) = pair(2);
-
-    let q = client.build_query(&key);
-    let q_bytes = q.wire_byte_size();
-    // 8 (epoch) + 4 (vec length prefix) + arity × reshape_rows × 4 (u32 each).
-    let expected_q = 8 + 4 + arity * (reshape_rows * 4);
-    assert_eq!(q_bytes, expected_q);
-
-    let r = server.answer(&q).unwrap();
-    let r_bytes = r.wire_byte_size();
-    let expected_r = 8 + 4 + arity * (reshape_row_width * 4);
-    assert_eq!(r_bytes, expected_r);
+fn precomputed_survives_apply_delta_4ary() {
+    precomputed_survives_apply_delta_inner(build_server_4());
 }
 
 /// Constant-time decode visits all candidate slots — same coverage as
@@ -396,10 +338,7 @@ fn decode_visits_all_candidate_slots() {
     for (key, val) in &inserted {
         let q = client.build_query(key);
         let resp = server.answer(&q).expect("answer ok");
-        let got = client
-            .decode(key, &q, &resp)
-            .expect("no error")
-            .expect("found");
+        let got = client.decode(key, &resp).expect("no error").expect("found");
         assert_eq!(got, val.to_vec(), "value mismatch for key {key:?}");
     }
 }
@@ -427,34 +366,31 @@ fn decode_roundtrip_at_fingerprint_bits_64() {
     for (key, val) in &inserted {
         let q = client.build_query(key);
         let resp = server.answer(&q).expect("answer ok");
-        let got = client
-            .decode(key, &q, &resp)
-            .expect("no error")
-            .expect("found");
+        let got = client.decode(key, &resp).expect("no error").expect("found");
         assert_eq!(got, val.to_vec(), "value mismatch for key {key:?}");
     }
 
-    // Update: the client observes the new value after accumulate_delta.
+    // Update: the client observes the new value after apply_delta.
     let (upd_key, _) = pair(3);
     let new_val = [0x77u8];
     let delta = server.update(&upd_key, &new_val).unwrap();
-    client.accumulate_delta(delta).unwrap();
+    client.apply_delta(delta).unwrap();
     let q = client.build_query(&upd_key);
     let resp = server.answer(&q).unwrap();
     assert_eq!(
-        client.decode(&upd_key, &q, &resp).unwrap(),
+        client.decode(&upd_key, &resp).unwrap(),
         Some(new_val.to_vec()),
         "update not observed at fingerprint_bits = 64"
     );
 
-    // Delete: the client observes the key is gone after accumulate_delta.
+    // Delete: the client observes the key is gone after apply_delta.
     let (del_key, _) = pair(5);
     let delta = server.delete(&del_key).unwrap();
-    client.accumulate_delta(delta).unwrap();
+    client.apply_delta(delta).unwrap();
     let q = client.build_query(&del_key);
     let resp = server.answer(&q).unwrap();
     assert_eq!(
-        client.decode(&del_key, &q, &resp).unwrap(),
+        client.decode(&del_key, &resp).unwrap(),
         None,
         "delete not observed at fingerprint_bits = 64"
     );

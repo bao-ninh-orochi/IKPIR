@@ -474,8 +474,8 @@ pub trait PrecomputingPirBackend: IndexPirBackend {
 ///
 /// # Purpose
 ///
-/// Response-rewind is the IKPIR client's **sole production update
-/// strategy** (`IkpirClient::{accumulate_delta, decode, collect_garbage}` in
+/// Response-rewind is the client-rewind flow's update strategy
+/// (`RewindClient::{accumulate_delta, decode, collect_garbage}` in
 /// `ikpir-client`). The client never patches its hint; it pins
 /// `H₀ = Aᵀ·D₀` and rolls a running `ΔD = D_head − D₀`, cost `Θ(τ·ω)` per
 /// batch of `τ` mutations over row width `ω` — independent of the LWE
@@ -488,14 +488,12 @@ pub trait PrecomputingPirBackend: IndexPirBackend {
 /// grows with the staleness `|ΔD|`, reclaimable by folding `ΔD` into the
 /// hint on demand (`collect_garbage`).
 ///
-/// The classical alternative — folding each delta into the hint immediately
-/// (`H ← H + Σ A[:,col]·δ`, `Θ(n·τ·ω)` per batch, a factor-`n` more
-/// expensive client maintenance) — survives only as a benchmark comparator
-/// behind the `hint-patch-bench` Cargo feature
-/// (`ikpir_client::HintPatchClient`), so `client_mutation` and the paper's
-/// §6.2 evaluation can still measure the two head-to-head; see
-/// `crates/ikpir-client/src/bench_comparator/`. It is not part of the
-/// production client.
+/// The client-hint-patch flow (`ikpir_client::HintPatchClient`) instead
+/// folds each delta into its hint immediately (`H ← H + Σ A[:,col]·δ`,
+/// `Θ(n·τ·ω)` per batch) and does not use this trait at all — it decodes
+/// directly against its own patched hint. Both flows are first-class and
+/// consume the same `HintDeltaBundle` stream from the server, and decode
+/// identically (`ikpir-client/tests/client_flow_parity.rs`).
 ///
 /// # Why per-backend
 ///

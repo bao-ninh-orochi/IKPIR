@@ -1,5 +1,5 @@
-//! End-to-end integration tests for `IkpirClient` against a real
-//! `IkpirServer` and `FrodoPirBackend`.
+//! End-to-end integration tests for the **client-rewind** flow
+//! (`RewindClient`) against a real `IkpirServer` and `FrodoPirBackend`.
 //!
 //! # Purpose
 //!
@@ -26,7 +26,7 @@
 //! single-arity tests pin the wire-byte accounting helpers
 //! (`wire_byte_size`) and the constant-time-decode last-slot probe.
 
-use ikpir_client::{FrodoConfig, FrodoPirBackend, IkpirClient, IkpirClientError};
+use ikpir_client::{FrodoConfig, FrodoPirBackend, IkpirClientError, RewindClient};
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{
     IndexScheme, SchemeMeta, Segmented2aryCuckooKVStore, Segmented2aryScheme,
@@ -34,7 +34,7 @@ use segmented_cuckoo::{
     Segmented4aryScheme,
 };
 
-type Client = IkpirClient<FrodoPirBackend>;
+type Client = RewindClient<FrodoPirBackend>;
 
 /// Build an empty 2-ary `IkpirServer` (64 buckets × 4 slots).
 fn build_server_2() -> IkpirServer<Segmented2aryScheme, FrodoPirBackend> {
@@ -53,13 +53,13 @@ fn build_server_4() -> IkpirServer<Segmented4aryScheme, FrodoPirBackend> {
     IkpirServer::new(store, FrodoConfig::default())
 }
 
-/// `IkpirClient::from_setup(server.setup())` shortcut shared by every
+/// `RewindClient::from_setup(server.setup())` shortcut shared by every
 /// arity-generic body.
 fn fresh_client<S>(server: &IkpirServer<S, FrodoPirBackend>) -> Client
 where
     S: IndexScheme + SchemeMeta + 'static,
 {
-    IkpirClient::from_setup(server.setup())
+    RewindClient::from_setup(server.setup())
 }
 
 /// `(key_bytes, value_bytes)` pair derived from `k` — keeps the test

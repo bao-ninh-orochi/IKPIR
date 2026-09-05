@@ -32,8 +32,8 @@ mod helpers;
 use criterion::Throughput;
 use helpers::{Backend, MakeStore};
 use ikpir_client::{
-    BackendWireSize, FrodoConfig, FrodoPirBackend, IkpirClient, IncrementalPirBackend,
-    IndexPirBackend, ParallelSetupBackend, PrecomputingPirBackend, SimpleConfig, SimplePirBackend,
+    BackendWireSize, FrodoConfig, FrodoPirBackend, IncrementalPirBackend, IndexPirBackend,
+    ParallelSetupBackend, PrecomputingPirBackend, RewindClient, SimpleConfig, SimplePirBackend,
 };
 use ikpir_server::IkpirServer;
 use segmented_cuckoo::{Segmented2aryScheme, Segmented3aryScheme, Segmented4aryScheme};
@@ -118,7 +118,7 @@ fn run_one<S, B>(
     // Without this scope, `probe_client` would live to end-of-function and
     // coexist with `client` — doubling peak `A` RAM at paper-scale configs.
     let query_bytes = {
-        let mut probe_client: IkpirClient<B> = IkpirClient::from_setup_parallel(bundle.clone());
+        let mut probe_client: RewindClient<B> = RewindClient::from_setup_parallel(bundle.clone());
         probe_client
             .build_query(&0u32.to_le_bytes())
             .wire_byte_size()
@@ -193,7 +193,7 @@ fn run_one<S, B>(
     let n = n_inserted as u32;
     let keys: Vec<[u8; 4]> = (0..cli.batch).map(|i| (i % n).to_le_bytes()).collect();
 
-    let mut client: IkpirClient<B> = IkpirClient::from_setup_parallel(server.setup());
+    let mut client: RewindClient<B> = RewindClient::from_setup_parallel(server.setup());
     // No upfront precompute_queries — refill per criterion sample (see iter_custom below)
     // so we never stall with millions of A·s+e computations before timing starts.
 
