@@ -13,7 +13,12 @@ Every server-side number (answer latency, mutation transcript, setup) and every
 filter number is flow-independent and shared by both papers. Only the client
 columns differ, and each flow has its own benchmark binary writing its own CSV:
 **benchmark data of the two flows is never merged into one file.** Every row
-of a client CSV carries a `flow` column naming the flow that produced it.
+of the per-flow decode and mutation CSVs (`ikpir_client_hint_patch_*.csv`,
+`ikpir_client_rewind_{decode,mutation}.csv`, and their `headtohead` twins)
+carries a `flow` column naming the flow that produced it;
+`ikpir_client_query.csv`, `ikpir_headtohead_client_query.csv` and
+`ikpir_client_rewind_staleness.csv` do not — the first two are
+flow-independent, the third is client-rewind only.
 
 ## One parameter set
 
@@ -80,8 +85,11 @@ realization the paper prints in brackets.
 | Staleness curve — decode latency against \|ΔD\|, then after `collect_garbage` | `for cell in 2:4 4:1 4:2; do for vb in 2048 8192; do for be in frodo simple; do ./scripts/bench.sh client_rewind_staleness --arity ${cell%%:*} --bucket-size ${cell##*:} --num-buckets $(( 1048576 / ${cell##*:} )) --value-bits $vb --backend $be --batch-size 2000 --staleness-steps 10 --queries 200; done; done; done` | `results/ikpir-client/ikpir_client_rewind_staleness.csv` |
 | Setup table | `./scripts/table5.sh` | as above (flow-independent) |
 
-The full version's arity-3 cells are part of the matrix; `--arity 3` narrows a
-sweep to them.
+The staleness loop covers the arity-2 and arity-4 cells only: its
+`1048576 / bucket_size` bucket count is the matrix's `n_b` for those cells and
+is not a legal `n_b` for a 3-ary segmented table. The full version's arity-3
+cells are part of the table scripts' matrix; `--arity 3` narrows a
+`table3.sh` / `table4.sh` sweep to them.
 
 ## Checks that take seconds
 
